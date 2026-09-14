@@ -29,7 +29,7 @@ ENV PIP_INDEX_URL=https://pypi.org/simple
 
 # (optional) git-lfs for pulling HuggingFace checkpoints + shell tools
 RUN apt-get update -y && \
-    apt-get install -y --no-install-recommends curl git-lfs tmux vim && \
+    apt-get install -y --no-install-recommends curl git-lfs tmux unzip vim && \
     git lfs install && \
     rm -rf /var/lib/apt/lists/*
 
