@@ -8,13 +8,12 @@
 # (reinstalling torch in particular would break the whole CUDA/vLLM stack):
 #   - CUDA 13.0.2 and cuDNN 9
 #   - torch==2.11.0 (cu130), vllm==0.24.0
-#   - transformers==5.5.3, flash-attn==2.8.3
+#   - transformers==5.3.0, flash-attn==2.8.3
 #   - Apex, TransformerEngine, Megatron-Bridge and DeepEP
 #
 # On top of the base we add ONLY what is missing for this project:
 #   - deepspeed     (Stage-1/2 SFT: phase1/phase2 use an explicit DeepSpeed loop)
 #   - fire          (evaluation + SFT launcher CLIs)
-#   - ipykernel     (required by AzureML's JupyterLab interactive endpoint)
 #   - tqdm and the pinned Azure SDK packages used by project integrations
 #   - GitHub Copilot CLI
 #
