@@ -10,8 +10,8 @@ import numpy as np
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset
 from torch.utils.data.distributed import DistributedSampler
 from transformers import (
-    AutoTokenizer,
-    Qwen3_5ForCausalLM,
+    AutoProcessor,
+    Qwen3_5ForConditionalGeneration,
     SchedulerType,
     DataCollatorForSeq2Seq,
     get_scheduler,
@@ -21,6 +21,8 @@ from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from datasets import load_dataset
 from tqdm import tqdm
+
+QWEN3_5_MULTIMODAL_ARCH = "Qwen3_5ForConditionalGeneration"
 
 def encode_sft_example(messages, tokenizer, max_seq_length):
     messages = [
@@ -123,8 +125,33 @@ def to_device(batch, device):
             output[k] = v
     return output
 
-def save_zero_three_model(model, tokenizer, save_dir):
+def validate_full_multimodal_model(model):
+    named_parameters = list(model.named_parameters())
+    parameter_names = {name for name, _ in named_parameters}
+    required_prefixes = ("model.visual.", "model.language_model.")
+    missing_prefixes = [
+        prefix
+        for prefix in required_prefixes
+        if not any(name.startswith(prefix) for name in parameter_names)
+    ]
+    if missing_prefixes:
+        raise RuntimeError(
+            "Refusing to save an incomplete Qwen3.5 checkpoint; missing "
+            f"parameter prefixes: {missing_prefixes}"
+        )
+    if not hasattr(model, "lm_head"):
+        raise RuntimeError("Refusing to save a Qwen3.5 checkpoint without an LM head")
+    frozen_parameters = [name for name, param in named_parameters if not param.requires_grad]
+    if frozen_parameters:
+        raise RuntimeError(
+            "Full-model SFT requires every parameter to be trainable; frozen "
+            f"parameters include: {frozen_parameters[:10]}"
+        )
+
+
+def save_zero_three_model(model, processor, save_dir):
     model_to_save = model.module if hasattr(model, 'module') else model
+    validate_full_multimodal_model(model_to_save)
     output_state_dict = {}
     for name, param in model_to_save.named_parameters():
         if hasattr(param, 'ds_id'):
@@ -138,22 +165,22 @@ def save_zero_three_model(model, tokenizer, save_dir):
     torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
         os.makedirs(save_dir, exist_ok=True)
-        torch.save(output_state_dict, os.path.join(save_dir, "pytorch_model.bin"))
-        model_to_save.config.to_json_file(os.path.join(save_dir, "config.json"))
-        tokenizer.save_pretrained(save_dir)
+        model_to_save.save_pretrained(save_dir, state_dict=output_state_dict)
+        processor.save_pretrained(save_dir)
     del output_state_dict
     torch.distributed.barrier()
 
-def save_hf_checkpoint(model, tokenizer, save_dir, zero_stage):
+def save_hf_checkpoint(model, processor, save_dir, zero_stage):
     if zero_stage == 3:
-        save_zero_three_model(model, tokenizer, save_dir)
+        save_zero_three_model(model, processor, save_dir)
         return
 
     model_to_save = model.module if hasattr(model, 'module') else model
+    validate_full_multimodal_model(model_to_save)
     if torch.distributed.get_rank() == 0:
         os.makedirs(save_dir, exist_ok=True)
         model_to_save.save_pretrained(save_dir)
-        tokenizer.save_pretrained(save_dir)
+        processor.save_pretrained(save_dir)
     torch.distributed.barrier()
 
 def get_all_reduce_mean(tensor):
@@ -162,7 +189,7 @@ def get_all_reduce_mean(tensor):
     return tensor
 
 def parse_args():
-    parser = argparse.ArgumentParser(description="Train the text backbone of a Qwen3.5 model")
+    parser = argparse.ArgumentParser(description="Train and save a full Qwen3.5 multimodal model")
 
     parser.add_argument('--use_wandb', action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument('--wandb_project', type=str, default="qwen3_5_text_training")
@@ -197,7 +224,7 @@ def parse_args():
     args = parser.parse_args()
     return args
 
-def save_checkpoint(args, model, tokenizer, epoch, step, ppl):
+def save_checkpoint(args, model, processor, epoch, step, ppl):
     ppl = round(ppl, 4)
     tag = f"epoch_{epoch}_step_{step}_ppl_{ppl}"
     cur_save_path = os.path.join(args.output_dir, tag)
@@ -206,7 +233,7 @@ def save_checkpoint(args, model, tokenizer, epoch, step, ppl):
 
     if torch.distributed.get_rank() == 0:
         print("Saving model checkpoint ...")
-    save_hf_checkpoint(model, tokenizer, cur_save_path, args.zero_stage)
+    save_hf_checkpoint(model, processor, cur_save_path, args.zero_stage)
 
 
 def get_optimizer_grouped_parameters(model, weight_decay):
@@ -244,24 +271,27 @@ def distributed_config(args):
 
 
 def prepare_model(args):
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    processor = AutoProcessor.from_pretrained(args.model_name_or_path, trust_remote_code=True)
+    tokenizer = processor.tokenizer
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token_id = tokenizer.eos_token_id
     tokenizer.padding_side = 'right'
 
-    model = Qwen3_5ForCausalLM.from_pretrained(
+    model = Qwen3_5ForConditionalGeneration.from_pretrained(
         args.model_name_or_path,
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
     )
+    model.config.architectures = [QWEN3_5_MULTIMODAL_ARCH]
     model.config.use_cache = False
+    validate_full_multimodal_model(model)
     if args.gradient_checkpointing:
         model.gradient_checkpointing_enable()
 
     optimizer_grouped_parameters = get_optimizer_grouped_parameters(model, args.weight_decay)
     optimizer = FusedAdam(optimizer_grouped_parameters, lr=args.learning_rate, betas=(0.9, 0.95))
-    return model, tokenizer, optimizer
+    return model, processor, optimizer
 
 
 def evaluation(model, eval_dataloader, device):
@@ -295,7 +325,8 @@ def evaluation(model, eval_dataloader, device):
 def main():
     args = parse_args()
     device, ds_config = distributed_config(args)
-    model, tokenizer, optimizer = prepare_model(args)
+    model, processor, optimizer = prepare_model(args)
+    tokenizer = processor.tokenizer
     train_dataset, eval_dataset = create_dataset(
         args.dataset_name,
         tokenizer,
@@ -344,7 +375,7 @@ def main():
     use_wandb = cur_rank == 0 and args.use_wandb
 
     if cur_rank == 0:
-        print("***** Running Qwen3.5 text SFT *****")
+        print("***** Running Qwen3.5 full-model SFT *****")
         os.makedirs(args.output_dir, exist_ok=True)
 
     if use_wandb:
@@ -434,7 +465,7 @@ def main():
                             "eval_step": global_step,
                         })
 
-                save_checkpoint(args, model, tokenizer, epoch, global_step, ppl_eval)
+                save_checkpoint(args, model, processor, epoch, global_step, ppl_eval)
                 torch.cuda.empty_cache()
 
     if use_wandb:
