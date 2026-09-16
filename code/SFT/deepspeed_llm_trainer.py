@@ -204,7 +204,7 @@ def parse_args():
     parser.add_argument('--num_train_epochs', type=int, default=2)
     parser.add_argument('--num_train_steps', type=int, default=-1)
     parser.add_argument('--num_warmup_steps', type=int, default=-1)
-    parser.add_argument('--checkpoints_every_epoch', type=int, default=2)
+    parser.add_argument('--checkpoint_steps', type=int, default=5000)
     parser.add_argument('--logging_steps', type=int, default=1)
 
     parser.add_argument('--per_device_train_batch_size', type=int, default=16)
@@ -215,7 +215,7 @@ def parse_args():
     parser.add_argument('--weight_decay', type=float, default=0.0)
 
     parser.add_argument('--zero_stage', type=int, default=3)
-    parser.add_argument('--gradient_checkpointing', default=True)
+    parser.add_argument('--gradient_checkpointing', action='store_true')
     parser.add_argument('--lr_scheduler_type', type=SchedulerType, default='cosine', choices=['linear', 'cosine'])
 
     parser.add_argument("--global_rank", type=int)
@@ -352,7 +352,6 @@ def main():
     )
 
     args.num_train_steps = int(len(train_dataloader) * args.num_train_epochs)
-    args.checkpoint_steps = max(1, math.ceil(len(train_dataloader) / args.checkpoints_every_epoch))
     args.num_warmup_steps = min(1000, int(args.num_train_steps * 0.1)) if args.num_warmup_steps == -1 else args.num_warmup_steps
 
     lr_scheduler = get_scheduler(
@@ -399,11 +398,14 @@ def main():
     if args.do_eval:
         if cur_rank == 0:
             print(f"***** Evaluating perplexity before training *****")
-        ppl, loss = evaluation(model, eval_dataloader, device)
+        evaluation_result = evaluation(model, eval_dataloader, device)
+        initial_ppl = evaluation_result[0]
+        initial_loss = evaluation_result[1]
         if cur_rank == 0:
-            print(f"Init ppl: {ppl}, loss: {loss}")
+            print(f"Init ppl: {initial_ppl}, loss: {initial_loss}")
         if use_wandb:
-            wandb.log({"eval/loss": loss, "eval/ppl": ppl, "eval_step": 0})
+            wandb.log({"eval/loss": initial_loss, "eval/ppl": initial_ppl, "eval_step": 0})
+        save_checkpoint(args, model, tokenizer, epoch=0, step=0, ppl=initial_ppl)
 
     global_step = 0
     for epoch in range(args.num_train_epochs):
@@ -422,7 +424,7 @@ def main():
             model.step()
             global_step += 1
 
-            if cur_rank == 0 and step % args.logging_steps == 0:
+            if cur_rank == 0 and global_step % args.logging_steps == 0:
                 current_loss = loss.item()
                 ppl = math.exp(min(20.0, current_loss))
                 try:
@@ -447,8 +449,12 @@ def main():
                         "train_step": global_step,
                     })
 
-            is_epoch_end = step + 1 == len(train_dataloader)
-            if (step + 1) % args.checkpoint_steps == 0 or is_epoch_end:
+            is_training_end = (
+                epoch + 1 == args.num_train_epochs
+                and step + 1 == len(train_dataloader)
+            )
+            is_checkpoint_step = global_step % args.checkpoint_steps == 0
+            if is_checkpoint_step or is_training_end:
                 ppl_eval = -1
                 if args.do_eval:
                     if cur_rank == 0:
