@@ -1,3 +1,6 @@
 vllm==0.28.0
 transformers==5.15.0
-gradio>=5.0,<6.0
+gradio==6.27.0
+gradio-client==2.7.0
+hf-gradio==0.4.1
+huggingface-hub>=1.16.0,<2.0

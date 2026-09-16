@@ -1,11 +1,13 @@
 import argparse
 import os
 import datetime
+import json
 import math
 import time
 import torch
 import deepspeed
 import numpy as np
+from safetensors import safe_open
 
 from torch.utils.data import DataLoader, RandomSampler, SequentialSampler, Dataset
 from torch.utils.data.distributed import DistributedSampler
@@ -23,6 +25,8 @@ from datasets import load_dataset
 from tqdm import tqdm
 
 QWEN3_5_MULTIMODAL_ARCH = "Qwen3_5ForConditionalGeneration"
+MISNESTED_VISUAL_PREFIX = "model.language_model.visual."
+HF_VISUAL_PREFIX = "model.visual."
 
 def encode_sft_example(messages, tokenizer, max_seq_length):
     messages = [
@@ -41,22 +45,23 @@ def encode_sft_example(messages, tokenizer, max_seq_length):
     input_ids = np.asarray(input_ids, dtype=np.int64)
     labels = np.full_like(input_ids, -100)
 
-    prompt_ids = tokenizer.apply_chat_template(
+    generation_prompt_ids = tokenizer.apply_chat_template(
         conversation=messages[:-1],
         tokenize=True,
         return_dict=False,
-        add_generation_prompt=False,
+        add_generation_prompt=True,
         enable_thinking=False,
     )
-    if isinstance(prompt_ids, dict):
-        prompt_ids = prompt_ids["input_ids"]
-    prompt_ids = np.asarray(prompt_ids, dtype=np.int64)
+    if isinstance(generation_prompt_ids, dict):
+        generation_prompt_ids = generation_prompt_ids["input_ids"]
+    generation_prompt_ids = np.asarray(generation_prompt_ids, dtype=np.int64)
 
-    assistant_prefix = tokenizer.encode(
-        "<|im_start|>assistant\n<think>\n\n</think>\n\n",
-        add_special_tokens=False,
-    )
-    response_start = len(prompt_ids) + len(assistant_prefix)
+    response_start = len(generation_prompt_ids)
+    if not np.array_equal(input_ids[:response_start], generation_prompt_ids):
+        raise RuntimeError(
+            "The training sequence prefix does not match the non-thinking "
+            "generation prompt used for inference."
+        )
     response_end = int(np.flatnonzero(input_ids == tokenizer.eos_token_id)[-1])
     labels[response_start:response_end + 1] = input_ids[response_start:response_end + 1]
 
@@ -93,6 +98,66 @@ def create_dataset(dataset_name,
     test_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "test")
     return train_llm_dataset, test_llm_dataset
 
+
+def log_sft_template_sample(messages, tokenizer, wandb_module=None):
+    messages = [
+        {"role": message["role"], "content": message["content"]}
+        for message in messages
+    ]
+    full_text = tokenizer.apply_chat_template(
+        conversation=messages,
+        tokenize=False,
+        add_generation_prompt=False,
+        enable_thinking=False,
+    )
+    generation_prompt_text = tokenizer.apply_chat_template(
+        conversation=messages[:-1],
+        tokenize=False,
+        add_generation_prompt=True,
+        enable_thinking=False,
+    )
+    if not full_text.startswith(generation_prompt_text):
+        raise RuntimeError(
+            "The logged training sequence does not start with the inference "
+            "generation prompt."
+        )
+
+    input_ids, labels, _ = encode_sft_example(messages, tokenizer, None)
+    supervised_indices = np.flatnonzero(labels != -100)
+    response_start = int(supervised_indices[0])
+    supervised_text = full_text[len(generation_prompt_text):]
+    raw_messages = json.dumps(messages, ensure_ascii=False, indent=2)
+
+    print("***** SFT template sample *****")
+    print(f"Raw messages:\n{raw_messages}")
+    print(f"Full training text (repr):\n{full_text!r}")
+    print(f"Inference generation prompt (repr):\n{generation_prompt_text!r}")
+    print(f"Supervised suffix (repr):\n{supervised_text!r}")
+    print(f"Response start token: {response_start}")
+    print(f"Total tokens: {len(input_ids)}")
+    print("***** End SFT template sample *****", flush=True)
+
+    if wandb_module is not None:
+        table = wandb_module.Table(
+            columns=[
+                "raw_messages",
+                "full_training_text",
+                "inference_generation_prompt",
+                "supervised_suffix",
+                "response_start_token",
+                "total_tokens",
+            ],
+            data=[[
+                raw_messages,
+                full_text,
+                generation_prompt_text,
+                supervised_text,
+                response_start,
+                len(input_ids),
+            ]],
+        )
+        wandb_module.log({"debug/sft_template_sample": table})
+
 def get_train_ds_config(stage=3):
     zero_opt_dict = {
         "stage": stage,
@@ -128,16 +193,19 @@ def to_device(batch, device):
 def validate_full_multimodal_model(model):
     named_parameters = list(model.named_parameters())
     parameter_names = {name for name, _ in named_parameters}
-    required_prefixes = ("model.visual.", "model.language_model.")
-    missing_prefixes = [
-        prefix
-        for prefix in required_prefixes
-        if not any(name.startswith(prefix) for name in parameter_names)
-    ]
-    if missing_prefixes:
+    has_visual = any(
+        name.startswith((HF_VISUAL_PREFIX, MISNESTED_VISUAL_PREFIX))
+        for name in parameter_names
+    )
+    has_language_model = any(
+        name.startswith("model.language_model.")
+        and not name.startswith(MISNESTED_VISUAL_PREFIX)
+        for name in parameter_names
+    )
+    if not has_visual or not has_language_model:
         raise RuntimeError(
-            "Refusing to save an incomplete Qwen3.5 checkpoint; missing "
-            f"parameter prefixes: {missing_prefixes}"
+            "Refusing to save an incomplete Qwen3.5 checkpoint: "
+            f"has_visual={has_visual}, has_language_model={has_language_model}"
         )
     if not hasattr(model, "lm_head"):
         raise RuntimeError("Refusing to save a Qwen3.5 checkpoint without an LM head")
@@ -147,6 +215,62 @@ def validate_full_multimodal_model(model):
             "Full-model SFT requires every parameter to be trainable; frozen "
             f"parameters include: {frozen_parameters[:10]}"
         )
+
+
+def normalize_checkpoint_state_dict(state_dict):
+    normalized_state_dict = {}
+    for name, value in state_dict.items():
+        if name.startswith(MISNESTED_VISUAL_PREFIX):
+            name = HF_VISUAL_PREFIX + name.removeprefix(MISNESTED_VISUAL_PREFIX)
+        if name in normalized_state_dict:
+            raise RuntimeError(f"Duplicate checkpoint tensor after key normalization: {name}")
+        normalized_state_dict[name] = value
+    return normalized_state_dict
+
+
+def get_saved_tensor_names(save_dir):
+    index_path = os.path.join(save_dir, "model.safetensors.index.json")
+    if os.path.isfile(index_path):
+        with open(index_path, encoding="utf-8") as file:
+            index = json.load(file)
+        return set(index["weight_map"])
+
+    tensor_names = set()
+    checkpoint_files = sorted(
+        filename
+        for filename in os.listdir(save_dir)
+        if filename.endswith(".safetensors")
+    )
+    if not checkpoint_files:
+        raise RuntimeError(f"No safetensors weights were written to {save_dir}")
+    for filename in checkpoint_files:
+        with safe_open(
+            os.path.join(save_dir, filename), framework="pt", device="cpu"
+        ) as reader:
+            tensor_names.update(reader.keys())
+    return tensor_names
+
+
+def validate_saved_checkpoint(model, save_dir, expected_state_dict):
+    saved_names = get_saved_tensor_names(save_dir)
+    tied_weights = getattr(model, "_tied_weights_keys", {})
+    allowed_missing = set(tied_weights) if isinstance(tied_weights, dict) else set()
+    missing_names = set(expected_state_dict) - saved_names - allowed_missing
+    malformed_names = {
+        name for name in saved_names if name.startswith(MISNESTED_VISUAL_PREFIX)
+    }
+    has_visual = any(name.startswith(HF_VISUAL_PREFIX) for name in saved_names)
+    if missing_names or malformed_names or not has_visual:
+        raise RuntimeError(
+            "Saved Qwen3.5 checkpoint failed verification: "
+            f"missing={sorted(missing_names)[:20]}, "
+            f"malformed={sorted(malformed_names)[:20]}, "
+            f"has_visual={has_visual}"
+        )
+    print(
+        f"Verified checkpoint: {len(saved_names)} tensors, all expected "
+        "parameters saved with standard Qwen3.5 names."
+    )
 
 
 def save_zero_three_model(model, processor, save_dir):
@@ -164,8 +288,14 @@ def save_zero_three_model(model, processor, save_dir):
 
     torch.distributed.barrier()
     if torch.distributed.get_rank() == 0:
+        output_state_dict = normalize_checkpoint_state_dict(output_state_dict)
         os.makedirs(save_dir, exist_ok=True)
-        model_to_save.save_pretrained(save_dir, state_dict=output_state_dict)
+        model_to_save.save_pretrained(
+            save_dir,
+            state_dict=output_state_dict,
+            safe_serialization=True,
+        )
+        validate_saved_checkpoint(model_to_save, save_dir, output_state_dict)
         processor.save_pretrained(save_dir)
     del output_state_dict
     torch.distributed.barrier()
@@ -178,8 +308,14 @@ def save_hf_checkpoint(model, processor, save_dir, zero_stage):
     model_to_save = model.module if hasattr(model, 'module') else model
     validate_full_multimodal_model(model_to_save)
     if torch.distributed.get_rank() == 0:
+        output_state_dict = normalize_checkpoint_state_dict(model_to_save.state_dict())
         os.makedirs(save_dir, exist_ok=True)
-        model_to_save.save_pretrained(save_dir)
+        model_to_save.save_pretrained(
+            save_dir,
+            state_dict=output_state_dict,
+            safe_serialization=True,
+        )
+        validate_saved_checkpoint(model_to_save, save_dir, output_state_dict)
         processor.save_pretrained(save_dir)
     torch.distributed.barrier()
 
@@ -395,6 +531,13 @@ def main():
         wandb.define_metric("eval_step")
         wandb.define_metric("eval/*", step_metric="eval_step")
 
+    if cur_rank == 0:
+        log_sft_template_sample(
+            train_dataset.dataset[0]["messages"],
+            tokenizer,
+            wandb if use_wandb else None,
+        )
+
     if args.do_eval:
         if cur_rank == 0:
             print(f"***** Evaluating perplexity before training *****")
@@ -405,7 +548,7 @@ def main():
             print(f"Init ppl: {initial_ppl}, loss: {initial_loss}")
         if use_wandb:
             wandb.log({"eval/loss": initial_loss, "eval/ppl": initial_ppl, "eval_step": 0})
-        save_checkpoint(args, model, tokenizer, epoch=0, step=0, ppl=initial_ppl)
+        save_checkpoint(args, model, processor, epoch=0, step=0, ppl=initial_ppl)
 
     global_step = 0
     for epoch in range(args.num_train_epochs):
