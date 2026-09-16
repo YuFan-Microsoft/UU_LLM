@@ -294,6 +294,7 @@ def save_zero_three_model(model, processor, save_dir):
             save_dir,
             state_dict=output_state_dict,
             safe_serialization=True,
+            save_original_format=False,
         )
         validate_saved_checkpoint(model_to_save, save_dir, output_state_dict)
         processor.save_pretrained(save_dir)
@@ -314,6 +315,7 @@ def save_hf_checkpoint(model, processor, save_dir, zero_stage):
             save_dir,
             state_dict=output_state_dict,
             safe_serialization=True,
+            save_original_format=False,
         )
         validate_saved_checkpoint(model_to_save, save_dir, output_state_dict)
         processor.save_pretrained(save_dir)
