@@ -52,8 +52,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--split", default="test")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--limit_per_stage", type=int, default=-1)
-    parser.add_argument("--max_model_len", type=int, default=12288)
-    parser.add_argument("--max_tokens", type=int, default=4096)
+    parser.add_argument("--max_model_len", type=int, default=16384)
+    parser.add_argument("--max_tokens", type=int, default=8192)
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--pipeline_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.90)
@@ -65,7 +65,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--temperature", type=float, default=0.0)
     parser.add_argument("--top_p", type=float, default=1.0)
     parser.add_argument("--top_k", type=int, default=-1)
-    parser.add_argument("--repetition_penalty", type=float, default=1.0)
+    parser.add_argument("--repetition_penalty", type=float, default=1.1)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--trust_remote_code", action="store_true")
     parser.add_argument("--enforce_eager", action="store_true")
@@ -119,6 +119,41 @@ def parse_json_output(text: str) -> tuple[Any | None, str | None]:
         return json.loads(text.strip()), None
     except (json.JSONDecodeError, TypeError) as error:
         return None, str(error)
+
+
+def classify_json_error(
+    text: str,
+    error_message: str | None,
+    finish_reason: str | None,
+) -> str | None:
+    if error_message is None:
+        return None
+
+    stripped_text = text.strip()
+    if not stripped_text:
+        return "empty_output"
+    if stripped_text.startswith("```"):
+        return "markdown_code_fence"
+    if finish_reason == "length":
+        return "generation_length_limit"
+
+    error_categories = (
+        ("Unterminated string", "unterminated_string"),
+        ("Extra data", "extra_data"),
+        (
+            "Expecting property name enclosed in double quotes",
+            "invalid_object_key",
+        ),
+        ("Expecting ',' delimiter", "missing_comma"),
+        ("Expecting ':' delimiter", "missing_colon"),
+        ("Invalid \\escape", "invalid_escape"),
+        ("Invalid control character", "invalid_control_character"),
+        ("Expecting value", "expecting_value"),
+    )
+    for message_fragment, category in error_categories:
+        if message_fragment in error_message:
+            return category
+    return "other_json_decode_error"
 
 
 def parse_input_payload(input_messages: list[dict[str, str]]) -> dict[str, Any]:
@@ -274,9 +309,22 @@ def update_metrics(
     metrics: Counter,
     json_valid: bool,
     stage1_validation: dict[str, Any] | None,
+    json_error_reason: str | None = None,
+    finish_reason: str | None = None,
+    generated_token_count: int = 0,
 ) -> None:
     metrics["examples"] += 1
     metrics["json_valid"] += int(json_valid)
+    normalized_finish_reason = finish_reason or "unknown"
+    metrics[f"finish_reason:{normalized_finish_reason}"] += 1
+    metrics["generated_tokens_total"] += generated_token_count
+    metrics["generated_tokens_max"] = max(
+        metrics["generated_tokens_max"], generated_token_count
+    )
+    if json_error_reason is not None:
+        metrics[f"json_error_reason:{json_error_reason}"] += 1
+    if not json_valid and normalized_finish_reason == "length":
+        metrics["invalid_json_at_length_limit"] += 1
     if stage1_validation is None:
         return
     metrics["referenced_indices"] += stage1_validation["reference_count"]
@@ -298,10 +346,38 @@ def update_metrics(
 
 
 def summarize_metrics(stage: str, metrics: Counter) -> dict[str, Any]:
+    invalid_json_count = metrics["examples"] - metrics["json_valid"]
     summary = {
         "examples": metrics["examples"],
         "json_valid": metrics["json_valid"],
+        "json_invalid": invalid_json_count,
         "json_valid_ratio": ratio(metrics["json_valid"], metrics["examples"]),
+        "json_error_reasons": {
+            key.removeprefix("json_error_reason:"): count
+            for key, count in sorted(metrics.items())
+            if key.startswith("json_error_reason:")
+        },
+        "generation_diagnostics": {
+            "finish_reasons": {
+                key.removeprefix("finish_reason:"): count
+                for key, count in sorted(metrics.items())
+                if key.startswith("finish_reason:")
+            },
+            "average_generated_tokens": ratio(
+                metrics["generated_tokens_total"], metrics["examples"]
+            ),
+            "max_generated_tokens": metrics["generated_tokens_max"],
+            "length_limited_outputs": metrics["finish_reason:length"],
+            "length_limited_ratio": ratio(
+                metrics["finish_reason:length"], metrics["examples"]
+            ),
+            "invalid_json_at_length_limit": metrics[
+                "invalid_json_at_length_limit"
+            ],
+            "invalid_json_length_limit_ratio": ratio(
+                metrics["invalid_json_at_length_limit"], invalid_json_count
+            ),
+        },
     }
     if stage == "stage1":
         summary.update(
@@ -333,6 +409,46 @@ def summarize_metrics(stage: str, metrics: Counter) -> dict[str, Any]:
             }
         )
     return summary
+
+
+def format_json_diagnostics(
+    stage: str,
+    summary: dict[str, Any],
+    max_tokens: int,
+) -> str:
+    examples = summary["examples"]
+    valid = summary["json_valid"]
+    invalid = summary["json_invalid"]
+    valid_ratio = summary["json_valid_ratio"] or 0.0
+    generation = summary["generation_diagnostics"]
+    average_tokens = generation["average_generated_tokens"] or 0.0
+    length_invalid = generation["invalid_json_at_length_limit"]
+
+    lines = [
+        f"===== {stage} JSON diagnostics =====",
+        f"JSON valid: {valid:,}/{examples:,} ({valid_ratio:.2%}); "
+        f"invalid: {invalid:,}",
+        f"Generated tokens: average={average_tokens:.1f}, "
+        f"max={generation['max_generated_tokens']:,}, "
+        f"configured max_tokens={max_tokens:,}",
+        "Finish reasons: "
+        + json.dumps(generation["finish_reasons"], ensure_ascii=False),
+        "Invalid JSON reasons: "
+        + json.dumps(summary["json_error_reasons"], ensure_ascii=False),
+    ]
+    if length_invalid:
+        share = generation["invalid_json_length_limit_ratio"] or 0.0
+        lines.append(
+            f"Length diagnosis: {length_invalid:,}/{invalid:,} invalid JSON "
+            f"outputs ({share:.2%}) hit max_tokens. Increasing --max_tokens "
+            "may fix these truncated outputs."
+        )
+    else:
+        lines.append(
+            "Length diagnosis: no invalid JSON output hit max_tokens; "
+            "increasing --max_tokens is unlikely to fix the JSON failures."
+        )
+    return "\n".join(lines)
 
 
 def write_jsonl_record(destination, record: dict[str, Any]) -> None:
@@ -379,6 +495,11 @@ def evaluate_stage(
                 raw_prediction = completion.text.strip()
                 parsed_prediction, json_error = parse_json_output(raw_prediction)
                 json_valid = json_error is None
+                json_error_reason = classify_json_error(
+                    raw_prediction,
+                    json_error,
+                    completion.finish_reason,
+                )
                 stage1_validation = None
                 validation_error = None
                 if stage == "stage1" and json_valid:
@@ -389,7 +510,14 @@ def evaluate_stage(
                     except (json.JSONDecodeError, TypeError, ValueError) as error:
                         validation_error = str(error)
 
-                update_metrics(metrics, json_valid, stage1_validation)
+                update_metrics(
+                    metrics,
+                    json_valid,
+                    stage1_validation,
+                    json_error_reason,
+                    completion.finish_reason,
+                    len(completion.token_ids),
+                )
                 write_jsonl_record(
                     destination,
                     {
@@ -401,6 +529,7 @@ def evaluate_stage(
                         "prediction": raw_prediction,
                         "parsed_prediction": parsed_prediction,
                         "json_valid": json_valid,
+                        "json_error_reason": json_error_reason,
                         "json_error": json_error,
                         "stage1_validation": stage1_validation,
                         "validation_error": validation_error,
@@ -472,10 +601,17 @@ def main() -> None:
             logger=logger,
         )
         stage_summaries[stage] = summarize_metrics(stage, metrics)
+        logger.info(
+            "\n%s",
+            format_json_diagnostics(stage, stage_summaries[stage], args.max_tokens),
+        )
         logger.info("%s metrics: %s", stage, stage_summaries[stage])
 
     total_examples = sum(item["examples"] for item in stage_summaries.values())
     total_json_valid = sum(item["json_valid"] for item in stage_summaries.values())
+    overall_json_error_reasons: Counter = Counter()
+    for stage_summary in stage_summaries.values():
+        overall_json_error_reasons.update(stage_summary["json_error_reasons"])
     summary = {
         "checkpoint": args.checkpoint,
         "dataset": args.dataset_name,
@@ -493,6 +629,7 @@ def main() -> None:
             "examples": total_examples,
             "json_valid": total_json_valid,
             "json_valid_ratio": ratio(total_json_valid, total_examples),
+            "json_error_reasons": dict(overall_json_error_reasons.most_common()),
         },
         "stages": stage_summaries,
     }
