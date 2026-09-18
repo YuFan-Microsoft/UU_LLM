@@ -21,7 +21,7 @@ from transformers import (
 from deepspeed.ops.adam import FusedAdam
 from deepspeed.accelerator import get_accelerator
 from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
-from datasets import load_dataset
+from datasets import concatenate_datasets, load_dataset
 from tqdm import tqdm
 
 QWEN3_5_MULTIMODAL_ARCH = "Qwen3_5ForConditionalGeneration"
@@ -92,8 +92,25 @@ class LLMDataset(Dataset):
 
 def create_dataset(dataset_name,
                    tokenizer,
-                   max_seq_len):
-    dataset = load_dataset(dataset_name)
+                   max_seq_len,
+                   dataset_configs=None,
+                   hf_token=None,
+                   shuffle_seed=42):
+    load_kwargs = {"token": hf_token} if hf_token else {}
+    if dataset_configs:
+        config_datasets = [
+            load_dataset(dataset_name, config_name, **load_kwargs)
+            for config_name in dataset_configs
+        ]
+        dataset = {
+            split_name: concatenate_datasets([
+                config_dataset[split_name]
+                for config_dataset in config_datasets
+            ]).shuffle(seed=shuffle_seed)
+            for split_name in ("train", "test")
+        }
+    else:
+        dataset = load_dataset(dataset_name, **load_kwargs)
     train_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "train")
     test_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "test")
     return train_llm_dataset, test_llm_dataset
@@ -326,7 +343,7 @@ def get_all_reduce_mean(tensor):
     tensor = tensor / torch.distributed.get_world_size()
     return tensor
 
-def parse_args():
+def parse_args(argument_defaults=None):
     parser = argparse.ArgumentParser(description="Train and save a full Qwen3.5 multimodal model")
 
     parser.add_argument('--use_wandb', action=argparse.BooleanOptionalAction, default=True)
@@ -336,6 +353,9 @@ def parse_args():
     parser.add_argument('--do_eval', type=int, default=1)
 
     parser.add_argument('--dataset_name', type=str, default='yufan/UltraData-SFT-2605-Chinese')
+    parser.add_argument('--dataset_configs', nargs='+', default=None)
+    parser.add_argument('--hf_token', type=str, default=os.getenv("HF_TOKEN"))
+    parser.add_argument('--dataset_shuffle_seed', type=int, default=42)
     parser.add_argument('--model_name_or_path', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='./checkpoints')
 
@@ -348,6 +368,7 @@ def parse_args():
     parser.add_argument('--per_device_train_batch_size', type=int, default=16)
     parser.add_argument('--per_device_eval_batch_size', type=int, default=16)
     parser.add_argument('--max_seq_len', type=int, default=8192)
+    parser.add_argument('--max_eval_steps', type=int, default=-1)
 
     parser.add_argument('--learning_rate', type=float, default=1e-5)
     parser.add_argument('--weight_decay', type=float, default=0.0)
@@ -359,6 +380,8 @@ def parse_args():
     parser.add_argument("--global_rank", type=int)
     parser.add_argument('--local_rank', type=int, default=-1)
     parser = deepspeed.add_config_arguments(parser)
+    if argument_defaults:
+        parser.set_defaults(**argument_defaults)
     args = parser.parse_args()
     return args
 
@@ -432,10 +455,10 @@ def prepare_model(args):
     return model, processor, optimizer
 
 
-def evaluation(model, eval_dataloader, device):
+def evaluation(model, eval_dataloader, device, max_eval_steps=-1):
     model.eval()
     losses = 0
-    step = 0
+    evaluated_steps = 0
     progress_bar = tqdm(
         eval_dataloader,
         desc="Evaluating",
@@ -443,12 +466,17 @@ def evaluation(model, eval_dataloader, device):
         dynamic_ncols=True,
     )
     for step, batch in enumerate(progress_bar):
+        if max_eval_steps > 0 and step >= max_eval_steps:
+            break
         batch = to_device(batch, device)
         with torch.no_grad():
             outputs = model(**batch, use_cache=False)
         loss = outputs.loss
         losses += loss.float()
-    losses = losses / (step + 1)
+        evaluated_steps += 1
+    if evaluated_steps == 0:
+        raise RuntimeError("Evaluation dataloader produced no batches")
+    losses = losses / evaluated_steps
     try:
         losses = get_all_reduce_mean(losses)
     except:
@@ -460,8 +488,8 @@ def evaluation(model, eval_dataloader, device):
     model.train()
     return ppl, losses.item()
 
-def main():
-    args = parse_args()
+def main(argument_defaults=None):
+    args = parse_args(argument_defaults)
     device, ds_config = distributed_config(args)
     model, processor, optimizer = prepare_model(args)
     tokenizer = processor.tokenizer
@@ -469,6 +497,9 @@ def main():
         args.dataset_name,
         tokenizer,
         args.max_seq_len,
+        dataset_configs=args.dataset_configs,
+        hf_token=args.hf_token,
+        shuffle_seed=args.dataset_shuffle_seed,
     )
 
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
@@ -520,10 +551,12 @@ def main():
 
         os.environ["WANDB_PROJECT"] = args.wandb_project
         wandb.login(key="3f14084582ffbf0986b305f813aea34ca59c77c5")
+        wandb_config = vars(args).copy()
+        wandb_config.pop("hf_token", None)
         init_kwargs = {
             "project": args.wandb_project,
             "name": args.wandb_run_name,
-            "config": vars(args),
+            "config": wandb_config,
         }
         if args.wandb_run_id:
             init_kwargs.update({"id": args.wandb_run_id, "resume": "allow"})
@@ -543,7 +576,9 @@ def main():
     if args.do_eval:
         if cur_rank == 0:
             print(f"***** Evaluating perplexity before training *****")
-        evaluation_result = evaluation(model, eval_dataloader, device)
+        evaluation_result = evaluation(
+            model, eval_dataloader, device, args.max_eval_steps
+        )
         initial_ppl = evaluation_result[0]
         initial_loss = evaluation_result[1]
         if cur_rank == 0:
@@ -604,7 +639,9 @@ def main():
                 if args.do_eval:
                     if cur_rank == 0:
                         print("***** Evaluating perplexity *****")
-                    ppl_eval, eval_loss = evaluation(model, eval_dataloader, device)
+                    ppl_eval, eval_loss = evaluation(
+                        model, eval_dataloader, device, args.max_eval_steps
+                    )
                     if cur_rank == 0:
                         print(f"Eval ppl: {ppl_eval}, loss: {eval_loss}")
                     if use_wandb:
