@@ -28,8 +28,8 @@ vLLM 0.24 supports only the full multimodal architecture, so training, checkpoin
 ```bash
 cd UU_LLM/code/trainer/SFT
 export HF_TOKEN=...   # needs access to yufan/user_profile_dataset
-sh run_user_profile_multi_gpu.sh                  # perplexity eval only
-ROLLOUT_EVAL=1 sh run_user_profile_multi_gpu.sh   # + vLLM rollout eval
+sh run_user_profile_multi_gpu.sh                  # perplexity + vLLM rollout eval (default)
+ROLLOUT_EVAL=0 sh run_user_profile_multi_gpu.sh   # perplexity eval only
 ```
 
 Generic SFT on another dataset uses the base trainer directly (see `run_multi_gpu.sh`):
@@ -94,8 +94,8 @@ Saved under `--output_dir` as `epoch_<e>_step_<s>_ppl_<ppl>/`:
 
 ## Rollout evaluation (user-profile, optional)
 
-**Off by default** — only perplexity is evaluated. Turn it on with `--rollout_eval` (or `ROLLOUT_EVAL=1` for
-`run_user_profile_multi_gpu.sh`). It needs a rollout scorer, so use `deepspeed_user_profile_trainer.py`.
+**On by default in `run_user_profile_multi_gpu.sh`** (set `ROLLOUT_EVAL=0` to skip it). The Python argument
+`--rollout_eval` itself defaults to off. It needs a rollout scorer, so use `deepspeed_user_profile_trainer.py`.
 
 **How it works**
 
