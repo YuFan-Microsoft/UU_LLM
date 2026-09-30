@@ -19,6 +19,26 @@ DEFAULT_INSTRUCTION = (
     "Given a web search query, retrieve relevant documents that answer the query"
 )
 DEFAULT_TOP_K = [1, 5, 10, 20, 50, 100, 200, 500, 1_000]
+DEFAULT_INDEX_PATHS = {
+    "future": Path(
+        "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
+        "test_1200/ann_evaluation/future_index.jsonl"
+    ),
+    "past": Path(
+        "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
+        "test_1200/ann_evaluation/history_index.jsonl"
+    ),
+}
+DEFAULT_EMBEDDING_PATHS = {
+    "future": Path(
+        "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
+        "test_1200/ann_evaluation/future_index_qwen_0.6B_emb.pt"
+    ),
+    "past": Path(
+        "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
+        "test_1200/ann_evaluation/history_index_qwen_0.6B_emb.pt"
+    ),
+}
 STREAMING_SEARCH_CHUNK_SIZE = 500_000
 
 
@@ -102,14 +122,19 @@ def extract_queries_from_layer(
 
 def extract_predicted_queries(
     record: dict[str, Any],
+    layer_key: str,
 ) -> tuple[list[tuple[str, str]], set[str]]:
-    rejection_reasons = set()
-    for layer_name in ("layer4", "layer3"):
-        queries, layer_rejections = extract_queries_from_layer(record, layer_name)
-        if queries:
-            return queries, layer_rejections
-        rejection_reasons.update(layer_rejections)
-    return [], rejection_reasons
+    return extract_queries_from_layer(record, layer_key)
+
+
+def count_interest_names(query_specs: list[tuple[str, str]]) -> int:
+    return len(
+        {
+            interest_name.strip()
+            for interest_name, _ in query_specs
+            if interest_name.strip()
+        }
+    )
 
 
 def build_no_valid_queries_reason(rejection_reasons: set[str]) -> str:
@@ -347,6 +372,7 @@ class SearchIndex:
 @dataclass
 class EvaluationConfig:
     target: str
+    layer_key: str
     top_ks: list[int]
     query_batch_size: int
     search_chunk_size: int
@@ -361,11 +387,20 @@ def format_metrics_table(
     top_ks: list[int],
     user_count: int,
     query_count: int,
+    interest_name_count: int,
     skipped_user_count: int = 0,
 ) -> str:
+    average_queries_per_user = query_count / user_count if user_count else 0.0
+    average_interest_names_per_user = (
+        interest_name_count / user_count if user_count else 0.0
+    )
     lines = [
         f"Metrics after {user_count:,} evaluated users "
-        f"(queries={query_count:,}, skipped={skipped_user_count:,})",
+        f"(queries={query_count:,}, "
+        f"queries/user={average_queries_per_user:.2f}, "
+        f"interest_names={interest_name_count:,}, "
+        f"interest_names/user={average_interest_names_per_user:.2f}, "
+        f"skipped={skipped_user_count:,})",
         f"{'K':>8} {'Macro Recall':>14} {'Micro Recall':>14}",
     ]
     for top_k in top_ks:
@@ -431,6 +466,7 @@ def evaluate(
     skip_reasons: Counter[str] = Counter()
     skip_user_ids: dict[str, list[Any]] = {}
     total_query_count = 0
+    total_interest_name_count = 0
 
     progress = tqdm(iter_jsonl(evaluation_path), desc="Evaluating users", unit="users")
     for record in progress:
@@ -438,7 +474,9 @@ def evaluate(
                 break
 
             target_action_ids = extract_action_ids(record, config.target)
-            query_specs, rejection_reasons = extract_predicted_queries(record)
+            query_specs, rejection_reasons = extract_predicted_queries(
+                record, config.layer_key
+            )
             if not query_specs:
                 reason = build_no_valid_queries_reason(rejection_reasons)
                 skipped_user_count += 1
@@ -470,9 +508,15 @@ def evaluate(
 
             user_count += 1
             total_query_count += len(query_specs)
+            total_interest_name_count += count_interest_names(query_specs)
             progress.set_postfix(
                 evaluated=user_count,
                 queries=total_query_count,
+                queries_per_user=f"{total_query_count / user_count:.2f}",
+                interest_names=total_interest_name_count,
+                interest_names_per_user=(
+                    f"{total_interest_name_count / user_count:.2f}"
+                ),
                 skipped=skipped_user_count,
                 refresh=True,
             )
@@ -483,6 +527,7 @@ def evaluate(
                         config.top_ks,
                         user_count,
                         total_query_count,
+                        total_interest_name_count,
                         skipped_user_count,
                     ),
                     file=sys.stderr,
@@ -494,6 +539,7 @@ def evaluate(
             config.top_ks,
             user_count,
             total_query_count,
+            total_interest_name_count,
             skipped_user_count,
         ),
         file=sys.stderr,
@@ -501,8 +547,16 @@ def evaluate(
 
     summary = {
         "target": config.target,
+        "layer_key": config.layer_key,
         "user_count": user_count,
         "query_count": total_query_count,
+        "average_queries_per_user": (
+            total_query_count / user_count if user_count else 0.0
+        ),
+        "interest_name_count": total_interest_name_count,
+        "average_interest_names_per_user": (
+            total_interest_name_count / user_count if user_count else 0.0
+        ),
         "skipped_user_count": skipped_user_count,
         "skip_reasons": dict(skip_reasons.most_common()),
         "metrics": {
@@ -521,7 +575,7 @@ def evaluate(
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
-            "Evaluate layer4 predicted queries against past or future actions "
+            "Evaluate predicted queries against past or future actions "
             "in a Qwen3 embedding index."
         )
     )
@@ -533,9 +587,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--index",
-        required=True,
         type=Path,
-        help="Target action index JSONL with id and value fields",
+        help="Target index JSONL (default: selected automatically from --target)",
     )
     parser.add_argument(
         "--target",
@@ -544,9 +597,14 @@ def parse_args() -> argparse.Namespace:
         help="Behavior field used as retrieval ground truth (default: future)",
     )
     parser.add_argument(
+        "--layer_key",
+        default="layer3",
+        help="Record key containing predicted_queries (default: layer3)",
+    )
+    parser.add_argument(
         "--embeddings",
         type=Path,
-        help="Action embedding tensor (default: <index>.embeddings.pt)",
+        help="Action embedding tensor (default: selected from --target)",
     )
     parser.add_argument(
         "--output",
@@ -612,9 +670,8 @@ def resolve_paths(
     args: argparse.Namespace,
 ) -> tuple[list[int], Path, Path, Path]:
     top_ks = sorted(set(args.top_k))
-    embedding_path = args.embeddings or args.index.with_suffix(
-        ".embeddings.pt"
-    )
+    args.index = args.index or DEFAULT_INDEX_PATHS[args.target]
+    embedding_path = args.embeddings or DEFAULT_EMBEDDING_PATHS[args.target]
     output_path = args.output or args.eval_data.with_suffix(
         f".{args.target}-eval.json"
     )
@@ -699,6 +756,7 @@ def main() -> int:
         )
         config = EvaluationConfig(
             target=args.target,
+            layer_key=args.layer_key,
             top_ks=top_ks,
             query_batch_size=args.query_batch_size,
             search_chunk_size=search_chunk_size,

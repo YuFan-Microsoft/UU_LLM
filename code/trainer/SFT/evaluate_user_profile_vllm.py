@@ -24,8 +24,8 @@ from vllm import LLM, ModelRegistry, SamplingParams
 QWEN3_5_FULL_ARCH = "Qwen3_5ForConditionalGeneration"
 DEFAULT_DATASET = "yufan/user_profile_dataset"
 DEFAULT_STAGE_CONFIGS = (
-    ("stage1", "User_Profile_L1"),
-    ("stage2", "User_Profile_L2"),
+    ("stage1", "User_Profile_L1_gpt54"),
+    ("stage2", "User_Profile_L2_gpt54"),
 )
 INPUT_MARKER = "\nInput:\n"
 REFERENCE_KEYS = ("evidence", "indices", "index", "idx")
@@ -47,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf_token", default=os.getenv("HF_TOKEN"))
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--dataset_name", default=DEFAULT_DATASET)
-    parser.add_argument("--stage1_config", default="User_Profile_L1")
-    parser.add_argument("--stage2_config", default="User_Profile_L2")
+    parser.add_argument("--stage1_config", default="User_Profile_L1_gpt54")
+    parser.add_argument("--stage2_config", default="User_Profile_L2_gpt54")
     parser.add_argument("--split", default="test")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--limit_per_stage", type=int, default=-1)
@@ -179,10 +179,24 @@ def index_key(value: Any) -> tuple[type, Any] | None:
     return type(value), value
 
 
+def table_activities(payload: dict[str, Any]) -> list[dict[str, Any]] | None:
+    """Expand the date-grouped table input ({"columns": [...], "days": {date: [[...], ...]}})."""
+    columns, days = payload.get("columns"), payload.get("days")
+    if not isinstance(columns, list) or not isinstance(days, dict):
+        return None
+    return [
+        dict(zip(columns, row))
+        for rows in days.values() if isinstance(rows, list)
+        for row in rows if isinstance(row, list)
+    ]
+
+
 def build_input_source_map(payload: dict[str, Any]) -> dict[tuple[type, Any], str]:
     activities = payload.get("activities")
     if not isinstance(activities, list):
-        raise ValueError("Stage1 input payload must contain an activities list")
+        activities = table_activities(payload)
+    if not isinstance(activities, list):
+        raise ValueError("Stage1 input payload must contain an activities list or a columns/days table")
 
     source_by_index: dict[tuple[type, Any], str] = {}
     for activity in activities:

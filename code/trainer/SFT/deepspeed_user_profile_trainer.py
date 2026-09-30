@@ -3,7 +3,7 @@ from deepspeed_llm_trainer import main
 
 USER_PROFILE_DEFAULTS = {
     "dataset_name": "yufan/user_profile_dataset",
-    "dataset_configs": ["User_Profile_L1", "User_Profile_L2"],
+    "dataset_configs": ["User_Profile_L1_gpt54", "User_Profile_L2_gpt54"],
     "dataset_shuffle_seed": 42,
 }
 
