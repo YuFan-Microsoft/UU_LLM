@@ -580,7 +580,7 @@ def rollout_evaluation(args, rollout, examples, rollout_scorer, model, tokenizer
 
 
 def rollout_wandb_section(config):
-    """W&B panel section for a dataset config, e.g. "User_Profile_L1_gpt54" -> "L1_rollout_evaluation"."""
+    """W&B panel section for a dataset config, e.g. "User_Profile_L1_gpt54_MaxLen15360" -> "L1_rollout_evaluation"."""
     match = re.search(r"(?:^|_)(L\d+)(?:_|$)", config)
     return f"{match.group(1) if match else config or 'rollout'}_rollout_evaluation"
 
@@ -708,6 +708,13 @@ def main(argument_defaults=None, rollout_scorer=None):
             model.step()
             global_step += 1
 
+            max_seq_len = None
+            if global_step % args.logging_steps == 0:
+                # Longest non-padding sequence in the global batch (max over all ranks).
+                max_seq_len = batch["attention_mask"].sum(dim=1).max().to(torch.int64)
+                torch.distributed.all_reduce(max_seq_len, op=torch.distributed.ReduceOp.MAX)
+                max_seq_len = max_seq_len.item()
+
             if cur_rank == 0 and global_step % args.logging_steps == 0:
                 current_loss = loss.item()
                 ppl = math.exp(min(20.0, current_loss))
@@ -720,7 +727,7 @@ def main(argument_defaults=None, rollout_scorer=None):
                     f"epoch {epoch + 1}/{args.num_train_epochs} | "
                     f"step {step + 1}/{len(train_dataloader)} | "
                     f"global-step {global_step} | loss {current_loss:.4f} | "
-                    f"ppl {ppl:.3f} | lr {current_lr:.2e} | {elapsed_ms:.0f} ms",
+                    f"ppl {ppl:.3f} | lr {current_lr:.2e} | max_len {max_seq_len} | {elapsed_ms:.0f} ms",
                     flush=True,
                 )
                 if use_wandb:
@@ -728,6 +735,7 @@ def main(argument_defaults=None, rollout_scorer=None):
                         "train/loss": current_loss,
                         "train/ppl": ppl,
                         "train/lr": current_lr,
+                        "train/max_seq_len": max_seq_len,
                         "epoch": epoch + 1,
                         "global_step": global_step,
                         "train_step": global_step,

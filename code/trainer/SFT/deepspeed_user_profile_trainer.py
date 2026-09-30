@@ -4,7 +4,7 @@ import user_profile_rules
 
 USER_PROFILE_DEFAULTS = {
     "dataset_name": "yufan/user_profile_dataset",
-    "dataset_configs": ["User_Profile_L1_gpt54", "User_Profile_L2_gpt54"],
+    "dataset_configs": ["User_Profile_L1_gpt54_MaxLen15360", "User_Profile_L2_gpt54_MaxLen15360"],
     "dataset_shuffle_seed": 42,
 }
 

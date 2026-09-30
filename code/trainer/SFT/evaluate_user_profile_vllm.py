@@ -24,8 +24,8 @@ from vllm import LLM, ModelRegistry, SamplingParams
 QWEN3_5_FULL_ARCH = "Qwen3_5ForConditionalGeneration"
 DEFAULT_DATASET = "yufan/user_profile_dataset"
 DEFAULT_STAGE_CONFIGS = (
-    ("stage1", "User_Profile_L1_gpt54"),
-    ("stage2", "User_Profile_L2_gpt54"),
+    ("stage1", "User_Profile_L1_gpt54_MaxLen15360"),
+    ("stage2", "User_Profile_L2_gpt54_MaxLen15360"),
 )
 INPUT_MARKER = "\nInput:\n"
 REFERENCE_KEYS = ("evidence", "indices", "index", "idx")
@@ -47,8 +47,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--hf_token", default=os.getenv("HF_TOKEN"))
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--dataset_name", default=DEFAULT_DATASET)
-    parser.add_argument("--stage1_config", default="User_Profile_L1_gpt54")
-    parser.add_argument("--stage2_config", default="User_Profile_L2_gpt54")
+    parser.add_argument("--stage1_config", default="User_Profile_L1_gpt54_MaxLen15360")
+    parser.add_argument("--stage2_config", default="User_Profile_L2_gpt54_MaxLen15360")
     parser.add_argument("--split", default="test")
     parser.add_argument("--batch_size", type=int, default=32)
     parser.add_argument("--limit_per_stage", type=int, default=-1)

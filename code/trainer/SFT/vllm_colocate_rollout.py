@@ -113,6 +113,12 @@ class ColocatedVLLMRollout:
         gc.collect()
         torch.cuda.empty_cache()
 
+    def _log_gpu_memory(self, label: str) -> None:
+        if self.rank == 0:
+            free, total = torch.cuda.mem_get_info()
+            print(f"[rank 0] GPU memory {label}: {(total - free) / 1024**3:.1f} GiB used, "
+                  f"{free / 1024**3:.1f} GiB free of {total / 1024**3:.1f} GiB", flush=True)
+
     def _vllm_model(self) -> torch.nn.Module:
         worker = self.llm.llm_engine.model_executor.driver_worker
         worker = getattr(worker, "worker", worker)
@@ -137,6 +143,7 @@ class ColocatedVLLMRollout:
 
         gc.collect()
         torch.cuda.empty_cache()
+        self._log_gpu_memory("before vLLM wake-up (training state only)")
         self._wake_up(["weights"])
         vllm_model = self._vllm_model()
         module = model.module if hasattr(model, "module") else model
@@ -171,12 +178,14 @@ class ColocatedVLLMRollout:
         from vllm import SamplingParams
 
         self._wake_up(["kv_cache"])
+        self._log_gpu_memory("after vLLM wake-up (weights + KV cache)")
         try:
             outputs = []
             if prompt_token_ids:
                 params = [SamplingParams(n=1, max_tokens=limit, **sampling_kwargs) for limit in max_tokens]
                 prompts = [{"prompt_token_ids": ids} for ids in prompt_token_ids]
-                outputs = self.llm.generate(prompts, params, use_tqdm=False)
+                # Live progress bar (with vLLM's input/output tok/s estimate) on rank 0 only, to keep logs readable.
+                outputs = self.llm.generate(prompts, params, use_tqdm=self.rank == 0)
         finally:
             self._sleep()
         return [(list(output.outputs[0].token_ids), output.outputs[0].finish_reason) for output in outputs]
@@ -237,9 +246,12 @@ def run_rollout_evaluation(
 
     Collective over all ranks. Returns (metrics, records) on rank 0 and ({}, []) elsewhere.
     """
+    total_start = time.time()
     start = time.time()
     rollout.sync_weights(model)
     sync_seconds = time.time() - start
+    if rollout.rank == 0:
+        print(f"Rollout weight sync done in {sync_seconds:.1f}s", flush=True)
 
     shard = list(enumerate(examples))[rollout.dp_rank::rollout.dp_size]
     records: list[dict] = []
@@ -263,6 +275,7 @@ def run_rollout_evaluation(
     )
     generate_seconds = time.time() - start
 
+    start = time.time()
     for (record, _, _), (token_ids, finish_reason) in zip(pending, outputs):
         example = examples[record["order"]]
         text = tokenizer.decode(token_ids, skip_special_tokens=True)
@@ -271,15 +284,36 @@ def run_rollout_evaluation(
         record["prediction"] = text
         record["reference"] = example["messages"][-1]["content"]
         records.append(record)
+    score_seconds = time.time() - start
 
-    gathered: list[list[dict] | None] = [None] * rollout.world_size
-    dist.all_gather_object(gathered, records if rollout.is_tp_leader else [])
+    rank_stats = {
+        "prompts": len(pending),
+        "skipped": len(shard) - len(pending),
+        "prompt_tokens": sum(len(prompt_ids) for _, prompt_ids, _ in pending),
+        "generated_tokens": sum(len(token_ids) for token_ids, _ in outputs),
+        "truncated": sum(finish_reason == "length" for _, finish_reason in outputs),
+        "generate_seconds": generate_seconds,
+        "score_seconds": score_seconds,
+    }
+    if rollout.is_tp_leader:
+        print(
+            f"[rank {rollout.rank}] Rollout generate: {rank_stats['prompts']} prompts "
+            f"({rank_stats['skipped']} skipped) in {generate_seconds:.1f}s | "
+            f"{rank_stats['prompt_tokens']} prompt + {rank_stats['generated_tokens']} generated tokens | "
+            f"{rank_stats['generated_tokens'] / max(generate_seconds, 1e-6):.0f} gen tok/s | "
+            f"{rank_stats['truncated']} hit max_tokens | score {score_seconds:.1f}s",
+            flush=True,
+        )
+
+    gathered: list[tuple[list[dict], dict] | None] = [None] * rollout.world_size
+    dist.all_gather_object(gathered, (records, rank_stats) if rollout.is_tp_leader else None)
     if rollout.rank != 0:
         return {}, []
 
-    all_records = sorted((r for part in gathered for r in part or []), key=lambda r: r["order"])
+    parts = [part for part in gathered if part is not None]
+    all_records = sorted((r for part_records, _ in parts for r in part_records), key=lambda r: r["order"])
+    start = time.time()
     metrics = summarize_records(all_records)
-    print(f"Rollout timing: weight sync {sync_seconds:.1f}s, generate {generate_seconds:.1f}s", flush=True)
     if output_path is not None:
         output_path.parent.mkdir(parents=True, exist_ok=True)
         with output_path.open("w", encoding="utf-8") as destination:
@@ -288,4 +322,29 @@ def run_rollout_evaluation(
         output_path.with_suffix(".summary.json").write_text(
             json.dumps(metrics, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
         )
+    write_seconds = time.time() - start
+
+    # Engines run in parallel, so the slowest one sets the wall-clock generate/score time.
+    rank_stats_list = [stats for _, stats in parts]
+    generate_wall = max(stats["generate_seconds"] for stats in rank_stats_list)
+    generate_fastest = min(stats["generate_seconds"] for stats in rank_stats_list)
+    score_wall = max(stats["score_seconds"] for stats in rank_stats_list)
+    prompts = sum(stats["prompts"] for stats in rank_stats_list)
+    skipped = sum(stats["skipped"] for stats in rank_stats_list)
+    prompt_tokens = sum(stats["prompt_tokens"] for stats in rank_stats_list)
+    generated_tokens = sum(stats["generated_tokens"] for stats in rank_stats_list)
+    truncated = sum(stats["truncated"] for stats in rank_stats_list)
+    print(
+        f"Rollout timing: weight sync {sync_seconds:.1f}s, generate {generate_wall:.1f}s "
+        f"(slowest of {len(rank_stats_list)} engines, fastest {generate_fastest:.1f}s), "
+        f"score {score_wall:.1f}s, summarize+write {write_seconds:.1f}s, total {time.time() - total_start:.1f}s",
+        flush=True,
+    )
+    print(
+        f"Rollout throughput: {prompts} prompts ({skipped} skipped), {prompt_tokens} prompt + "
+        f"{generated_tokens} generated tokens (avg {generated_tokens / max(prompts, 1):.0f}/prompt), "
+        f"{generated_tokens / max(generate_wall, 1e-6):.0f} gen tok/s overall, "
+        f"{prompts / max(generate_wall, 1e-6):.2f} prompts/s, {truncated} hit max_tokens",
+        flush=True,
+    )
     return metrics, all_records

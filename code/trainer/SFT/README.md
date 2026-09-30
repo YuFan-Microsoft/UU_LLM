@@ -42,8 +42,9 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 
 - Hugging Face dataset with `train` / `test` splits and a `messages` column
   (`[{"role": "user", ...}, {"role": "assistant", ...}]`).
-- User-profile SFT loads `yufan/user_profile_dataset`, configs `User_Profile_L1_gpt54` and
-  `User_Profile_L2_gpt54`, concatenates them and shuffles with `--dataset_shuffle_seed`.
+- User-profile SFT loads `yufan/user_profile_dataset`, configs `User_Profile_L1_gpt54_MaxLen15360` and
+  `User_Profile_L2_gpt54_MaxLen15360` (the GPT-5.4 subsets filtered to ≤ 15360 tokens), concatenates them and
+  shuffles with `--dataset_shuffle_seed`.
 - The chat template is applied with `enable_thinking=False`. Loss is computed only on the assistant answer
   (through its final EOS); the prompt tokens are masked with `-100`.
 
@@ -103,8 +104,21 @@ Saved under `--output_dir` as `epoch_<e>_step_<s>_ppl_<ppl>/`:
 2. At step 0, every `--checkpoint_steps` and at the end of training: gather the ZeRO-3 weights into vLLM,
    generate on a fixed test subset (`--rollout_eval_samples` per config, same examples every time), score the
    outputs, then put vLLM back to sleep.
-3. While asleep, vLLM releases its weights and KV cache. Eager mode is the default, so there is no CUDA-graph
-   memory pool either. At startup each rank prints `vLLM is asleep, still holding X GiB`.
+3. While asleep, vLLM releases its weights and KV cache. With `--rollout_enforce_eager` (the argument default)
+   there is no CUDA-graph memory pool either; `run_user_profile_multi_gpu.sh` turns eager off for speed, so the
+   CUDA-graph pool stays resident. At startup each rank prints `vLLM is asleep, still holding X GiB`.
+
+**Speed and memory logs** (printed at every rollout evaluation)
+
+- Rank 0 prints `GPU memory before vLLM wake-up` (training state only) and `GPU memory after vLLM wake-up`
+  (weights + KV cache). If the "after" free memory is large, `--rollout_gpu_memory_utilization` can go up;
+  if the wake-up OOMs, lower it. `gpu_memory_utilization × total` must fit in the "before" free memory.
+- Rank 0 shows vLLM's live progress bar (processed prompts, estimated input/output tok/s) for its own shard.
+- Each engine prints `[rank N] Rollout generate: ...` with its prompts, prompt/generated tokens, generation
+  tok/s, outputs that hit `max_tokens`, and scoring time. Use this to spot a slow GPU.
+- Rank 0 then prints `Rollout timing` (weight sync, generate wall time = slowest engine, score,
+  summarize+write, total) and `Rollout throughput` (total tokens, avg generated tokens per prompt, overall
+  gen tok/s, prompts/s, outputs that hit `max_tokens`).
 
 **Metrics** (wandb `L1_rollout_evaluation/<metric>` and `L2_rollout_evaluation/<metric>`, x-axis `eval_step`;
 the section comes from the `L<N>` token in the dataset config name)
@@ -120,7 +134,8 @@ the section comes from the `L<N>` token in the dataset config name)
 | L2 | `delta_exact_match_ratio` | Outputs whose decided `delta_interest_name` values exactly equal the input delta names (same count, each side found in the other, case-sensitive) |
 | L2 | `merge_ratio` | Share of `merge` among add/merge decisions |
 
-Apart from `json_valid_ratio`, ratios are computed over JSON-valid outputs, so read them together with
+Apart from `json_valid_ratio` and L2 `simple_rules_pass_ratio` (over all samples), ratios are computed over
+JSON-valid outputs, so read them together with
 `json_valid_ratio`. Per-example results (prediction, reference, violated rules) are written to
 `<output_dir>/rollout_eval/step_<N>.jsonl`, with metrics in `step_<N>.summary.json`.
 
@@ -131,10 +146,10 @@ Apart from `json_valid_ratio`, ratios are computed over JSON-valid outputs, so r
 | `--rollout_eval_samples` | 256 | Per config; `<= 0` = whole split |
 | `--rollout_max_model_len` | 15360 | Prompt + generation; ≤ 19456 |
 | `--rollout_max_tokens` | 8192 | Max generated tokens |
-| `--rollout_gpu_memory_utilization` | 0.3 | vLLM share of GPU memory while awake; lower it on OOM |
+| `--rollout_gpu_memory_utilization` | 0.3 | vLLM share of total GPU memory while awake (the script uses 0.7 on 80 GB); lower it on OOM |
 | `--rollout_max_num_seqs` | 64 | Concurrent sequences per GPU |
 | `--rollout_enforce_eager` | on | `--no-rollout_enforce_eager` enables CUDA graphs: faster, but keeps ~1-2 GiB while asleep |
-| `--rollout_temperature` / `--rollout_top_p` / `--rollout_top_k` | 0.0 / 1.0 / -1 | Greedy by default |
+| `--rollout_temperature` / `--rollout_top_p` / `--rollout_top_k` | 0.0 / 1.0 / -1 | Greedy by default; the script samples with 0.6 / 0.8 |
 | `--rollout_repetition_penalty` | 1.0 | Kept at 1.0: vLLM also penalizes prompt tokens, which hurts copying exact names |
 | `--rollout_tensor_parallel_size` | 1 | Must divide the world size |
 
