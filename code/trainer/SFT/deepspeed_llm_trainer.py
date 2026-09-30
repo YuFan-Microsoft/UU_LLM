@@ -4,6 +4,7 @@ import datetime
 import json
 import math
 import time
+from pathlib import Path
 import torch
 import deepspeed
 import numpy as np
@@ -377,6 +378,26 @@ def parse_args(argument_defaults=None):
     parser.add_argument('--gradient_checkpointing', action='store_true')
     parser.add_argument('--lr_scheduler_type', type=SchedulerType, default='cosine', choices=['linear', 'cosine'])
 
+    # Generation-based evaluation with a colocated vLLM engine (runs at step 0 and at every checkpoint).
+    parser.add_argument('--rollout_eval', action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument('--rollout_eval_configs', nargs='+', default=None,
+                        help="Dataset configs to roll out (default: --dataset_configs)")
+    parser.add_argument('--rollout_eval_split', type=str, default='test')
+    parser.add_argument('--rollout_eval_samples', type=int, default=256,
+                        help="Fixed number of examples per config (<=0 for the whole split)")
+    parser.add_argument('--rollout_max_model_len', type=int, default=16384)
+    parser.add_argument('--rollout_max_tokens', type=int, default=8192)
+    parser.add_argument('--rollout_gpu_memory_utilization', type=float, default=0.3)
+    parser.add_argument('--rollout_tensor_parallel_size', type=int, default=1)
+    parser.add_argument('--rollout_max_num_seqs', type=int, default=64)
+    parser.add_argument('--rollout_max_num_batched_tokens', type=int, default=8192)
+    # Eager mode keeps no CUDA-graph memory pool, so a sleeping vLLM holds (almost) no GPU memory during training.
+    parser.add_argument('--rollout_enforce_eager', action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument('--rollout_temperature', type=float, default=0.0)
+    parser.add_argument('--rollout_top_p', type=float, default=1.0)
+    parser.add_argument('--rollout_top_k', type=int, default=-1)
+    parser.add_argument('--rollout_repetition_penalty', type=float, default=1.0)
+
     parser.add_argument("--global_rank", type=int)
     parser.add_argument('--local_rank', type=int, default=-1)
     parser = deepspeed.add_config_arguments(parser)
@@ -488,7 +509,71 @@ def evaluation(model, eval_dataloader, device, max_eval_steps=-1):
     model.train()
     return ppl, losses.item()
 
-def main(argument_defaults=None):
+
+def create_rollout_evaluator(args, tokenizer, rollout_scorer):
+    """Build the colocated vLLM engine and the fixed rollout eval set. Must run before deepspeed.initialize."""
+    if rollout_scorer is None:
+        raise ValueError("--rollout_eval needs a rollout scorer (use deepspeed_user_profile_trainer.py)")
+    from vllm_colocate_rollout import ColocatedVLLMRollout, load_rollout_eval_examples
+
+    configs = args.rollout_eval_configs or args.dataset_configs or [None]
+    examples = load_rollout_eval_examples(
+        args.dataset_name,
+        configs,
+        args.rollout_eval_split,
+        args.rollout_eval_samples,
+        args.dataset_shuffle_seed,
+        args.hf_token,
+    )
+    rollout = ColocatedVLLMRollout(
+        args.model_name_or_path,
+        tensor_parallel_size=args.rollout_tensor_parallel_size,
+        gpu_memory_utilization=args.rollout_gpu_memory_utilization,
+        max_model_len=args.rollout_max_model_len,
+        max_num_seqs=args.rollout_max_num_seqs,
+        max_num_batched_tokens=args.rollout_max_num_batched_tokens,
+        enforce_eager=args.rollout_enforce_eager,
+        architectures=[QWEN3_5_MULTIMODAL_ARCH],
+        trust_remote_code=True,
+    )
+    if torch.distributed.get_rank() == 0:
+        print(f"Colocated vLLM rollout ready: {len(examples)} eval examples from {configs}", flush=True)
+    return rollout, examples
+
+
+def rollout_evaluation(args, rollout, examples, rollout_scorer, model, tokenizer, step, wandb_module=None):
+    from vllm_colocate_rollout import run_rollout_evaluation
+
+    if torch.distributed.get_rank() == 0:
+        print(f"***** Rollout evaluation with vLLM ({len(examples)} examples) *****", flush=True)
+    sampling_kwargs = {
+        "temperature": args.rollout_temperature,
+        "top_p": args.rollout_top_p,
+        "repetition_penalty": args.rollout_repetition_penalty,
+    }
+    if args.rollout_top_k > 0:
+        sampling_kwargs["top_k"] = args.rollout_top_k
+    metrics, _ = run_rollout_evaluation(
+        rollout,
+        model,
+        tokenizer,
+        examples,
+        rollout_scorer.score_example,
+        rollout_scorer.summarize_records,
+        sampling_kwargs,
+        args.rollout_max_tokens,
+        output_path=Path(args.output_dir) / "rollout_eval" / f"step_{step}.jsonl",
+    )
+    if torch.distributed.get_rank() != 0:
+        return
+    print(f"Rollout metrics (step {step}): {json.dumps(metrics, indent=2)}", flush=True)
+    if wandb_module is not None:
+        log = {f"rollout/{name}": value for name, value in metrics.items()}
+        log["eval_step"] = step
+        wandb_module.log(log)
+
+
+def main(argument_defaults=None, rollout_scorer=None):
     args = parse_args(argument_defaults)
     device, ds_config = distributed_config(args)
     model, processor, optimizer = prepare_model(args)
@@ -501,6 +586,9 @@ def main(argument_defaults=None):
         hf_token=args.hf_token,
         shuffle_seed=args.dataset_shuffle_seed,
     )
+    rollout, rollout_examples = None, None
+    if args.rollout_eval:
+        rollout, rollout_examples = create_rollout_evaluator(args, tokenizer, rollout_scorer)
 
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
@@ -565,6 +653,7 @@ def main(argument_defaults=None):
         wandb.define_metric("train/*", step_metric="train_step")
         wandb.define_metric("eval_step")
         wandb.define_metric("eval/*", step_metric="eval_step")
+        wandb.define_metric("rollout/*", step_metric="eval_step")
 
     if cur_rank == 0:
         log_sft_template_sample(
@@ -585,6 +674,10 @@ def main(argument_defaults=None):
             print(f"Init ppl: {initial_ppl}, loss: {initial_loss}")
         if use_wandb:
             wandb.log({"eval/loss": initial_loss, "eval/ppl": initial_ppl, "eval_step": 0})
+    if rollout is not None:
+        rollout_evaluation(args, rollout, rollout_examples, rollout_scorer, model, tokenizer, 0,
+                           wandb if use_wandb else None)
+    if args.do_eval:
         save_checkpoint(args, model, processor, epoch=0, step=0, ppl=initial_ppl)
 
     global_step = 0
@@ -652,6 +745,9 @@ def main(argument_defaults=None):
                             "global_step": global_step,
                             "eval_step": global_step,
                         })
+                if rollout is not None:
+                    rollout_evaluation(args, rollout, rollout_examples, rollout_scorer, model, tokenizer,
+                                       global_step, wandb if use_wandb else None)
 
                 save_checkpoint(args, model, processor, epoch, global_step, ppl_eval)
                 torch.cuda.empty_cache()
