@@ -3,6 +3,7 @@ import os
 import datetime
 import json
 import math
+import re
 import time
 from pathlib import Path
 import torch
@@ -568,9 +569,20 @@ def rollout_evaluation(args, rollout, examples, rollout_scorer, model, tokenizer
         return
     print(f"Rollout metrics (step {step}): {json.dumps(metrics, indent=2)}", flush=True)
     if wandb_module is not None:
-        log = {f"rollout/{name}": value for name, value in metrics.items()}
+        log = {}
+        for name, value in metrics.items():
+            config, _, metric = name.rpartition("/")
+            section = rollout_wandb_section(config)
+            wandb_module.define_metric(f"{section}/*", step_metric="eval_step")
+            log[f"{section}/{metric}"] = value
         log["eval_step"] = step
         wandb_module.log(log)
+
+
+def rollout_wandb_section(config):
+    """W&B panel section for a dataset config, e.g. "User_Profile_L1_gpt54" -> "L1_rollout_evaluation"."""
+    match = re.search(r"(?:^|_)(L\d+)(?:_|$)", config)
+    return f"{match.group(1) if match else config or 'rollout'}_rollout_evaluation"
 
 
 def main(argument_defaults=None, rollout_scorer=None):
@@ -653,7 +665,6 @@ def main(argument_defaults=None, rollout_scorer=None):
         wandb.define_metric("train/*", step_metric="train_step")
         wandb.define_metric("eval_step")
         wandb.define_metric("eval/*", step_metric="eval_step")
-        wandb.define_metric("rollout/*", step_metric="eval_step")
 
     if cur_rank == 0:
         log_sft_template_sample(

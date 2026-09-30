@@ -10,8 +10,8 @@ Flow:
     summarize_records(records)     -> the metrics logged to wandb, per dataset config
 
 Metrics:
-    Layer 1: json_valid_ratio, topic_evidence_valid_ratio, other_rules_pass_ratio, avg_interest_num
-    Layer 2: json_valid_ratio, rule_pass_ratio, delta_exact_match_ratio, merge_ratio
+    Layer 1: json_valid_ratio, topic_evidence_valid_ratio, simple_rules_pass_ratio, avg_interest_num
+    Layer 2: json_valid_ratio, simple_rules_pass_ratio, delta_exact_match_ratio, merge_ratio
 """
 
 import json
@@ -74,7 +74,7 @@ L1_TOPIC_KEYS = {"topic", "source", "evidence"}
 L1_MAX_INTERESTS = 40
 L1_NON_LATIN = re.compile(r"[^\x00-\x7F\u00C0-\u024F\u2019\u2013\u2014]")
 
-# Reported by topic_evidence_valid_ratio; every other Layer-1 rule is reported by other_rules_pass_ratio.
+# Reported by topic_evidence_valid_ratio; every other Layer-1 rule is reported by simple_rules_pass_ratio.
 L1_EVIDENCE_RULES = {"invalid_evidence", "source_evidence_mismatch"}
 
 
@@ -105,6 +105,25 @@ def check_layer1_topic(topic, source_by_idx, violations):
     if set(source) != {source_by_idx[idx] for idx in evidence}:
         violations.add("source_evidence_mismatch")
         return False
+    return True
+
+
+def layer1_keys_valid(output):
+    """True when the top level, every interest and every topic have exactly the expected keys,
+    and interests / topics / source / evidence are lists."""
+    interests = output.get("interests")
+    if set(output) != L1_TOP_KEYS or not isinstance(interests, list):
+        return False
+    for interest in interests:
+        if not isinstance(interest, dict) or set(interest) != L1_INTEREST_KEYS:
+            return False
+        topics = interest["topics"]
+        if not isinstance(topics, list) or not all(
+            isinstance(topic, dict) and set(topic) == L1_TOPIC_KEYS
+            and isinstance(topic["source"], list) and isinstance(topic["evidence"], list)
+            for topic in topics
+        ):
+            return False
     return True
 
 
@@ -200,12 +219,28 @@ def check_layer2_decision_fields(decision, action, violations):
     """Field-level checks for one decision with a valid action."""
     if set(decision) != L2_DECISION_KEYS[action]:
         violations.add("unexpected_keys")
-    if decision.get("temporal") not in L2_TEMPORALS:
+    temporal = decision.get("temporal")
+    if not isinstance(temporal, str) or temporal not in L2_TEMPORALS:
         violations.add("invalid_temporal")
     if not all(has_text(decision.get(key)) for key in L2_DECISION_KEYS[action]):
         violations.add("empty_text")
     if any(L2_NON_LATIN_LETTER.search(str(decision.get(key) or "")) for key in L2_TEXT_KEYS[action]):
         violations.add("non_latin_output_text")
+
+
+def layer2_keys_valid(output):
+    """True when the top level is exactly {"decisions": [...]} and every decision has a valid action
+    and exactly the keys expected for that action."""
+    decisions = output.get("decisions")
+    if set(output) != {"decisions"} or not isinstance(decisions, list):
+        return False
+    return all(
+        isinstance(decision, dict)
+        and isinstance(decision.get("action"), str)
+        and decision["action"] in L2_DECISION_KEYS
+        and set(decision) == L2_DECISION_KEYS[decision["action"]]
+        for decision in decisions
+    )
 
 
 def check_layer2(payload, output):
@@ -214,7 +249,7 @@ def check_layer2(payload, output):
     delta_names = [interest.get("interest_name") for interest in payload.get("delta") or []]
     snapshot_names = [interest.get("interest_name") for interest in payload.get("snapshot") or []]
     snapshot_normalized = {normalize_name(name) for name in snapshot_names}
-    stats = {"decisions": 0, "merges": 0, "matched_deltas": 0, "match_total": len(delta_names)}
+    stats = {"decisions": 0, "merges": 0, "delta_exact_match": 0}
 
     if set(output) != {"decisions"}:
         violations.add("invalid_top_level")
@@ -230,7 +265,7 @@ def check_layer2(payload, output):
     added_names = []                             # normalized names of added interests
     for decision in decisions:
         action = decision.get("action") if isinstance(decision, dict) else None
-        if action not in L2_DECISION_KEYS:
+        if not isinstance(action, str) or action not in L2_DECISION_KEYS:
             violations.add("unexpected_keys")
             continue
         stats["decisions"] += 1
@@ -274,10 +309,11 @@ def check_layer2(payload, output):
     if len(set(result_names)) < len(result_names):
         violations.add("duplicate_result_name")
 
-    # One-to-one exact match: deltas decided exactly once, over max(#deltas, #decisions), so missing,
-    # duplicated, misspelled and invented names all lower delta_exact_match_ratio.
-    stats["matched_deltas"] = sum(decision_count_by_delta[name] == 1 for name in delta_names)
-    stats["match_total"] = max(len(delta_names), len(decisions))
+    # Exact match: the decided delta_interest_name values equal the input delta names as a multiset,
+    # i.e. same count and every name on either side found on the other (case-sensitive).
+    stats["delta_exact_match"] = int(
+        len(decisions) == len(delta_names) and decision_count_by_delta == Counter(delta_names)
+    )
     return violations, stats
 
 
@@ -289,16 +325,20 @@ def score_example(messages, generated_text):
     """Score one rollout. Only the user prompt in `messages` is used, not the reference answer."""
     stage, payload = read_input(messages)
     output = parse_json_object(generated_text)
+    json_valid = output is not None
     violations, stats = set(), {}
     if output is not None and stage == "layer1":
+        # JSON-valid also requires exactly the expected keys at every level.
+        json_valid = layer1_keys_valid(output)
         violations, stats = check_layer1(payload, output)
     elif output is not None and stage == "layer2":
+        json_valid = layer2_keys_valid(output)
         violations, stats = check_layer2(payload, output)
     return {
         "stage": stage,
-        "json_valid": output is not None,
+        "json_valid": json_valid,
         "violations": sorted(violations),
-        "rule_pass": output is not None and stage != "unknown" and not violations,
+        "rule_pass": json_valid and stage != "unknown" and not violations,
         "stats": stats,
     }
 
@@ -326,12 +366,12 @@ def summarize_records(records):
         stage = items[0]["stage"]
         if stage == "layer1":
             values["topic_evidence_valid_ratio"] = ratio(totals["valid_topics"], totals["topics"])
-            values["other_rules_pass_ratio"] = ratio(
+            values["simple_rules_pass_ratio"] = ratio(
                 sum(not set(r["violations"]) - L1_EVIDENCE_RULES for r in valid), len(valid))
             values["avg_interest_num"] = ratio(totals["interests"], len(valid))
         elif stage == "layer2":
-            values["rule_pass_ratio"] = ratio(sum(r["rule_pass"] for r in items), len(items))
-            values["delta_exact_match_ratio"] = ratio(totals["matched_deltas"], totals["match_total"])
+            values["simple_rules_pass_ratio"] = ratio(sum(r["rule_pass"] for r in items), len(items))
+            values["delta_exact_match_ratio"] = ratio(totals["delta_exact_match"], len(valid))
             values["merge_ratio"] = ratio(totals["merges"], totals["decisions"])
 
         for name, value in values.items():

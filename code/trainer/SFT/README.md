@@ -81,7 +81,7 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 | `--zero_stage` | 3 | |
 | `--checkpoint_steps` | 5000 | Eval + checkpoint interval |
 | `--do_eval` / `--max_eval_steps` | 1 / -1 | Perplexity on the test split |
-| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `train/*`, `eval/*`, `rollout/*` |
+| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `train/*`, `eval/*`, `L1_rollout_evaluation/*`, `L2_rollout_evaluation/*` |
 
 ## Checkpoints
 
@@ -106,17 +106,18 @@ Saved under `--output_dir` as `epoch_<e>_step_<s>_ppl_<ppl>/`:
 3. While asleep, vLLM releases its weights and KV cache. Eager mode is the default, so there is no CUDA-graph
    memory pool either. At startup each rank prints `vLLM is asleep, still holding X GiB`.
 
-**Metrics** (wandb `rollout/<config>/<metric>`, x-axis `eval_step`)
+**Metrics** (wandb `L1_rollout_evaluation/<metric>` and `L2_rollout_evaluation/<metric>`, x-axis `eval_step`;
+the section comes from the `L<N>` token in the dataset config name)
 
 | Layer | Metric | Meaning |
 | --- | --- | --- |
-| L1 | `json_valid_ratio` | Outputs that parse as a JSON object |
+| L1 | `json_valid_ratio` | Outputs that parse as a JSON object whose top level, interests and topics have exactly the expected keys, with `interests`, `topics`, `source` and `evidence` as lists |
 | L1 | `topic_evidence_valid_ratio` | Topics whose evidence idx all exist in the input and whose `source` equals their evidence sources |
-| L1 | `other_rules_pass_ratio` | Outputs passing all other cleaning rules (keys, empty text, duplicates, non-English names, ≥ 40 interests) |
+| L1 | `simple_rules_pass_ratio` | Outputs passing all other cleaning rules (empty text, duplicates, non-English names, ≥ 40 interests) |
 | L1 | `avg_interest_num` | Average number of interests per output |
-| L2 | `json_valid_ratio` | Outputs that parse as a JSON object |
-| L2 | `rule_pass_ratio` | Outputs passing every Layer-2 cleaning rule |
-| L2 | `delta_exact_match_ratio` | Input deltas matched one-to-one by exact `delta_interest_name`, over max(#deltas, #decisions) |
+| L2 | `json_valid_ratio` | Outputs that parse as `{"decisions": [...]}` where every decision has `action` `merge` or `add` and exactly the keys for that action |
+| L2 | `simple_rules_pass_ratio` | Outputs passing every Layer-2 cleaning rule |
+| L2 | `delta_exact_match_ratio` | Outputs whose decided `delta_interest_name` values exactly equal the input delta names (same count, each side found in the other, case-sensitive) |
 | L2 | `merge_ratio` | Share of `merge` among add/merge decisions |
 
 Apart from `json_valid_ratio`, ratios are computed over JSON-valid outputs, so read them together with
