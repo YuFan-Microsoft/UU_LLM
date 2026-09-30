@@ -47,7 +47,7 @@ class ColocatedVLLMRollout:
         *,
         tensor_parallel_size: int = 1,
         gpu_memory_utilization: float = 0.3,
-        max_model_len: int = 16384,
+        max_model_len: int = 15360,
         max_num_seqs: int = 64,
         max_num_batched_tokens: int = 8192,
         enforce_eager: bool = True,

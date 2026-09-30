@@ -385,7 +385,7 @@ def parse_args(argument_defaults=None):
     parser.add_argument('--rollout_eval_split', type=str, default='test')
     parser.add_argument('--rollout_eval_samples', type=int, default=256,
                         help="Fixed number of examples per config (<=0 for the whole split)")
-    parser.add_argument('--rollout_max_model_len', type=int, default=16384)
+    parser.add_argument('--rollout_max_model_len', type=int, default=15360)
     parser.add_argument('--rollout_max_tokens', type=int, default=8192)
     parser.add_argument('--rollout_gpu_memory_utilization', type=float, default=0.3)
     parser.add_argument('--rollout_tensor_parallel_size', type=int, default=1)
