@@ -134,8 +134,8 @@ the section comes from the `L<N>` token in the dataset config name)
 | L2 | `delta_exact_match_ratio` | Outputs whose decided `delta_interest_name` values exactly equal the input delta names (same count, each side found in the other, case-sensitive) |
 | L2 | `merge_ratio` | Share of `merge` among add/merge decisions |
 
-Apart from `json_valid_ratio` and L2 `simple_rules_pass_ratio` (over all samples), ratios are computed over
-JSON-valid outputs, so read them together with
+Apart from `json_valid_ratio` (over all samples), ratios are computed over JSON-valid outputs, so read them
+together with
 `json_valid_ratio`. Per-example results (prediction, reference, violated rules) are written to
 `<output_dir>/rollout_eval/step_<N>.jsonl`, with metrics in `step_<N>.summary.json`.
 

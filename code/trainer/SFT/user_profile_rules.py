@@ -370,7 +370,7 @@ def summarize_records(records):
                 sum(not set(r["violations"]) - L1_EVIDENCE_RULES for r in valid), len(valid))
             values["avg_interest_num"] = ratio(totals["interests"], len(valid))
         elif stage == "layer2":
-            values["simple_rules_pass_ratio"] = ratio(sum(r["rule_pass"] for r in items), len(items))
+            values["simple_rules_pass_ratio"] = ratio(sum(not r["violations"] for r in valid), len(valid))
             values["delta_exact_match_ratio"] = ratio(totals["delta_exact_match"], len(valid))
             values["merge_ratio"] = ratio(totals["merges"], totals["decisions"])
 
