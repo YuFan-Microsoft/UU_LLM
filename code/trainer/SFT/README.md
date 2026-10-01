@@ -162,9 +162,13 @@ python evaluate_user_profile_vllm.py --checkpoint <ckpt_dir> --output_dir <eval_
 `evaluate_user_profile_vllm.py` reproduces the in-training rollout evaluation locally: it reuses
 `load_rollout_eval_examples` / `build_prompt_ids` from `vllm_colocate_rollout.py` and
 `score_example` / `summarize_records` from `user_profile_rules.py`, so it reports the same metrics.
-Its defaults match the rollout arguments in `run_user_profile_multi_gpu.sh` (whole test split,
+Its sampling defaults match the rollout arguments in `run_user_profile_multi_gpu.sh` (whole test split,
 `max_model_len` 15360, `max_tokens` 8192, temperature 0.6, top-p 0.8, repetition penalty 1.0, thinking off);
-pass `--temperature 0` for greedy decoding. Per-example records go to `<eval_dir>/predictions.jsonl` (same
-fields as `rollout_eval/step_<N>.jsonl`) and metrics to `<eval_dir>/evaluation_summary.json`. `--hf_token`
-(or `HF_TOKEN`) is only needed if the gated dataset is not cached. With sampling on, results match training
-statistically, not token for token.
+pass `--temperature 0` for greedy decoding. Like training, examples are sharded round-robin over
+data-parallel vLLM engines, one per `--tensor_parallel_size` GPUs on all visible GPUs (`--num_gpus` or
+`CUDA_VISIBLE_DEVICES` to limit), each in its own process with seed `--seed + engine index`. Because
+the engine owns the whole GPU, `--max_num_seqs` / `--max_num_batched_tokens` default to 256 / 32768
+instead of training's 64 / 8192; they only change throughput. Per-example records go to
+`<eval_dir>/predictions.jsonl` (same fields as `rollout_eval/step_<N>.jsonl`) and metrics to
+`<eval_dir>/evaluation_summary.json`. `--hf_token` (or `HF_TOKEN`) is only needed if the gated dataset is
+not cached. With sampling on, results match training statistically, not token for token.
