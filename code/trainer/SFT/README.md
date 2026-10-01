@@ -13,7 +13,6 @@ fixed test subset and scores the outputs with the rule checks used for data clea
 | `vllm_colocate_rollout.py` | Colocated vLLM engine: sleeps during training, syncs weights and generates during eval |
 | `user_profile_rules.py` | Layer-1 / Layer-2 rule checks and the rollout metrics |
 | `evaluate_user_profile_vllm.py` | Standalone vLLM evaluation of a saved checkpoint |
-| `inference_vllm_gradio.py` | Gradio chat UI for a saved checkpoint |
 | `run_user_profile_multi_gpu.sh` | Launch script for user-profile SFT |
 | `run_multi_gpu.sh` | Launch script for generic SFT (UltraData Chinese) |
 
@@ -153,15 +152,19 @@ together with
 | `--rollout_repetition_penalty` | 1.0 | Kept at 1.0: vLLM also penalizes prompt tokens, which hurts copying exact names |
 | `--rollout_tensor_parallel_size` | 1 | Must divide the world size |
 
-## Standalone evaluation and inference
+## Standalone evaluation
 
 ```bash
 # Evaluate a saved checkpoint on the full L1/L2 test sets
-python evaluate_user_profile_vllm.py --checkpoint <ckpt_dir> --output_dir <eval_dir> --hf_token "$HF_TOKEN"
-
-# Chat with a checkpoint in the browser
-python inference_vllm_gradio.py --model <ckpt_dir> --tensor-parallel-size 1
+python evaluate_user_profile_vllm.py --checkpoint <ckpt_dir> --output_dir <eval_dir>
 ```
 
-`evaluate_user_profile_vllm.py` defaults to `--repetition_penalty 1.1`, so its numbers are not directly
-comparable with the in-training rollout metrics.
+`evaluate_user_profile_vllm.py` reproduces the in-training rollout evaluation locally: it reuses
+`load_rollout_eval_examples` / `build_prompt_ids` from `vllm_colocate_rollout.py` and
+`score_example` / `summarize_records` from `user_profile_rules.py`, so it reports the same metrics.
+Its defaults match the rollout arguments in `run_user_profile_multi_gpu.sh` (whole test split,
+`max_model_len` 15360, `max_tokens` 8192, temperature 0.6, top-p 0.8, repetition penalty 1.0, thinking off);
+pass `--temperature 0` for greedy decoding. Per-example records go to `<eval_dir>/predictions.jsonl` (same
+fields as `rollout_eval/step_<N>.jsonl`) and metrics to `<eval_dir>/evaluation_summary.json`. `--hf_token`
+(or `HF_TOKEN`) is only needed if the gated dataset is not cached. With sampling on, results match training
+statistically, not token for token.

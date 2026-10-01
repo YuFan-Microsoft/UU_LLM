@@ -14,7 +14,7 @@ grouped by date (DetailedSource is dropped):
 Answer `evidence` indices are remapped to the new idx and sorted.
 
 The "\\nInput:\\n" marker and this input layout match what
-code/trainer/SFT/evaluate_user_profile_vllm.py parses. JSON is minified.
+code/trainer/SFT/user_profile_rules.py parses. JSON is minified.
 Train/test is split by user_hash so a user never appears in both.
 """
 
