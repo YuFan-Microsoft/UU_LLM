@@ -1,29 +1,29 @@
-# Multi-Node DeepSpeed 训练实践
+# Multi-Node DeepSpeed Training in Practice
 
-本文记录在 AzureML/Singularity 环境中，用 2 个节点、每节点 8 张 NVIDIA A100（共 16 GPU）启动 `run_user_profile_multi_gpu.sh` 的完整方案、遇到的问题和排障经验。
+This document records the complete setup, the problems encountered, and troubleshooting lessons from launching `run_user_profile_multi_gpu.sh` in an AzureML/Singularity environment on 2 nodes with 8 NVIDIA A100 GPUs per node (16 GPUs total).
 
-## 1. 最终运行状态
+## 1. Final Running State
 
-- 节点：`node-0`、`node-1`
-- GPU：每节点 8 张 A100 80GB，共 16 张
-- DeepSpeed：16 个 global rank，每节点 8 个 local rank
-- 通信：NCCL + InfiniBand
-- 跨节点数据路径：`NET/IB/*/GDRDMA`
-- 日志：`user_logs/user_profile_multi_gpu.log`
-- 输出目录：`output/qwen3_5_4B_sft_user_profile/`
-- W&B run：`a07e4m5c`
+- Nodes: `node-0`, `node-1`
+- GPUs: 8 × A100 80GB per node, 16 total
+- DeepSpeed: 16 global ranks, 8 local ranks per node
+- Communication: NCCL + InfiniBand
+- Cross-node data path: `NET/IB/*/GDRDMA`
+- Log: `user_logs/user_profile_multi_gpu.log`
+- Output directory: `output/qwen3_5_4B_sft_user_profile/`
+- W&B run: `a07e4m5c`
 
-启动成功后，两节点各有 8 个 `deepspeed_user_profile_trainer.py --local_rank=N` 进程，GPU 均有显存占用和计算负载。
+After a successful launch, each node runs 8 `deepspeed_user_profile_trainer.py --local_rank=N` processes, and every GPU shows memory usage and compute load.
 
-## 2. 启动前确认资源
+## 2. Verify Resources Before Launch
 
-不要只相信作业配置，应在运行环境中确认实际分配的节点和 GPU。
+Do not rely on the job configuration alone; confirm the nodes and GPUs actually allocated inside the runtime environment.
 
 ```bash
 env | grep -E 'AZUREML_NODE_COUNT|NODE_COUNT|GPU_PER_NODE_COUNT|MASTER_ADDR|MASTER_PORT|AZ_BATCH_NODE'
 ```
 
-本次环境中的关键变量为：
+Key variables in this environment:
 
 ```text
 AZUREML_NODE_COUNT=2
@@ -34,61 +34,61 @@ MASTER_PORT=9500
 AZ_BATCH_NODE_LIST=node-0;node-1
 ```
 
-检查本地 GPU：
+Check local GPUs:
 
 ```bash
 nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv,noheader
 ```
 
-检查 worker：
+Check the worker:
 
 ```bash
 ssh -o BatchMode=yes -o ConnectTimeout=10 node-1 \
   'hostname; nvidia-smi --query-gpu=index,name,memory.total,memory.used --format=csv,noheader'
 ```
 
-如果 SSH 失败，DeepSpeed 的跨节点进程也无法正常启动。应先解决节点名解析、SSH key 或 BatchMode 登录问题。
+If SSH fails, DeepSpeed cannot start cross-node processes either. Fix hostname resolution, SSH keys, or BatchMode login first.
 
-## 3. 确认工作目录是否共享
+## 3. Check Whether the Working Directory Is Shared
 
-同一个绝对路径不代表两台机器看到的是同一份文件系统。本次两个节点都有：
+The same absolute path does not mean both machines see the same file system. In this run, both nodes have:
 
 ```text
 /scratch/azureml/cr/j/.../exe/wd
 ```
 
-但 inode/device 信息不同，因此它们是各节点独立的本地目录，不是共享目录。
+However, the inode/device information differs, so these are independent local directories on each node, not a shared directory.
 
-可以这样检查：
+Check it like this:
 
 ```bash
 stat -c '%d:%i %n' "$PWD"
 ssh node-1 "stat -c '%d:%i %n' '$PWD'"
 ```
 
-这会影响：
+This affects the following:
 
-- 修改后的启动脚本必须同步到 worker。
-- Hugging Face dataset cache 必须在两个节点分别准备。
-- 本地输出和日志默认不会自动出现在另一个节点。
-- 不应假设 node-0 创建的临时文件能被 node-1 读取。
+- A modified launch script must be synced to the worker.
+- The Hugging Face dataset cache must be prepared separately on each node.
+- Local outputs and logs do not automatically appear on the other node.
+- Do not assume temporary files created on node-0 can be read by node-1.
 
-当前 launcher 在启动 worker 前使用 `scp` 同步自身：
+The current launcher syncs itself with `scp` before starting the worker:
 
 ```sh
 remote_script="$PWD/$(basename "$0")"
 scp -q "$0" "$host:$remote_script"
 ```
 
-## 4. 确认 InfiniBand 设备
+## 4. Verify InfiniBand Devices
 
-某些镜像没有 `ibv_devinfo`、`ip` 或 `rdma` 命令，不能因为命令不存在就判断机器没有 IB。可以直接检查 sysfs：
+Some images lack `ibv_devinfo`, `ip`, or `rdma`. A missing command does not mean the machine has no IB. Check sysfs directly:
 
 ```bash
 find /sys/class/infiniband -mindepth 1 -maxdepth 1 -printf '%f\n' | sort
 ```
 
-本次两台机器都有：
+Both machines in this run have:
 
 ```text
 mlx5_ib0
@@ -101,7 +101,7 @@ mlx5_ib6
 mlx5_ib7
 ```
 
-检查端口状态：
+Check port state:
 
 ```bash
 for state_file in /sys/class/infiniband/mlx5_ib*/ports/1/state; do
@@ -110,13 +110,13 @@ for state_file in /sys/class/infiniband/mlx5_ib*/ports/1/state; do
 done
 ```
 
-期望每个端口都是：
+Every port should report:
 
 ```text
 4: ACTIVE
 ```
 
-worker 也必须执行同样检查：
+The worker must pass the same check:
 
 ```bash
 ssh node-1 '
@@ -127,9 +127,9 @@ ssh node-1 '
 '
 ```
 
-## 5. NCCL/IB 环境变量
+## 5. NCCL/IB Environment Variables
 
-当前脚本显式设置：
+The current script explicitly sets:
 
 ```sh
 export NCCL_IB_DISABLE="${NCCL_IB_DISABLE:-0}"
@@ -140,35 +140,35 @@ export NCCL_SOCKET_IFNAME="${NCCL_SOCKET_IFNAME:-eth0}"
 export NCCL_DEBUG="${NCCL_DEBUG:-INFO}"
 ```
 
-含义：
+Meaning:
 
-- `NCCL_IB_DISABLE=0`：启用 IB transport。
-- `NCCL_IB_HCA=...`：限制 NCCL 使用实际存在的 8 个 IB HCA。
-- `NCCL_IB_PCI_RELAXED_ORDERING=1`：允许 PCIe relaxed ordering。
-- `NCCL_NET_GDR_LEVEL=5`：允许 GPU Direct RDMA。
-- `NCCL_SOCKET_IFNAME=eth0`：socket/bootstrap 走 `eth0`；这不代表数据面走以太网。
-- `NCCL_DEBUG=INFO`：启动期间输出足够的 NCCL 诊断信息。
+- `NCCL_IB_DISABLE=0`: enables the IB transport.
+- `NCCL_IB_HCA=...`: restricts NCCL to the 8 IB HCAs that actually exist.
+- `NCCL_IB_PCI_RELAXED_ORDERING=1`: allows PCIe relaxed ordering.
+- `NCCL_NET_GDR_LEVEL=5`: allows GPU Direct RDMA.
+- `NCCL_SOCKET_IFNAME=eth0`: socket/bootstrap traffic goes over `eth0`; this does not mean the data plane uses Ethernet.
+- `NCCL_DEBUG=INFO`: emits enough NCCL diagnostics during startup.
 
-`eth0` 通常只承担 NCCL bootstrap/OOB。判断 IB 是否生效，应查看 NCCL 数据通道，而不是只看 `NCCL_SOCKET_IFNAME`。
+`eth0` usually only carries NCCL bootstrap/OOB traffic. To determine whether IB is in effect, inspect the NCCL data channels rather than `NCCL_SOCKET_IFNAME`.
 
-## 6. 如何确认真的使用了 IB
+## 6. How to Confirm IB Is Actually Used
 
-仅设置 `NCCL_IB_DISABLE=0` 不等于实际使用 IB。必须在日志中找到以下证据。
+Setting `NCCL_IB_DISABLE=0` alone does not mean IB is actually used. You must find the following evidence in the log.
 
-### 6.1 NCCL 选择 IB network
+### 6.1 NCCL Selects the IB Network
 
 ```text
 NCCL INFO NET/IB : Using [0]mlx5_ib0:1/IB ... [7]mlx5_ib7:1/IB
 NCCL INFO Using network IB
 ```
 
-快速检查：
+Quick check:
 
 ```bash
 grep -E 'NET/IB|Using network IB' user_logs/user_profile_multi_gpu.log | head -40
 ```
 
-### 6.2 16 个 rank 全部初始化
+### 6.2 All 16 Ranks Initialize
 
 ```text
 rank 0 nranks 16 ... Init COMPLETE
@@ -176,15 +176,15 @@ rank 0 nranks 16 ... Init COMPLETE
 rank 15 nranks 16 ... Init COMPLETE
 ```
 
-检查：
+Check:
 
 ```bash
 grep 'nranks 16.*Init COMPLETE' user_logs/user_profile_multi_gpu.log
 ```
 
-### 6.3 跨节点通道使用 GDRDMA
+### 6.3 Cross-Node Channels Use GDRDMA
 
-最重要的成功标志：
+The most important success indicator:
 
 ```text
 via NET/IB/0/GDRDMA
@@ -193,60 +193,60 @@ via NET/IB/1/GDRDMA
 via NET/IB/7/GDRDMA
 ```
 
-检查：
+Check:
 
 ```bash
 grep 'NET/IB/.*/GDRDMA' user_logs/user_profile_multi_gpu.log | head -40
 ```
 
-如果只看到 `NET/Socket`，说明 NCCL 回退到了 TCP/socket，并没有使用 IB 数据通道。
+If you only see `NET/Socket`, NCCL has fallen back to TCP/socket and is not using the IB data channels.
 
-### 6.4 通信拓扑完成
+### 6.4 Communication Topology Is Complete
 
 ```text
 NCCL INFO Connected all trees
 ```
 
-两个节点的 16 个 rank 都应完成 communicator 初始化。
+All 16 ranks across both nodes should finish communicator initialization.
 
-## 7. 第一次失败：DeepSpeed 默认依赖 pdsh
+## 7. First Failure: DeepSpeed Depends on pdsh by Default
 
-最初直接使用：
+The initial attempt used:
 
 ```bash
 deepspeed --hostfile /job/hostfile ...
 ```
 
-`/job/hostfile` 内容正确：
+The contents of `/job/hostfile` were correct:
 
 ```text
 node-0 slots=8
 node-1 slots=8
 ```
 
-但 DeepSpeed 默认多节点 launcher 是 `pdsh`，镜像中没有安装，报错：
+However, DeepSpeed's default multi-node launcher is `pdsh`, which is not installed in the image:
 
 ```text
 RuntimeError: launcher 'pdsh' not installed.
 ```
 
-尝试使用 `apt-get install pdsh` 也失败，因为当前容器没有 root 权限：
+Trying `apt-get install pdsh` also failed because the container has no root privileges:
 
 ```text
 Permission denied
 ```
 
-经验：
+Lessons:
 
-- hostfile 正确不代表 launcher 依赖已安装。
-- 在受限训练镜像中不要把 root/package installation 当成必然可用。
-- 如果没有 `pdsh`，不需要阻塞等待镜像重建，可以使用 DeepSpeed `--no_ssh` 模式。
+- A correct hostfile does not mean the launcher's dependencies are installed.
+- In restricted training images, do not assume root access or package installation is available.
+- Without `pdsh`, there is no need to wait for an image rebuild; use DeepSpeed's `--no_ssh` mode instead.
 
-## 8. 最终方案：DeepSpeed --no_ssh
+## 8. Final Solution: DeepSpeed --no_ssh
 
-`--no_ssh` 并不是“不使用多节点”，而是 DeepSpeed 不负责从 rank 0 自动拉起其他节点。每个节点都要主动运行一次 launcher，并传入自己的 `node_rank`。
+`--no_ssh` does not mean "no multi-node". It means DeepSpeed does not automatically start the other nodes from rank 0. Each node must run the launcher itself and pass its own `node_rank`.
 
-每个节点使用：
+Each node uses:
 
 ```bash
 deepspeed --no_ssh \
@@ -258,15 +258,15 @@ deepspeed --no_ssh \
   deepspeed_user_profile_trainer.py ...
 ```
 
-node-0 负责：
+node-0 is responsible for:
 
-1. 从 `/job/hostfile` 读取 worker。
-2. 用 `scp` 同步最新版脚本。
-3. 通过已有 SSH 通道在 worker 启动 `DEEPSPEED_NODE_RANK=1`。
-4. 在本机启动 `node_rank=0`。
-5. 等待所有本地和远程 launcher，并传播失败退出码。
+1. Reading the workers from `/job/hostfile`.
+2. Syncing the latest script with `scp`.
+3. Starting `DEEPSPEED_NODE_RANK=1` on the worker over the existing SSH channel.
+4. Starting `node_rank=0` locally.
+5. Waiting for all local and remote launchers and propagating failure exit codes.
 
-核心结构：
+Core structure:
 
 ```sh
 if [ "$node_count" -gt 1 ] && [ -z "${DEEPSPEED_NODE_RANK:-}" ]; then
@@ -286,40 +286,40 @@ if [ "$node_count" -gt 1 ] && [ -z "${DEEPSPEED_NODE_RANK:-}" ]; then
 fi
 ```
 
-递归启动通过 `DEEPSPEED_NODE_RANK` 防止：worker 收到该变量后只执行自己的 `run_node`，不会再次 SSH 启动其他节点。
+`DEEPSPEED_NODE_RANK` prevents recursive launching: once a worker receives this variable, it only runs its own `run_node` and does not SSH into other nodes again.
 
-## 9. Hugging Face gated dataset 与凭据安全
+## 9. Hugging Face Gated Dataset and Credential Safety
 
-本次 dataset：
+Dataset used in this run:
 
 ```text
 yufan/user_profile_dataset
 ```
 
-仓库 metadata 是公开的，但数据为 gated。匿名访问 config 时会报：
+The repository metadata is public, but the data is gated. Anonymous access to a config fails with:
 
 ```text
 DatasetNotFoundError: ... is a gated dataset ... must be authenticated
 ```
 
-### 不推荐的方法
+### Not Recommended
 
-不要执行：
+Do not run:
 
 ```bash
 deepspeed trainer.py --hf_token "$HF_TOKEN"
 ```
 
-原因：
+Reasons:
 
-- token 会出现在每个 rank 的进程命令行中。
-- `ps`、launcher 日志和错误日志可能记录完整参数。
-- 16 个 rank 会把泄漏面扩大。
-- 不要把 token 写进脚本、Markdown、hostfile、`.deepspeed_env` 或 git。
+- The token appears in the process command line of every rank.
+- `ps`, launcher logs, and error logs may record the full arguments.
+- 16 ranks multiply the exposure surface.
+- Never write the token into scripts, Markdown, the hostfile, `.deepspeed_env`, or git.
 
-### 本次采用的方法
+### Approach Used in This Run
 
-在每个节点分别使用 token 预取 dataset：
+Prefetch the dataset with the token on each node separately:
 
 ```bash
 HF_TOKEN='<token>' python - <<'PY'
@@ -338,16 +338,16 @@ for config in configs:
 PY
 ```
 
-因为两个节点的 `$HOME` 和 Hugging Face cache 不共享，node-0 和 node-1 都必须预取。
+Because `$HOME` and the Hugging Face cache are not shared between the two nodes, both node-0 and node-1 must prefetch.
 
-完成后，训练使用离线 cache，不把 token 传入 trainer：
+Afterwards, training uses the offline cache and the token is never passed to the trainer:
 
 ```text
 HF_HUB_OFFLINE=1
 HF_DATASETS_OFFLINE=1
 ```
 
-本次缓存数据量：
+Cached data size in this run:
 
 ```text
 User_Profile_L1_gpt54_MaxLen15360:
@@ -359,13 +359,13 @@ User_Profile_L2_gpt54_MaxLen15360:
   test: 4696
 ```
 
-如果 token 曾经出现在聊天、终端回显、日志或命令行中，应立即在 Hugging Face 撤销并轮换。不要把旧 token 再用于其他作业。
+If a token has ever appeared in a chat, terminal echo, log, or command line, revoke and rotate it on Hugging Face immediately. Do not reuse the old token for other jobs.
 
-## 10. DeepSpeed 环境变量传播
+## 10. DeepSpeed Environment Variable Propagation
 
-DeepSpeed 不会任意传播所有 shell 环境变量。它会传播部分已知前缀，并读取 `DS_ENV_FILE` 指定的环境文件。
+DeepSpeed does not propagate arbitrary shell environment variables. It propagates certain known prefixes and reads the environment file specified by `DS_ENV_FILE`.
 
-当前脚本用临时文件传播 Hugging Face offline 设置：
+The current script propagates the Hugging Face offline settings through a temporary file:
 
 ```sh
 DEEPSPEED_ENV_FILE="$(mktemp)"
@@ -377,16 +377,16 @@ printf '%s\n' \
 export DS_ENV_FILE="$DEEPSPEED_ENV_FILE"
 ```
 
-注意：
+Notes:
 
-- 只放非敏感配置。
-- 临时文件在 launcher 退出时删除。
-- 不要把 `HF_TOKEN`、W&B key 或其他 secret 写入该文件。
-- `NCCL_*` 变量由 DeepSpeed/CUDA accelerator launcher 传播，但仍应通过日志验证 worker 是否实际收到并生效。
+- Put only non-sensitive configuration in it.
+- The temporary file is deleted when the launcher exits.
+- Never write `HF_TOKEN`, W&B keys, or other secrets into this file.
+- `NCCL_*` variables are propagated by the DeepSpeed/CUDA accelerator launcher, but you should still verify from the logs that the worker actually received and applied them.
 
-## 11. 启动命令
+## 11. Launch Commands
 
-建议保存完整日志：
+Save the full log:
 
 ```bash
 mkdir -p user_logs
@@ -395,29 +395,29 @@ sh ./run_user_profile_multi_gpu.sh \
   > user_logs/user_profile_multi_gpu.log 2>&1
 ```
 
-需要后台运行时，使用作业平台或终端工具提供的受管后台模式。不要随意使用 `nohup` 后失去进程树和退出码。
+To run in the background, use the managed background mode provided by the job platform or terminal tooling. Do not casually use `nohup` and lose the process tree and exit code.
 
-关闭 rollout evaluation、只做 perplexity evaluation：
+Disable rollout evaluation and run only perplexity evaluation:
 
 ```bash
 ROLLOUT_EVAL=0 sh ./run_user_profile_multi_gpu.sh \
   > user_logs/user_profile_multi_gpu.log 2>&1
 ```
 
-覆盖 master port：
+Override the master port:
 
 ```bash
 MASTER_PORT=29500 sh ./run_user_profile_multi_gpu.sh \
   > user_logs/user_profile_multi_gpu.log 2>&1
 ```
 
-如果端口被占用，换一个所有节点都可访问的空闲端口，并确保两端使用同一个值。
+If the port is in use, switch to a free port reachable from all nodes and make sure both sides use the same value.
 
-## 12. 启动后的健康检查
+## 12. Post-Launch Health Checks
 
-### 检查 local rank 数量
+### Check the Number of Local Ranks
 
-node-0：
+node-0:
 
 ```bash
 ps -eo pid,stat,etime,cmd \
@@ -425,7 +425,7 @@ ps -eo pid,stat,etime,cmd \
   | grep -v grep
 ```
 
-node-1：
+node-1:
 
 ```bash
 ssh node-1 \
@@ -434,9 +434,9 @@ ssh node-1 \
    | grep -v grep"
 ```
 
-每台机器都应看到 8 个 local rank。
+Each machine should show 8 local ranks.
 
-### 检查 GPU
+### Check GPUs
 
 ```bash
 nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader
@@ -444,9 +444,9 @@ ssh node-1 \
   'nvidia-smi --query-gpu=index,memory.used,utilization.gpu --format=csv,noheader'
 ```
 
-不要只在初始化后的某一个瞬间看利用率。模型加载、collective barrier、vLLM compile 或数据预处理阶段可能短暂为 0%。应结合进程状态、日志时间戳和显存变化判断。
+Do not judge by utilization at a single instant after initialization. Model loading, collective barriers, vLLM compilation, or data preprocessing can briefly show 0%. Combine process state, log timestamps, and memory changes.
 
-### 检查致命错误
+### Check for Fatal Errors
 
 ```bash
 grep -E \
@@ -454,17 +454,17 @@ grep -E \
   user_logs/user_profile_multi_gpu.log
 ```
 
-### 检查日志是否仍更新
+### Check Whether the Log Is Still Updating
 
 ```bash
 stat -c 'size=%s mtime=%y' user_logs/user_profile_multi_gpu.log
 ```
 
-等待一段时间再次检查。如果文件大小和 mtime 持续不变，再结合进程 `wchan`、CPU 和 GPU 判断是否卡住。
+Wait a while and check again. If the file size and mtime stay unchanged, use process `wchan`, CPU, and GPU activity to decide whether it is stuck.
 
-## 13. vLLM 初始化为什么看起来很慢
+## 13. Why vLLM Initialization Looks Slow
 
-本次开启 colocated vLLM rollout：
+This run enables colocated vLLM rollout:
 
 ```text
 --rollout_eval
@@ -475,18 +475,18 @@ stat -c 'size=%s mtime=%y' user_logs/user_profile_multi_gpu.log
 --no-rollout_enforce_eager
 ```
 
-在真正开始 rollout/training 前，每个 rank 会经历：
+Before rollout/training actually begins, each rank goes through:
 
-1. NCCL communicator 初始化。
-2. 从 FUSE model path 加载约 8.68 GiB checkpoint。
-3. vLLM 初始化。
-4. `torch.compile`。
-5. initial profiling/warmup。
-6. CUDA graph capture。
-7. vLLM sleep，释放大部分 rollout 显存。
-8. DeepSpeed training model/optimizer 初始化。
+1. NCCL communicator initialization.
+2. Loading a ~8.68 GiB checkpoint from the FUSE model path.
+3. vLLM initialization.
+4. `torch.compile`.
+5. Initial profiling/warmup.
+6. CUDA graph capture.
+7. vLLM sleep, releasing most of the rollout memory.
+8. DeepSpeed training model/optimizer initialization.
 
-本次日志中的关键耗时：
+Key timings from this run's log:
 
 ```text
 torch.compile took about 40-41 seconds
@@ -494,7 +494,7 @@ Initial profiling/warmup run took about 86-88 seconds
 init engine ... took about 230-231 seconds
 ```
 
-因此启动后数分钟 GPU 利用率波动或部分进程处于 `D`/`S` 状态，不一定是挂死。尤其 model path 位于 FUSE 时，读取 checkpoint 可能出现：
+So for several minutes after launch, fluctuating GPU utilization or some processes in `D`/`S` state does not necessarily mean a hang. In particular, when the model path is on FUSE, checkpoint reads may show:
 
 ```text
 fuse_lock_inode
@@ -502,17 +502,17 @@ d_alloc_parallel
 request_wait_answer
 ```
 
-判断是否正常的依据：
+Signs that things are normal:
 
-- 日志 mtime/size 仍在变化。
-- rank 数量没有减少。
-- 没有 traceback 或 launcher child failure。
-- GPU 显存逐步增长。
-- 后续出现 `Graph capturing finished`。
-- 后续出现 `vLLM is asleep`。
-- 后续出现 `Colocated vLLM rollout ready`。
+- Log mtime/size keeps changing.
+- The number of ranks has not decreased.
+- No traceback or launcher child failure.
+- GPU memory grows gradually.
+- `Graph capturing finished` appears later.
+- `vLLM is asleep` appears later.
+- `Colocated vLLM rollout ready` appears later.
 
-本次最终出现：
+This run eventually showed:
 
 ```text
 Colocated vLLM rollout ready: 9732 eval examples from [
@@ -521,91 +521,91 @@ Colocated vLLM rollout ready: 9732 eval examples from [
 ]
 ```
 
-这说明 rollout engine、dataset 和 16-rank distributed environment 都已准备完成。
+This means the rollout engine, dataset, and 16-rank distributed environment are all ready.
 
-## 14. 常见问题排查顺序
+## 14. Troubleshooting Order for Common Issues
 
-建议严格按以下顺序排查，避免一开始就怀疑训练代码。
+Follow this order strictly to avoid suspecting the training code first.
 
-### A. 没有 worker 进程
+### A. No Worker Processes
 
-检查：
+Check:
 
 ```bash
 ssh -o BatchMode=yes node-1 hostname
 ```
 
-然后检查：
+Then check:
 
-- hostfile 是否列出 worker。
-- launcher 是否把脚本同步到 worker。
-- worker 的工作目录和 Python/DeepSpeed 是否存在。
-- node rank 是否正确。
+- Whether the hostfile lists the worker.
+- Whether the launcher synced the script to the worker.
+- Whether the worker's working directory and Python/DeepSpeed exist.
+- Whether the node rank is correct.
 
-### B. DeepSpeed 报 pdsh 未安装
+### B. DeepSpeed Reports pdsh Not Installed
 
-现象：
+Symptom:
 
 ```text
 RuntimeError: launcher 'pdsh' not installed.
 ```
 
-解决：
+Fix:
 
-- 有 root 权限：安装 `pdsh`。
-- 无 root 权限：改用 `deepspeed --no_ssh`，每节点主动启动。
+- With root access: install `pdsh`.
+- Without root access: switch to `deepspeed --no_ssh` and start each node explicitly.
 
-### C. 只有 8 个 rank
+### C. Only 8 Ranks
 
-说明只有 node-0 启动。
+Only node-0 has started.
 
-检查：
+Check:
 
-- node-1 的 SSH 命令是否执行。
-- `DEEPSPEED_NODE_RANK=1` 是否传入。
-- 两边 `--num_nodes=2` 是否一致。
-- `MASTER_ADDR` 是否是 worker 可访问的 node-0 地址。
-- `MASTER_PORT` 是否一致且未被占用。
+- Whether the SSH command for node-1 was executed.
+- Whether `DEEPSPEED_NODE_RANK=1` was passed.
+- Whether `--num_nodes=2` matches on both sides.
+- Whether `MASTER_ADDR` is a node-0 address reachable from the worker.
+- Whether `MASTER_PORT` matches and is not in use.
 
-### D. rank 卡在 rendezvous
+### D. Ranks Stuck at Rendezvous
 
-检查：
+Check:
 
-- `MASTER_ADDR` 不能是仅 node-0 本地可见的 loopback。
-- master port 必须对两个节点可达。
-- 两边 world info、node count、GPU count 必须一致。
-- 旧进程是否还占用 master port。
+- `MASTER_ADDR` must not be a loopback address visible only on node-0.
+- The master port must be reachable from both nodes.
+- World info, node count, and GPU count must match on both sides.
+- Whether a stale process is still holding the master port.
 
-### E. NCCL 回退到 socket
+### E. NCCL Falls Back to Socket
 
-日志只出现：
+The log only shows:
 
 ```text
 NET/Socket
 ```
 
-检查：
+Check:
 
-- `/sys/class/infiniband` 是否存在设备。
-- IB port 是否为 `ACTIVE`。
-- `NCCL_IB_DISABLE` 是否误设为 `1`。
-- `NCCL_IB_HCA` 是否写错。
-- container 是否挂载 IB device。
-- NCCL/OFED/driver 是否兼容。
+- Whether devices exist under `/sys/class/infiniband`.
+- Whether IB ports are `ACTIVE`.
+- Whether `NCCL_IB_DISABLE` was mistakenly set to `1`.
+- Whether `NCCL_IB_HCA` is misspelled.
+- Whether the container mounts the IB devices.
+- Whether NCCL/OFED/driver versions are compatible.
 
-### F. GPU 显存低、利用率为零
+### F. Low GPU Memory, Zero Utilization
 
-启动阶段可能是正常现象。先确认：
+This may be normal during startup. First confirm:
 
-- 进程是否仍存活。
-- 日志是否更新。
-- 是否正在 dataset cache、checkpoint I/O、compile、warmup 或 barrier。
+- Whether the processes are still alive.
+- Whether the log is updating.
+- Whether it is in dataset caching, checkpoint I/O, compile, warmup, or a barrier.
 
-只有日志长时间不更新、CPU/GPU 都无活动且所有 rank 卡在同一等待点时，才进一步做 hang dump。
+Only take a hang dump when the log has not updated for a long time, there is no CPU/GPU activity, and all ranks are stuck at the same wait point.
 
-### G. 某个 rank 退出
+### G. A Rank Exits
 
-先找最早出现的异常，而不是只看 launcher 最后的 child failure：
+Find the earliest exception, not just the launcher's final child failure:
 
 ```bash
 grep -n -E \
@@ -614,11 +614,11 @@ grep -n -E \
   | head -100
 ```
 
-分布式作业中，一个 rank 的根因会触发其他 15 个 rank 连锁退出。最后一条错误往往不是根因。
+In a distributed job, the root cause in one rank triggers cascading exits in the other 15 ranks. The last error is often not the root cause.
 
-### H. gated dataset 离线加载失败
+### H. Offline Loading of the Gated Dataset Fails
 
-检查两个节点是否都预取了全部 config：
+Check that both nodes have prefetched every config:
 
 ```bash
 find ~/.cache/huggingface/datasets/yufan___user_profile_dataset -maxdepth 3 -type d
@@ -626,51 +626,51 @@ ssh node-1 \
   'find ~/.cache/huggingface/datasets/yufan___user_profile_dataset -maxdepth 3 -type d'
 ```
 
-如果某一节点缺 cache，应只重新预取缺失 config，不要把 token 放进训练命令行。
+If a node is missing cache, re-prefetch only the missing configs; do not put the token on the training command line.
 
-## 15. 当前脚本的重要设计点
+## 15. Key Design Points of the Current Script
 
-`run_user_profile_multi_gpu.sh` 当前具备：
+`run_user_profile_multi_gpu.sh` currently:
 
-- `set -eu`，遇到未设置变量或失败命令及时退出。
-- 默认启用 8 路 IB HCA 和 GDRDMA。
-- 使用临时 `DS_ENV_FILE` 传播非敏感 offline 配置。
-- 兼容单节点和多节点。
-- 多节点时自动解析 `/job/hostfile`。
-- 自动同步 launcher 到 worker。
-- 使用 `DEEPSPEED_NODE_RANK` 防止递归拉起。
-- node-0 等待 worker，并返回失败状态。
-- 不把 Hugging Face token 传给训练进程。
-- rollout evaluation 可通过 `ROLLOUT_EVAL=0` 关闭。
+- Uses `set -eu` to exit promptly on unset variables or failed commands.
+- Enables 8 IB HCAs and GDRDMA by default.
+- Uses a temporary `DS_ENV_FILE` to propagate non-sensitive offline configuration.
+- Supports both single-node and multi-node runs.
+- Automatically parses `/job/hostfile` in multi-node mode.
+- Automatically syncs the launcher to workers.
+- Uses `DEEPSPEED_NODE_RANK` to prevent recursive launching.
+- Has node-0 wait for workers and return a failure status.
+- Does not pass the Hugging Face token to training processes.
+- Allows disabling rollout evaluation via `ROLLOUT_EVAL=0`.
 
-## 16. 可以继续增强的地方
+## 16. Possible Future Improvements
 
-后续若要把 launcher 做得更通用，可以增加：
+To make the launcher more general, consider adding:
 
-- 启动前自动检查每个节点 GPU 数量。
-- 启动前自动检查所有 IB port 状态。
-- SSH/SCP 失败时输出明确的 host 和 node rank。
-- 为每个节点、每个 rank 设置独立日志文件。
-- 检查 `MASTER_PORT` 是否已占用。
-- 处理 `SIGINT`/`SIGTERM` 时主动终止 worker launcher。
-- 支持任意节点数，而不只是假设两个节点。
-- 给 worker 分发必要的代码文件或使用明确的共享代码目录。
-- 对 model path、dataset cache、output path 做启动前可见性检查。
-- 在正式训练前运行一个小型 NCCL all-reduce smoke test。
+- Automatic pre-launch check of GPU count on each node.
+- Automatic pre-launch check of all IB port states.
+- Clear host and node rank output when SSH/SCP fails.
+- Separate log files per node and per rank.
+- A check for whether `MASTER_PORT` is already in use.
+- Actively terminating worker launchers on `SIGINT`/`SIGTERM`.
+- Support for an arbitrary number of nodes, not just two.
+- Distributing required code files to workers, or using an explicit shared code directory.
+- Pre-launch visibility checks for the model path, dataset cache, and output path.
+- A small NCCL all-reduce smoke test before real training.
 
-## 17. 最小成功判据
+## 17. Minimum Success Criteria
 
-只有同时满足以下条件，才能认为多节点训练真正启动成功：
+Multi-node training can only be considered truly launched when all of the following hold:
 
-1. node-0 有 8 个 local rank。
-2. node-1 有 8 个 local rank。
-3. NCCL 显示 `nranks 16`。
-4. 所有 rank 都出现 `Init COMPLETE`。
-5. NCCL 显示 `Using network IB`。
-6. 跨节点 channel 显示 `NET/IB/*/GDRDMA`。
-7. 两节点 GPU 都有训练进程和显存占用。
-8. 日志持续更新且没有 traceback/child failure。
-9. vLLM 场景下出现 `Colocated vLLM rollout ready`。
-10. 最终出现 evaluation/training progress、loss 或 checkpoint。
+1. node-0 has 8 local ranks.
+2. node-1 has 8 local ranks.
+3. NCCL reports `nranks 16`.
+4. Every rank shows `Init COMPLETE`.
+5. NCCL reports `Using network IB`.
+6. Cross-node channels show `NET/IB/*/GDRDMA`.
+7. GPUs on both nodes have training processes and memory usage.
+8. The log keeps updating with no traceback/child failure.
+9. In the vLLM setup, `Colocated vLLM rollout ready` appears.
+10. Evaluation/training progress, loss, or checkpoints eventually appear.
 
-只看到进程存在、只看到 16 张 GPU、或只设置了 NCCL 环境变量，都不足以证明多节点 IB 训练已经正确运行。
+Seeing processes exist, seeing 16 GPUs, or merely setting NCCL environment variables is not enough to prove that multi-node IB training is running correctly.
