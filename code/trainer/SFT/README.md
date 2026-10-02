@@ -252,8 +252,13 @@ fixed-length padding to `--max_seq_len`. The FLA fast path depends only on the i
 ### Qwen3.5 linear-attention fast-path installation
 
 Qwen3.5-4B has 24 linear-attention layers and 8 full-attention layers. Without the packages below,
-Transformers falls back to its PyTorch implementation for Gated Delta Rule and causal Conv1D. Install the
-FLA/Triton implementation and the CUDA Conv1D extension on **every node**:
+Transformers falls back to its PyTorch implementation for Gated Delta Rule and causal Conv1D.
+
+The project `UU_LLM/Dockerfile` already installs both: `fla-core` / `flash-linear-attention` 0.5.2 with
+`--no-deps`, and `causal-conv1d` 1.7.0 built from source with its `setup.py` patched to a single architecture
+(`--build-arg CAUSAL_CONV1D_CUDA_ARCH=80` by default; change it for non-A100 GPUs). For a container built
+from an older image, install the FLA/Triton implementation and the CUDA Conv1D extension manually on
+**every node**:
 
 ```bash
 python -m pip install --user flash-linear-attention==0.5.2
@@ -321,7 +326,9 @@ Raw logs: `user_logs/training_speed_baseline_zero3.log`,
 
 ## Environment
 
-Run inside the project Docker image (`UU_LLM/Dockerfile`): torch 2.11, vLLM 0.24, transformers 5.x, DeepSpeed.
+Run inside the project Docker image (`UU_LLM/Dockerfile`): torch 2.11, vLLM 0.24, transformers 5.x, DeepSpeed,
+plus the Qwen3.5 linear-attention fast path (`flash-linear-attention` 0.5.2 and `causal-conv1d` 1.7.0 built for
+A100 / SM80; see [Qwen3.5 linear-attention fast-path installation](#qwen35-linear-attention-fast-path-installation)).
 vLLM 0.24 supports only the full multimodal architecture, so training, checkpoints and rollout all use
 `Qwen3_5ForConditionalGeneration` (see `UU_LLM/docs/qwen3_5_training_rollout_inference_decision.md`).
 
