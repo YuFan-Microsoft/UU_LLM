@@ -4,6 +4,87 @@ Full-parameter SFT of `Qwen3_5ForConditionalGeneration` (e.g. Qwen3.5-4B) with D
 Evaluation is perplexity on the test split by default. Optionally, a colocated vLLM engine also rolls out a
 fixed test subset and scores the outputs with the rule checks used for data cleaning.
 
+## Training speed optimization log
+
+Benchmark invariants: 5 nodes × 8 A100 80GB, 40 global ranks, per-device batch size 1,
+`max_seq_len=15360`, gradient checkpointing enabled, and the same shuffled training samples. Evaluation,
+rollout, checkpoint saving, and W&B are disabled. Each experiment runs exactly 5 optimizer steps;
+steady-state numbers exclude step 1. The first experiments used right-side dynamic padding. Starting with the
+fixed-length stress tests, every sequence tensor is right-padded to exactly 15360 tokens to validate
+worst-case memory use.
+
+### Fixed-length 15360 stress tests
+
+| Experiment | Change | 5-step QPS | Steady-state QPS | Peak GPU memory | Result |
+| --- | --- | --- | --- | --- | --- |
+| Fixed-length baseline | ZeRO-3 baseline buckets, default attention, 0 DataLoader workers | 0.021757 step/s; 0.870 sample/s | 0.022872 step/s; 0.915 sample/s | 55.56 GiB allocated; 65.29 GiB reserved | Reference stress test; completed without OOM |
+| ZeRO-3 communication tuning | 500M reduce/prefetch buckets, larger live-parameter window, contiguous gradients, reduce-scatter, and overlapped communication | 0.023380 step/s; 0.935 sample/s | 0.024645 step/s; 0.986 sample/s | 57.20 GiB allocated; 69.03 GiB reserved | Kept over baseline; about 7.5% higher full-run sample QPS |
+| ZeRO-2 communication tuning | Replicate parameters, partition optimizer and gradients, use 500M communication buckets and overlap | 0.023808 step/s; 0.952 sample/s | 0.024724 step/s; 0.989 sample/s | 62.40 GiB allocated; 74.72 GiB reserved | Slightly faster than tuned ZeRO-3, but only about 5 GiB reserved-memory headroom remains |
+| ZeRO-2 + FlashAttention 2 | Enable FlashAttention 2 on top of tuned ZeRO-2 | 0.026210 step/s; 1.048 sample/s | 0.027473 step/s; 1.099 sample/s | 62.18 GiB allocated; 74.50 GiB reserved | Faster, but ZeRO-2's memory cost is not justified when its non-attention gain over tuned ZeRO-3 is only about 1.8% |
+| ZeRO-3 + FlashAttention 2 | Enable FlashAttention 2 on top of tuned ZeRO-3 | 0.024851 step/s; 0.994 sample/s | 0.026197 step/s; 1.048 sample/s | 56.98 GiB allocated; 68.81 GiB reserved | Preferred over ZeRO-2: only about 4.9% lower steady-state throughput, with about 5.7 GiB less reserved memory |
+| ZeRO-3 + FlashAttention 2 + FLA fast path | Add `flash-linear-attention` Gated Delta Rule and `causal-conv1d` CUDA kernels | 0.037485 step/s; 1.499 sample/s | 0.261867 step/s; 10.475 sample/s | 56.98 GiB allocated; 68.13 GiB reserved | Major win; steady-state throughput is about 10× the same ZeRO-3/FlashAttention configuration. The first measured step includes initial Triton kernel compilation |
+| FLA fast path, warm kernel cache | Repeat the previous configuration after Triton kernels are cached on every node | 0.186207 step/s; 7.448 sample/s | 0.265927 step/s; 10.637 sample/s | 56.98 GiB allocated; 68.13 GiB reserved | Confirmed result; use this row for expected repeated-run throughput |
+
+Raw logs: `user_logs/fixed15360_baseline_zero3.log`,
+`user_logs/fixed15360_zero3_overlap.log`,
+`user_logs/fixed15360_zero2_overlap.log`,
+`user_logs/fixed15360_zero2_flashattn2.log`,
+`user_logs/fixed15360_zero3_flashattn2.log`,
+`user_logs/fixed15360_zero3_flashattn2_fla.log`,
+`user_logs/fixed15360_zero3_flashattn2_fla_warm.log`.
+
+### Qwen3.5 linear-attention fast-path installation
+
+Qwen3.5-4B has 24 linear-attention layers and 8 full-attention layers. Without the packages below,
+Transformers falls back to its PyTorch implementation for Gated Delta Rule and causal Conv1D. Install the
+FLA/Triton implementation and the CUDA Conv1D extension on **every node**:
+
+```bash
+python -m pip install --user flash-linear-attention==0.5.2
+
+TORCH_CUDA_ARCH_LIST=8.0 MAX_JOBS=16 \
+  python -m pip install --user --no-build-isolation causal-conv1d==1.7.0
+```
+
+`TORCH_CUDA_ARCH_LIST=8.0` is intentional for the A100 cluster. Without it, the package builds kernels for
+many unrelated GPU architectures (SM75, SM87, SM90, SM100, SM120, and others), making installation appear
+stuck for a long time. Do not reuse this exact architecture setting on a non-A100 cluster.
+
+Environment used for this installation:
+
+| Component | Version |
+| --- | --- |
+| GPU | NVIDIA A100 80GB, compute capability 8.0 |
+| PyTorch | 2.11.0+cu130 |
+| CUDA toolkit | 13.0.88 |
+| Triton | 3.6.0 |
+| flash-linear-attention | 0.5.2 |
+| causal-conv1d | 1.7.0 |
+
+After installation, verify rather than assuming the fast path is active:
+
+```bash
+python - <<'PY'
+from transformers.utils.import_utils import (
+    is_causal_conv1d_available,
+    is_flash_linear_attention_available,
+)
+
+print("flash_linear_attention", is_flash_linear_attention_available())
+print("causal_conv1d", is_causal_conv1d_available())
+PY
+```
+
+### Preliminary dynamic-padding tests (superseded)
+
+| Experiment | Sequence shape | Change | 5-step QPS | Steady-state QPS | Result |
+| --- | --- | --- | --- | --- | --- |
+| Baseline | Dynamic padding, observed max 12528 | ZeRO-3 baseline buckets, default attention, 0 DataLoader workers | 0.034390 step/s; 1.376 sample/s | 0.036506 step/s; 1.460 sample/s | Reference; IB/GDRDMA was active, so ZeRO-3 communication is the first optimization target |
+| ZeRO-2 communication tuning | Dynamic padding, observed max 12528 | Use ZeRO-2, 500M reduce/all-gather buckets, contiguous gradients, reduce-scatter, and overlapped communication | 0.044529 step/s; 1.781 sample/s | 0.048307 step/s; 1.932 sample/s | Kept; about 29% higher full-run sample QPS and 32% higher steady-state sample QPS |
+
+Raw logs: `user_logs/training_speed_baseline_zero3.log`,
+`user_logs/training_speed_zero2_overlap.log`.
+
 ## Files
 
 | File | Purpose |
@@ -172,5 +253,3 @@ instead of training's 64 / 8192; they only change throughput. Per-example record
 `<eval_dir>/predictions.jsonl` (same fields as `rollout_eval/step_<N>.jsonl`) and metrics to
 `<eval_dir>/evaluation_summary.json`. `--hf_token` (or `HF_TOKEN`) is only needed if the gated dataset is
 not cached. With sampling on, results match training statistically, not token for token.
-
-Weekly Layer-1 inference on raw user behaviors lives in [`../../inference`](../../inference/README.md).
