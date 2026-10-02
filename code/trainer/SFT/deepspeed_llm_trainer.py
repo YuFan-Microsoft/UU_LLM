@@ -4,9 +4,11 @@ import datetime
 import json
 import math
 import re
+import socket
 import time
 from pathlib import Path
 import torch
+import torch.nn.functional as F
 import deepspeed
 import numpy as np
 from safetensors import safe_open
@@ -178,13 +180,17 @@ def log_sft_template_sample(messages, tokenizer, wandb_module=None):
         wandb_module.log({"debug/sft_template_sample": table})
 
 def get_train_ds_config(stage=3):
+    # Communication tuning benchmarked in README "Training speed optimization log" (ZeRO-3 communication tuning).
     zero_opt_dict = {
         "stage": stage,
         "stage3_param_persistence_threshold": 1e4,
-        "stage3_max_live_parameters": 3e7,
-        "stage3_prefetch_bucket_size": 3e7,
+        "stage3_max_live_parameters": 1e9,
+        "stage3_prefetch_bucket_size": 5e8,
         "memory_efficient_linear": False,
-        "reduce_bucket_size": 1e6
+        "reduce_bucket_size": 5e8,
+        "overlap_comm": True,
+        "contiguous_gradients": True,
+        "reduce_scatter": True,
     }
     return {
         "train_batch_size": -1,
@@ -370,6 +376,15 @@ def parse_args(argument_defaults=None):
     parser.add_argument('--per_device_train_batch_size', type=int, default=16)
     parser.add_argument('--per_device_eval_batch_size', type=int, default=16)
     parser.add_argument('--max_seq_len', type=int, default=8192)
+    parser.add_argument('--pad_to_max_seq_len', action=argparse.BooleanOptionalAction, default=True,
+                        help="Right-pad every batch to exactly --max_seq_len (fixed shapes, worst-case memory)")
+    parser.add_argument('--attn_implementation', type=str, default='flash_attention_2',
+                        help="Attention for the full-attention layers, e.g. flash_attention_2 or sdpa")
+    parser.add_argument('--require_linear_attention_kernels', action=argparse.BooleanOptionalAction, default=True,
+                        help="Exit at startup unless flash-linear-attention and causal-conv1d are importable")
+    parser.add_argument('--label_logits_only', action=argparse.BooleanOptionalAction, default=True,
+                        help="Compute lm_head logits only at supervised positions (logits_to_keep) and the loss in "
+                             "the trainer; --no-label_logits_only uses the model's full-sequence loss")
     parser.add_argument('--max_eval_steps', type=int, default=-1)
 
     parser.add_argument('--learning_rate', type=float, default=1e-5)
@@ -465,6 +480,7 @@ def prepare_model(args):
         torch_dtype=torch.bfloat16,
         low_cpu_mem_usage=True,
         trust_remote_code=True,
+        attn_implementation=args.attn_implementation,
     )
     model.config.architectures = [QWEN3_5_MULTIMODAL_ARCH]
     model.config.use_cache = False
@@ -477,7 +493,48 @@ def prepare_model(args):
     return model, processor, optimizer
 
 
-def evaluation(model, eval_dataloader, device, max_eval_steps=-1):
+def compute_loss(model, batch, label_logits_only=True):
+    """Causal-LM loss, the mean over supervised tokens (same value as the model's built-in loss).
+
+    With label_logits_only, lm_head runs only at positions whose next-token label is supervised
+    (assistant answer) instead of all max_seq_len positions. Prompt and padding positions have label -100
+    and never contribute to the loss, so skipping them saves the [seq_len, vocab=248k] logits memory and
+    their lm_head compute.
+
+    Positions are selected per row with a boolean mask in a forward pre-hook on lm_head, so the logits are
+    [total supervised tokens in the batch, vocab]. (`logits_to_keep` takes one index shared by all rows;
+    the union of answer spans made logits grow with batch_size x sum of answer lengths.)
+    """
+    if not label_logits_only:
+        return model(**batch, use_cache=False).loss
+
+    labels = batch["labels"]
+    inputs = {key: value for key, value in batch.items() if key != "labels"}
+    # Logit t predicts token t + 1, so keep position t when labels[t + 1] is supervised.
+    keep = torch.zeros_like(labels, dtype=torch.bool)
+    keep[:, :-1] = labels[:, 1:] != -100
+    targets = labels[:, 1:][keep[:, :-1]]
+
+    module = model.module if hasattr(model, "module") else model
+    lm_head = module.lm_head
+
+    def select_supervised_hidden_states(_, args):
+        return (args[0][keep],) + tuple(args[1:])
+
+    # lm_head sits outside the checkpointed decoder layers, so the hook is not needed for backward recompute.
+    handle = lm_head.register_forward_pre_hook(select_supervised_hidden_states)
+    try:
+        # logits_to_keep=0 hands all positions to lm_head; the hook narrows them to [N, hidden].
+        logits = model(**inputs, use_cache=False, logits_to_keep=0).logits.float()
+    finally:
+        handle.remove()
+    if targets.numel() == 0:
+        # Every rank must still run the forward (ZeRO-3 gathers collectively); contribute a zero loss.
+        return logits.sum() * 0.0
+    return F.cross_entropy(logits, targets)
+
+
+def evaluation(model, eval_dataloader, device, max_eval_steps=-1, label_logits_only=True):
     model.eval()
     losses = 0
     evaluated_steps = 0
@@ -492,8 +549,7 @@ def evaluation(model, eval_dataloader, device, max_eval_steps=-1):
             break
         batch = to_device(batch, device)
         with torch.no_grad():
-            outputs = model(**batch, use_cache=False)
-        loss = outputs.loss
+            loss = compute_loss(model, batch, label_logits_only)
         losses += loss.float()
         evaluated_steps += 1
     if evaluated_steps == 0:
@@ -585,8 +641,34 @@ def rollout_wandb_section(config):
     return f"{match.group(1) if match else config or 'rollout'}_rollout_evaluation"
 
 
+def require_linear_attention_kernels():
+    """Fail fast if this node would fall back to the slow PyTorch Gated Delta Rule / causal Conv1D path.
+
+    Every rank waits for the slowest one, so a single node without the kernels slows the whole job ~10x.
+    """
+    from transformers.utils.import_utils import (
+        is_causal_conv1d_available,
+        is_flash_linear_attention_available,
+    )
+
+    missing = [
+        package for package, available in (
+            ("flash-linear-attention", is_flash_linear_attention_available()),
+            ("causal-conv1d", is_causal_conv1d_available()),
+        ) if not available
+    ]
+    if missing:
+        raise RuntimeError(
+            f"[{socket.gethostname()} rank {os.environ.get('RANK', '?')}] Qwen3.5 linear-attention fast path "
+            f"unavailable: {', '.join(missing)} not importable. Install them on every node (see README "
+            "'Qwen3.5 linear-attention fast-path installation') or pass --no-require_linear_attention_kernels."
+        )
+
+
 def main(argument_defaults=None, rollout_scorer=None):
     args = parse_args(argument_defaults)
+    if args.require_linear_attention_kernels:
+        require_linear_attention_kernels()
     device, ds_config = distributed_config(args)
     model, processor, optimizer = prepare_model(args)
     tokenizer = processor.tokenizer
@@ -605,16 +687,20 @@ def main(argument_defaults=None, rollout_scorer=None):
     train_sampler = RandomSampler(train_dataset) if args.local_rank == -1 else DistributedSampler(train_dataset)
     eval_sampler = SequentialSampler(eval_dataset) if args.local_rank == -1 else DistributedSampler(eval_dataset)
 
+    if args.pad_to_max_seq_len:
+        collator = DataCollatorForSeq2Seq(tokenizer=tokenizer, padding="max_length", max_length=args.max_seq_len)
+    else:
+        collator = DataCollatorForSeq2Seq(tokenizer=tokenizer)
     train_dataloader = DataLoader(
         train_dataset,
-        collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer),
+        collate_fn=collator,
         sampler=train_sampler,
         batch_size=args.per_device_train_batch_size,
         pin_memory=True
     )
     eval_dataloader = DataLoader(
         eval_dataset,
-        collate_fn=DataCollatorForSeq2Seq(tokenizer=tokenizer),
+        collate_fn=collator,
         sampler=eval_sampler,
         batch_size=args.per_device_eval_batch_size,
         pin_memory=True
@@ -677,7 +763,7 @@ def main(argument_defaults=None, rollout_scorer=None):
         if cur_rank == 0:
             print(f"***** Evaluating perplexity before training *****")
         evaluation_result = evaluation(
-            model, eval_dataloader, device, args.max_eval_steps
+            model, eval_dataloader, device, args.max_eval_steps, args.label_logits_only
         )
         initial_ppl = evaluation_result[0]
         initial_loss = evaluation_result[1]
@@ -701,8 +787,7 @@ def main(argument_defaults=None, rollout_scorer=None):
             start_time = time.time()
             batch = to_device(batch, device)
 
-            outputs = model(**batch, use_cache=False)
-            loss = outputs.loss
+            loss = compute_loss(model, batch, args.label_logits_only)
 
             model.backward(loss)
             model.step()
@@ -752,7 +837,7 @@ def main(argument_defaults=None, rollout_scorer=None):
                     if cur_rank == 0:
                         print("***** Evaluating perplexity *****")
                     ppl_eval, eval_loss = evaluation(
-                        model, eval_dataloader, device, args.max_eval_steps
+                        model, eval_dataloader, device, args.max_eval_steps, args.label_logits_only
                     )
                     if cur_rank == 0:
                         print(f"Eval ppl: {ppl_eval}, loss: {eval_loss}")

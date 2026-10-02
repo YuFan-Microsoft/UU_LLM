@@ -13,6 +13,166 @@ steady-state numbers exclude step 1. The first experiments used right-side dynam
 fixed-length stress tests, every sequence tensor is right-padded to exactly 15360 tokens to validate
 worst-case memory use.
 
+### Final fixed-15360 10-step confirmation
+
+After the code was re-uploaded, the launcher and trainer were restored to the selected benchmark
+configuration:
+
+- five-node `deepspeed --no_ssh` launch, 8 GPUs per node;
+- ZeRO-3 with 500M reduce/prefetch buckets, communication overlap, contiguous gradients and reduce-scatter;
+- FlashAttention 2 for the 8 full-attention layers;
+- required FLA and causal-conv1d fast paths for the 24 linear-attention layers;
+- right-padding every batch to exactly 15360 tokens;
+- gradient checkpointing and per-device batch size 1;
+- exactly 10 optimizer steps;
+- evaluation, rollout, W&B and checkpoint saving disabled.
+
+Measured result:
+
+```text
+Step QPS: 0.224726 steps/s
+Sample QPS: 8.989 samples/s
+Steady-state Step QPS: 0.277377 steps/s
+Steady-state Sample QPS: 11.095 samples/s
+Peak GPU memory: 56.98 GiB allocated, 68.15 GiB reserved
+```
+
+GPU usage was sampled every two seconds on all five nodes. For active training samples (node-average memory
+above 50 GiB/GPU and node-average utilization above 20%), the aggregate node-average GPU utilization was
+94.37%; every node reached 100% node-average utilization in at least one sample. The highest observed
+single-GPU memory usage from `nvidia-smi` was 71367 MiB.
+
+| Node | Active samples | Average GPU utilization | Peak node-average utilization |
+| --- | ---: | ---: | ---: |
+| node-0 | 4 | 99.81% | 100.00% |
+| node-1 | 6 | 87.75% | 100.00% |
+| node-2 | 6 | 90.85% | 100.00% |
+| node-3 | 6 | 99.81% | 100.00% |
+| node-4 | 6 | 95.42% | 100.00% |
+
+Raw logs:
+
+- `user_logs/fixed15360_10step_final.log`
+- `user_logs/fixed15360_10step_gpu_usage.csv`
+
+### Supervised-position logits optimization
+
+The final trainer can avoid materializing vocabulary logits for prompt and padding positions. With
+`--label_logits_only`, it:
+
+1. finds, per row, the sequence positions whose next-token label is not `-100`;
+2. runs the model with `logits_to_keep=0` and a forward pre-hook on `lm_head` that selects exactly those
+   hidden states with a boolean mask, giving `[total supervised tokens in the batch, hidden]`;
+3. runs `lm_head` only on that selection;
+4. computes cross-entropy against `labels[:, position + 1]`.
+
+This preserves causal-LM shifting while avoiding the full `[batch, 15360, 248320]` logits tensor, and the
+logits size is proportional to the total answer length in the batch, independent of how answer spans are
+placed across rows. The launcher enables the optimization explicitly.
+
+The measurements below were taken with an earlier version that passed one shared position index (the union
+of supervised positions across the batch) through `logits_to_keep`. At batch size 1 the two versions select
+the same positions; at larger batch sizes the per-row mask computes fewer logits.
+
+Correctness was checked on the same cached training example using both implementations:
+
+```text
+Sequence length: 583
+Supervised tokens: 222
+Full-logits loss: 1.1421434879302979
+Supervised-position-logits loss: 1.1421434879302979
+Absolute difference: 0.0
+```
+
+Fixed-15360, 40-GPU, 10-step comparison:
+
+| Metric | Full logits | Supervised-position logits | Change |
+| --- | ---: | ---: | ---: |
+| Step QPS | 0.224726 | 0.266415 | +18.55% |
+| Sample QPS | 8.989 | 10.657 | +18.55% |
+| Steady-state Step QPS | 0.277377 | 0.294398 | +6.14% |
+| Steady-state Sample QPS | 11.095 | 11.776 | +6.14% |
+| Peak allocated GPU memory | 56.98 GiB | 15.54 GiB | -72.73% |
+| Peak reserved GPU memory | 68.15 GiB | 21.48 GiB | -68.48% |
+
+During active optimized training, sampled node-average GPU utilization was 93.28%; every node reached 100%
+node-average utilization. The highest single-GPU memory usage observed by `nvidia-smi` was 23559 MiB.
+
+Raw logs:
+
+- `user_logs/fixed15360_label_logits_10step.log`
+- `user_logs/fixed15360_label_logits_10step_gpu_usage.csv`
+
+### Batch-size and checkpointing search
+
+The launcher exposes:
+
+```bash
+PER_DEVICE_TRAIN_BATCH_SIZE=<N>
+GRADIENT_CHECKPOINTING=0|1
+```
+
+Fixed-15360 results with supervised-position logits:
+
+| Gradient checkpointing | Per-device batch | Global batch | Run | Sample QPS | Steady-state Sample QPS | Peak allocated / reserved | Result |
+| --- | ---: | ---: | --- | ---: | ---: | --- | --- |
+| On | 1 | 40 | 10 steps | 10.657 | 11.776 | 15.54 / 21.48 GiB | Safe baseline after logits optimization |
+| On | 2 | 80 | 10 steps | **12.350** | **13.151** | 40.28 / 49.60 GiB | Selected optimum: highest overall and steady-state Sample QPS with large memory headroom |
+| On | 3 | 120 | 10 steps | 9.320 | 12.860 | 60.33 / 73.53 GiB | Slower than batch 2 and leaves little reserved-memory headroom |
+| On | 4 | 160 | 1-step probe | 3.259 | N/A | 71.47 / 73.72 GiB | One step passed, but this was not sufficient to prove safety |
+| On | 4 | 160 | 10-step attempt | N/A | N/A | OOM | Rejected: a later batch needed an additional 21.08 GiB allocation |
+| Off | 1 | 40 | 1-step attempt | N/A | N/A | 79.21 GiB in use | Rejected: OOM before completing one optimizer step |
+
+The batch-4 failure was caused by the union of supervised positions across examples in the shared-index
+version: `logits_to_keep` uses one position index for the whole batch, so every row computed logits for every
+row's answer span, and different answer spans could make a later batch retain many more positions than the
+first batch. The trainer now selects positions per row (see above), so this table should be re-measured for
+batch sizes above 1. A one-step memory probe is still not sufficient for selecting the production batch size,
+because answer lengths vary from batch to batch.
+
+Selected optimum:
+
+```text
+Per-device batch size: 2
+Global batch size: 80
+Gradient checkpointing: enabled
+Sample QPS: 12.350 samples/s
+Steady-state Sample QPS: 13.151 samples/s
+Peak GPU memory: 40.28 GiB allocated, 49.60 GiB reserved
+```
+
+Raw logs:
+
+- `user_logs/logits_no_gc_bs1_probe.log`
+- `user_logs/logits_gc_bs2_probe.log`
+- `user_logs/logits_gc_bs2_10step.log`
+- `user_logs/logits_gc_bs3_10step.log`
+- `user_logs/logits_gc_bs4_probe.log`
+- `user_logs/logits_gc_bs4_10step.log`
+
+Gradient checkpointing must remain enabled. A fixed-15360, batch-size-1 probe without gradient checkpointing
+failed before completing one optimizer step:
+
+```text
+CUDA out of memory while allocating 120 MiB
+79.21 GiB in use on an A100 80GB
+77.22 GiB allocated by PyTorch
+```
+
+This was a genuine capacity failure rather than allocator fragmentation: only 34.81 MiB was free and only
+506.86 MiB was reserved but unallocated. The no-checkpointing configuration was therefore rejected and no
+10-step benchmark was attempted. Raw log: `user_logs/fixed15360_no_gc_probe.log`.
+
+Code restored for this confirmation:
+
+- `run_user_profile_multi_gpu.sh`: multi-node launch, offline dataset loading, IB/GDRDMA environment,
+  fixed-length padding, 10-step limit and all non-training work disabled.
+- `deepspeed_llm_trainer.py`: honors `--num_train_steps`, supports `--no-save_model`, stops all ranks at step
+  10, uses non-blocking GPU copies, reports global and steady-state QPS, and reports maximum GPU memory across
+  ranks.
+- The embedded W&B login key was removed; W&B uses normal environment authentication only when explicitly
+  enabled.
+
 ### Fixed-length 15360 stress tests
 
 | Experiment | Change | 5-step QPS | Steady-state QPS | Peak GPU memory | Result |
@@ -33,6 +193,9 @@ Raw logs: `user_logs/fixed15360_baseline_zero3.log`,
 `user_logs/fixed15360_zero3_flashattn2_fla.log`,
 `user_logs/fixed15360_zero3_flashattn2_fla_warm.log`.
 
+The trainer defaults follow the chosen configuration: ZeRO-3 communication tuning, FlashAttention 2 and
+fixed-length padding to `--max_seq_len`. The FLA fast path depends only on the installed packages below.
+
 ### Qwen3.5 linear-attention fast-path installation
 
 Qwen3.5-4B has 24 linear-attention layers and 8 full-attention layers. Without the packages below,
@@ -42,13 +205,17 @@ FLA/Triton implementation and the CUDA Conv1D extension on **every node**:
 ```bash
 python -m pip install --user flash-linear-attention==0.5.2
 
-TORCH_CUDA_ARCH_LIST=8.0 MAX_JOBS=16 \
-  python -m pip install --user --no-build-isolation causal-conv1d==1.7.0
+python -m pip install --user --no-deps \
+  wheels/fla_core-0.5.2-py3-none-any.whl \
+  wheels/flash_linear_attention-0.5.2-py3-none-any.whl \
+  wheels/causal_conv1d-1.7.0-cp312-cp312-linux_x86_64.whl
 ```
 
-`TORCH_CUDA_ARCH_LIST=8.0` is intentional for the A100 cluster. Without it, the package builds kernels for
-many unrelated GPU architectures (SM75, SM87, SM90, SM100, SM120, and others), making installation appear
-stuck for a long time. Do not reuse this exact architecture setting on a non-A100 cluster.
+The causal-conv1d 1.7.0 build script hardcodes many CUDA architectures and ignores
+`TORCH_CUDA_ARCH_LIST=8.0`. Building the source package directly therefore compiles SM75, SM80, SM87, SM90,
+SM100, SM103, SM110, SM120 and SM121. The wheel above was built once after patching `setup.py` to retain only
+`-gencode arch=compute_80,code=sm_80`, then copied to every A100 node. Do not use this wheel on a different
+GPU architecture.
 
 Environment used for this installation:
 
@@ -61,7 +228,9 @@ Environment used for this installation:
 | flash-linear-attention | 0.5.2 |
 | causal-conv1d | 1.7.0 |
 
-After installation, verify rather than assuming the fast path is active:
+After installation, verify rather than assuming the fast path is active. The trainer also runs this check on
+every rank at startup and exits with the host name if either package is missing
+(`--no-require_linear_attention_kernels` disables it):
 
 ```bash
 python - <<'PY'
@@ -135,7 +304,9 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 | Recommended `--max_seq_len` | **15360** (used by `run_user_profile_multi_gpu.sh`) |
 | Hard limit | **19456** — do not go above this |
 
-- `--max_seq_len` bounds the full sequence (prompt + answer) per example.
+- `--max_seq_len` bounds the full sequence (prompt + answer) per example. With the default
+  `--pad_to_max_seq_len`, every batch is also padded to exactly this length, so per-step time and memory do not
+  depend on the actual example lengths.
 - Longer examples are **truncated from the left** (the last `max_seq_len` tokens are kept), which cuts off the
   beginning of the instruction prompt. Pick a length that covers almost all examples instead of relying on
   truncation. Check the distribution with:
@@ -154,12 +325,16 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 | --- | --- | --- |
 | `--model_name_or_path` | required | Qwen3.5 checkpoint directory |
 | `--max_seq_len` | 8192 | See [Sequence length](#sequence-length) |
+| `--pad_to_max_seq_len` | on | Right-pads every train/eval batch to exactly `--max_seq_len` (labels with `-100`), so shapes and memory are fixed at the worst case; `--no-pad_to_max_seq_len` pads to the longest example in the batch |
+| `--attn_implementation` | `flash_attention_2` | For the 8 full-attention layers; requires `flash-attn`, use `sdpa` otherwise |
+| `--require_linear_attention_kernels` | on | Every rank exits at startup unless `flash-linear-attention` and `causal-conv1d` are importable; `--no-require_linear_attention_kernels` allows the slow PyTorch fallback |
+| `--label_logits_only` | on | Train and perplexity eval run `lm_head` only at each row's supervised (answer) positions (boolean-mask pre-hook on `lm_head`) and compute the cross-entropy in the trainer, skipping the `[max_seq_len, 248k]` logits for prompt and padding; the loss value is unchanged. `--no-label_logits_only` uses the model's full-sequence loss |
 | `--learning_rate` | 1e-5 | Cosine schedule by default (`--lr_scheduler_type`) |
 | `--num_train_epochs` | 2 | |
 | `--num_warmup_steps` | -1 | -1 = min(1000, 10% of steps) |
 | `--per_device_train_batch_size` | 16 | User-profile script uses 1 |
 | `--gradient_checkpointing` | off | Needed for long sequences |
-| `--zero_stage` | 3 | |
+| `--zero_stage` | 3 | ZeRO-3 with tuned communication (500M reduce/prefetch buckets, 1e9 max live parameters, overlapped communication, contiguous gradients, reduce-scatter) |
 | `--checkpoint_steps` | 5000 | Eval + checkpoint interval |
 | `--do_eval` / `--max_eval_steps` | 1 / -1 | Perplexity on the test split |
 | `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `train/*`, `eval/*`, `L1_rollout_evaluation/*`, `L2_rollout_evaluation/*` |
