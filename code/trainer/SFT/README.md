@@ -60,19 +60,14 @@ Raw logs:
 The final trainer can avoid materializing vocabulary logits for prompt and padding positions. With
 `--label_logits_only`, it:
 
-1. finds, per row, the sequence positions whose next-token label is not `-100`;
-2. runs the model with `logits_to_keep=0` and a forward pre-hook on `lm_head` that selects exactly those
-   hidden states with a boolean mask, giving `[total supervised tokens in the batch, hidden]`;
-3. runs `lm_head` only on that selection;
-4. computes cross-entropy against `labels[:, position + 1]`.
+1. builds a per-row boolean mask for positions whose next-token label is not `-100`;
+2. installs a temporary forward pre-hook on `lm_head`;
+3. narrows `[batch, sequence, hidden]` to `[total supervised tokens, hidden]`;
+4. runs `lm_head` only for those tokens and computes cross-entropy against the shifted labels.
 
-This preserves causal-LM shifting while avoiding the full `[batch, 15360, 248320]` logits tensor, and the
-logits size is proportional to the total answer length in the batch, independent of how answer spans are
-placed across rows. The launcher enables the optimization explicitly.
-
-The measurements below were taken with an earlier version that passed one shared position index (the union
-of supervised positions across the batch) through `logits_to_keep`. At batch size 1 the two versions select
-the same positions; at larger batch sizes the per-row mask computes fewer logits.
+This preserves causal-LM shifting while avoiding the full `[batch, 15360, 248320]` logits tensor. The
+per-row mask also avoids the earlier `logits_to_keep` position-union behavior, where different answer spans
+inside a batch caused unnecessary logits and memory growth. The launcher enables the optimization explicitly.
 
 Correctness was checked on the same cached training example using both implementations:
 
@@ -81,6 +76,16 @@ Sequence length: 583
 Supervised tokens: 222
 Full-logits loss: 1.1421434879302979
 Supervised-position-logits loss: 1.1421434879302979
+Absolute difference: 0.0
+```
+
+It was also checked with two rows:
+
+```text
+Batch shape: (2, 1024)
+Supervised tokens: 1244
+Full-logits loss: 1.3396435976028442
+Per-row supervised-logits loss: 1.3396435976028442
 Absolute difference: 0.0
 ```
 
@@ -103,6 +108,17 @@ Raw logs:
 - `user_logs/fixed15360_label_logits_10step.log`
 - `user_logs/fixed15360_label_logits_10step_gpu_usage.csv`
 
+Per-row hook improvement over the previous shared-position-union implementation at per-device batch 2:
+
+| Metric | Shared position union | Per-row hook | Change |
+| --- | ---: | ---: | ---: |
+| Sample QPS | 12.350 | **12.673** | +2.62% |
+| Steady-state Sample QPS | 13.151 | **13.535** | +2.92% |
+| Peak allocated GPU memory | 40.28 GiB | **25.05 GiB** | -37.81% |
+| Peak reserved GPU memory | 49.60 GiB | **31.80 GiB** | -35.89% |
+
+Raw log: `user_logs/per_row_logits_bs2_10step.log`.
+
 ### Batch-size and checkpointing search
 
 The launcher exposes:
@@ -112,7 +128,7 @@ PER_DEVICE_TRAIN_BATCH_SIZE=<N>
 GRADIENT_CHECKPOINTING=0|1
 ```
 
-Fixed-15360 results with supervised-position logits:
+The following search used the older shared-position-union logits implementation:
 
 | Gradient checkpointing | Per-device batch | Global batch | Run | Sample QPS | Steady-state Sample QPS | Peak allocated / reserved | Result |
 | --- | ---: | ---: | --- | ---: | ---: | --- | --- |
@@ -123,32 +139,69 @@ Fixed-15360 results with supervised-position logits:
 | On | 4 | 160 | 10-step attempt | N/A | N/A | OOM | Rejected: a later batch needed an additional 21.08 GiB allocation |
 | Off | 1 | 40 | 1-step attempt | N/A | N/A | 79.21 GiB in use | Rejected: OOM before completing one optimizer step |
 
-The batch-4 failure was caused by the union of supervised positions across examples in the shared-index
-version: `logits_to_keep` uses one position index for the whole batch, so every row computed logits for every
-row's answer span, and different answer spans could make a later batch retain many more positions than the
-first batch. The trainer now selects positions per row (see above), so this table should be re-measured for
-batch sizes above 1. A one-step memory probe is still not sufficient for selecting the production batch size,
-because answer lengths vary from batch to batch.
+The old batch-4 failure was caused by the union of supervised positions across examples. The new per-row hook
+removes that specific scaling problem, so old batch-3/batch-4 memory results must not be used to infer the
+current implementation's limit without retesting.
 
-Selected optimum:
+Current safe default with the per-row implementation:
 
 ```text
-Per-device batch size: 2
-Global batch size: 80
+Per-device batch size: 4
+Global batch size: 160
 Gradient checkpointing: enabled
-Sample QPS: 12.350 samples/s
-Steady-state Sample QPS: 13.151 samples/s
-Peak GPU memory: 40.28 GiB allocated, 49.60 GiB reserved
+Sample QPS: 13.216 samples/s
+Steady-state Sample QPS: 13.977 samples/s
+Peak GPU memory: 35.97 GiB allocated, 43.97 GiB reserved
 ```
+
+Per-row logits batch-size retest:
+
+| Per-device batch | Global batch | Sample QPS | Steady-state Sample QPS | Peak allocated / reserved | Result |
+| ---: | ---: | ---: | ---: | --- | --- |
+| 2 | 80 | 12.673 | 13.535 | 25.05 / 31.80 GiB | Safe |
+| 3 | 120 | 12.837 | 13.548 | 29.13 / 36.47 GiB | Safe; marginal throughput gain |
+| 4 | 160 | **13.216** | **13.977** | 35.97 / 43.97 GiB | Selected optimum among tested values |
+| 8 | 320 | 12.552 | **14.832** | 60.66 / 71.57 GiB | Highest steady-state throughput, but lower 10-step average and much less memory headroom |
+
+The old shared-position-union implementation OOMed at batch 4. The new per-row `lm_head` hook eliminates that
+union and completes 10 steps with about 36 GiB allocated, confirming that the prior OOM was caused by logits
+selection rather than decoder activations.
+
+An additional monitored 10-step confirmation measured:
+
+```text
+Sample QPS: 12.248 samples/s
+Steady-state Sample QPS: 13.087 samples/s
+Active-training average GPU utilization: 96.64%
+Peak node-average GPU utilization: 100.00%
+Peak single-GPU nvidia-smi memory: 53257 MiB
+Peak trainer memory: 40.28 GiB allocated, 50.48 GiB reserved
+```
+
+Per-node active-training utilization:
+
+| Node | Average utilization | Peak node-average utilization |
+| --- | ---: | ---: |
+| node-0 | 96.73% | 100.00% |
+| node-1 | 99.03% | 100.00% |
+| node-2 | 96.33% | 100.00% |
+| node-3 | 94.14% | 100.00% |
+| node-4 | 96.76% | 100.00% |
 
 Raw logs:
 
 - `user_logs/logits_no_gc_bs1_probe.log`
 - `user_logs/logits_gc_bs2_probe.log`
 - `user_logs/logits_gc_bs2_10step.log`
+- `user_logs/logits_gc_bs2_10step_util_run.log`
+- `user_logs/logits_gc_bs2_10step_gpu_usage.csv`
 - `user_logs/logits_gc_bs3_10step.log`
 - `user_logs/logits_gc_bs4_probe.log`
 - `user_logs/logits_gc_bs4_10step.log`
+- `user_logs/per_row_logits_bs2_10step.log`
+- `user_logs/per_row_logits_bs3_10step.log`
+- `user_logs/per_row_logits_bs4_10step.log`
+- `user_logs/per_row_logits_bs8_10step.log`
 
 Gradient checkpointing must remain enabled. A fixed-15360, batch-size-1 probe without gradient checkpointing
 failed before completing one optimizer step:
@@ -328,7 +381,6 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 | `--pad_to_max_seq_len` | on | Right-pads every train/eval batch to exactly `--max_seq_len` (labels with `-100`), so shapes and memory are fixed at the worst case; `--no-pad_to_max_seq_len` pads to the longest example in the batch |
 | `--attn_implementation` | `flash_attention_2` | For the 8 full-attention layers; requires `flash-attn`, use `sdpa` otherwise |
 | `--require_linear_attention_kernels` | on | Every rank exits at startup unless `flash-linear-attention` and `causal-conv1d` are importable; `--no-require_linear_attention_kernels` allows the slow PyTorch fallback |
-| `--label_logits_only` | on | Train and perplexity eval run `lm_head` only at each row's supervised (answer) positions (boolean-mask pre-hook on `lm_head`) and compute the cross-entropy in the trainer, skipping the `[max_seq_len, 248k]` logits for prompt and padding; the loss value is unchanged. `--no-label_logits_only` uses the model's full-sequence loss |
 | `--learning_rate` | 1e-5 | Cosine schedule by default (`--lr_scheduler_type`) |
 | `--num_train_epochs` | 2 | |
 | `--num_warmup_steps` | -1 | -1 = min(1000, 10% of steps) |
