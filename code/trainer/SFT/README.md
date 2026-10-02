@@ -172,3 +172,5 @@ instead of training's 64 / 8192; they only change throughput. Per-example record
 `<eval_dir>/predictions.jsonl` (same fields as `rollout_eval/step_<N>.jsonl`) and metrics to
 `<eval_dir>/evaluation_summary.json`. `--hf_token` (or `HF_TOKEN`) is only needed if the gated dataset is
 not cached. With sampling on, results match training statistically, not token for token.
+
+Weekly Layer-1 inference on raw user behaviors lives in [`../../inference`](../../inference/README.md).
