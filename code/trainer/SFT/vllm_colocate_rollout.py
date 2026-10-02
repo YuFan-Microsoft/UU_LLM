@@ -143,6 +143,10 @@ class ColocatedVLLMRollout:
 
         gc.collect()
         torch.cuda.empty_cache()
+        # ZeRO-3 prefetching can leave parameters INFLIGHT (data still empty) after the last forward, and
+        # _params_to_gather only fetches NOT_AVAILABLE ones. Wait for and release them all first.
+        if hasattr(model, "empty_partition_cache"):
+            model.empty_partition_cache()
         self._log_gpu_memory("before vLLM wake-up (training state only)")
         self._wake_up(["weights"])
         vllm_model = self._vllm_model()

@@ -299,6 +299,9 @@ def validate_saved_checkpoint(model, save_dir, expected_state_dict):
 
 
 def save_zero_three_model(model, processor, save_dir):
+    # Release parameters left INFLIGHT by ZeRO-3 prefetching; _z3_params_to_fetch skips them otherwise.
+    if hasattr(model, "empty_partition_cache"):
+        model.empty_partition_cache()
     model_to_save = model.module if hasattr(model, 'module') else model
     validate_full_multimodal_model(model_to_save)
     output_state_dict = {}
