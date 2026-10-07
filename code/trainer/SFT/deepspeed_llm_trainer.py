@@ -719,13 +719,13 @@ def evaluation(model, eval_dataloader, device, max_eval_steps=-1, label_logits_o
 
 
 def eval_log(result: dict, wandb_module) -> dict:
-    """wandb keys for an evaluation() result: overall numbers under eval/, per-task ones under
+    """wandb keys for an evaluation() result: overall numbers under eval/, each task's token_ppl under
     <task>_evaluation/ (the same section as that task's rollout metrics)."""
     log = {f"eval/{key}": value for key, value in result.items() if key != "configs"}
     for config, values in result.get("configs", {}).items():
         section = task_wandb_section(config)
         wandb_module.define_metric(f"{section}/*", step_metric="eval_step")
-        log.update({f"{section}/{key}": value for key, value in values.items()})
+        log[f"{section}/token_ppl"] = values["token_ppl"]
     return log
 
 

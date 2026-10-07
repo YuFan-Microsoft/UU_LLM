@@ -365,11 +365,6 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 
 ## Sequence length
 
-| Setting | Value |
-| --- | --- |
-| Recommended `--max_seq_len` | **20480** (used by `run_user_profile_multi_gpu.sh`; covers every `V1_` row) |
-| Previously validated limit | **19456** — 20480 with batch size 2 is not yet validated; watch for OOM on the first run |
-
 - `--max_seq_len` bounds the full sequence (prompt + answer) per example. With the default
   `--pad_to_max_seq_len`, every batch is also padded to exactly this length, so per-step time and memory do not
   depend on the actual example lengths.
@@ -409,8 +404,8 @@ Eval perplexity (x-axis `eval_step`):
 - `eval/batch_loss`, `eval/batch_ppl`: mean of per-batch losses, then over ranks.
 - `eval/token_loss`, `eval/token_ppl`, `eval/tokens`: total NLL / total supervised tokens over the whole test
   split. Checkpoint names use `token_ppl`.
-- `<task>_evaluation/token_loss`, `token_ppl`, `tokens`: the same token-level numbers for each dataset config,
-  e.g. `L3_Persona_evaluation/token_ppl`. They sit in the same wandb section as that task's rollout metrics.
+- `<task>_evaluation/token_ppl`: the same token-level perplexity for each dataset config, e.g.
+  `L3_Persona_evaluation/token_ppl`. It sits in the same wandb section as that task's rollout metrics.
 
 ## Checkpoints
 
