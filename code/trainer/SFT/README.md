@@ -354,7 +354,7 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 - User-profile SFT loads `yufan/user_profile_dataset`, the eight `V1_` configs (L1, L2, L3 Persona, L3 Commercial,
   L4 Biography, L4 Commercial Preference, L4 Mission Discovery, L4 Mission Enhancement; each with the simplified
   task prompt and rows ≤ 20,480 Qwen3.5-4B tokens), concatenates them and shuffles with `--dataset_shuffle_seed`.
-  Rollout scoring rules exist for L1 and L2; the other configs report `json_valid_ratio` only.
+  Rollout scoring rules exist for all eight configs (see the rollout metrics below).
 - The train split is mixed with `--dataset_mixing_alpha 0.5` (default in `deepspeed_user_profile_trainer.py`):
   each epoch has the rows of one natural epoch, split across configs in proportion to `rows ** 0.5`. Large
   configs (L1, L2, L4 Mission Enhancement, ~0.7-0.9 passes per epoch) see fresh rows each epoch; small configs
@@ -449,16 +449,13 @@ x-axis `eval_step`)
 
 | Layer | Metric | Meaning |
 | --- | --- | --- |
-| L1 | `json_valid_ratio` | Outputs that parse as a JSON object whose top level, interests and topics have exactly the expected keys, with `interests`, `topics`, `source` and `evidence` as lists |
+| All | `json_valid_ratio` | Outputs that (1) parse as a JSON object, (2) have exactly the task's keys at every level, in any order (L2: per decision, the keys of its `action`, which must be `merge` or `add`; L4 Mission Enhancement: the audit blocks are optional), and (3) have the expected value type everywhere (string, int, bool, null, list, object; e.g. L1 `evidence` is a list of ints, L3 Commercial `commercial_score` a string or null). Enum values, empty text and counts are rules, not JSON validity |
+| All | `rule_based_pass_ratio` | Outputs that are JSON-valid and break no rule (L1 / L2 cleaning rules, or the L3 / L4 categories below) |
+| All | `truncated_ratio` | Generations that hit `--rollout_max_tokens` (`finish_reason == "length"`); these usually also fail `json_valid_ratio` |
 | L1 | `topic_evidence_valid_ratio` | Topics whose evidence idx all exist in the input and whose `source` equals their evidence sources |
-| L1 | `simple_rules_pass_ratio` | Outputs passing all other cleaning rules (empty text, duplicates, non-English names, ≥ 40 interests) |
 | L1 | `avg_interest_num` | Average number of interests per output |
-| L2 | `json_valid_ratio` | Outputs that parse as `{"decisions": [...]}` where every decision has `action` `merge` or `add` and exactly the keys for that action |
-| L2 | `simple_rules_pass_ratio` | Outputs passing every Layer-2 cleaning rule |
-| L2 | `delta_exact_match_ratio` | Outputs whose decided `delta_interest_name` values exactly equal the input delta names (same count, each side found in the other, case-sensitive) |
+| L2 | `input_match_ratio` | Outputs whose decided `delta_interest_name` values exactly equal the input delta names (same count, each side found in the other, case-sensitive) |
 | L2 | `merge_ratio` | Share of `merge` among add/merge decisions |
-| L3 / L4 | `json_valid_ratio` | Outputs that parse as a JSON object with exactly the task's keys at every level |
-| L3 / L4 | `simple_rules_pass_ratio` | Outputs with no violation of the categories below |
 | L3 / L4 | `input_match_ratio` | Outputs with no `input_mismatch`. Not logged for L4 Biography and L4 Commercial Preference |
 | L3 Commercial, L4 Enhancement | `query_language_match_ratio_en` | Outputs whose queries are in the requested `query_language` (fastText, below), over rows requesting `en` |
 | L3 Commercial, L4 Enhancement | `query_language_match_ratio_glb` | Same, over rows requesting any other language |
@@ -483,9 +480,8 @@ rollouts requesting `en` / any other language). It needs `fasttext-wheel` and
 `opencc-python-reimplemented` (in the Dockerfile and `requirements_inference.txt`). The model is read from
 `$LID_MODEL_PATH` (default `UU_LLM/models/lid.176.bin`) and downloaded there on first use when missing.
 
-Apart from `json_valid_ratio` (over all samples), ratios are computed over JSON-valid outputs, so read them
-together with
-`json_valid_ratio`. Per-example results (prediction, reference, violated rules) are written to
+`json_valid_ratio`, `rule_based_pass_ratio` and `truncated_ratio` are over all samples; the other ratios are over JSON-valid
+outputs, so read them together with `json_valid_ratio`. Per-example results (prediction, reference, violated rules) are written to
 `<output_dir>/rollout_eval/step_<N>.jsonl`, with metrics in `step_<N>.summary.json`.
 
 **Rollout arguments**

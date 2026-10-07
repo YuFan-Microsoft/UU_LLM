@@ -11,9 +11,12 @@ Flow:
     summarize_records(records)     -> the metrics logged to wandb, per dataset config
 
 Metrics:
-    Layer 1: json_valid_ratio, topic_evidence_valid_ratio, simple_rules_pass_ratio, avg_interest_num
-    Layer 2: json_valid_ratio, simple_rules_pass_ratio, delta_exact_match_ratio, merge_ratio
-    Every L3 / L4 task: json_valid_ratio, simple_rules_pass_ratio, and input_match_ratio
+    Every task: json_valid_ratio (parses, exactly the expected keys at every level in any order, and the expected
+        value types), rule_based_pass_ratio (JSON-valid and no rule violation) and truncated_ratio
+        (generation hit max_tokens), all over every sample
+    Layer 1: topic_evidence_valid_ratio, avg_interest_num
+    Layer 2: input_match_ratio (each input delta decided exactly once, no unknown names), merge_ratio
+    Every L3 / L4 task: input_match_ratio
         (not for L4 Biography / L4 Commercial Preference, which copy no names from the input)
     L3 Commercial and L4 Mission Enhancement also: query_language_match_ratio_en / _glb (fastText lid.176;
         requested query_language "en" / any other language) and
@@ -44,6 +47,32 @@ def normalize_name(value):
 
 def has_text(value):
     return isinstance(value, str) and bool(value.strip())
+
+
+class ListOf:
+    def __init__(self, item):
+        self.item = item
+
+
+NULL = type(None)
+
+
+def matches(value, schema):
+    """True when a parsed JSON value has the schema's shape and value types. A dict schema needs exactly its keys
+    (any order), ListOf(s) a list whose items all match s, a tuple any one of its options, a type that JSON type
+    (int excludes bool), and a function returns its own verdict."""
+    if isinstance(schema, dict):
+        return (isinstance(value, dict) and set(value) == set(schema)
+                and all(matches(value[key], item) for key, item in schema.items()))
+    if isinstance(schema, ListOf):
+        return isinstance(value, list) and all(matches(item, schema.item) for item in value)
+    if isinstance(schema, tuple):
+        return any(matches(value, option) for option in schema)
+    if schema is int:
+        return type(value) is int
+    if isinstance(schema, type):
+        return isinstance(value, schema)
+    return schema(value)
 
 
 def parse_json_object(text):
@@ -96,9 +125,6 @@ L1_TOPIC_KEYS = {"topic", "source", "evidence"}
 L1_MAX_INTERESTS = 40
 L1_NON_LATIN = re.compile(r"[^\x00-\x7F\u00C0-\u024F\u2019\u2013\u2014]")
 
-# Reported by topic_evidence_valid_ratio; every other Layer-1 rule is reported by simple_rules_pass_ratio.
-L1_EVIDENCE_RULES = {"invalid_evidence", "source_evidence_mismatch"}
-
 
 def check_layer1_topic(topic, source_by_idx, violations):
     """Check one topic. Returns True when its evidence and source are both correct."""
@@ -130,23 +156,20 @@ def check_layer1_topic(topic, source_by_idx, violations):
     return True
 
 
+L1_SCHEMA = {
+    "predicted_content_locale": str,
+    "interests": ListOf({
+        "interest_name": str,
+        "topics": ListOf({"topic": str, "source": ListOf(str), "evidence": ListOf(int)}),
+        "actual_activity": str,
+        "inferred_intent": str,
+    }),
+}
+
+
 def layer1_keys_valid(output):
-    """True when the top level, every interest and every topic have exactly the expected keys,
-    and interests / topics / source / evidence are lists."""
-    interests = output.get("interests")
-    if set(output) != L1_TOP_KEYS or not isinstance(interests, list):
-        return False
-    for interest in interests:
-        if not isinstance(interest, dict) or set(interest) != L1_INTEREST_KEYS:
-            return False
-        topics = interest["topics"]
-        if not isinstance(topics, list) or not all(
-            isinstance(topic, dict) and set(topic) == L1_TOPIC_KEYS
-            and isinstance(topic["source"], list) and isinstance(topic["evidence"], list)
-            for topic in topics
-        ):
-            return False
-    return True
+    """JSON-valid: exactly the expected keys at every level, with the expected value types."""
+    return matches(output, L1_SCHEMA)
 
 
 def check_layer1(payload, output):
@@ -251,18 +274,11 @@ def check_layer2_decision_fields(decision, action, violations):
 
 
 def layer2_keys_valid(output):
-    """True when the top level is exactly {"decisions": [...]} and every decision has a valid action
-    and exactly the keys expected for that action."""
-    decisions = output.get("decisions")
-    if set(output) != {"decisions"} or not isinstance(decisions, list):
-        return False
-    return all(
-        isinstance(decision, dict)
-        and isinstance(decision.get("action"), str)
-        and decision["action"] in L2_DECISION_KEYS
-        and set(decision) == L2_DECISION_KEYS[decision["action"]]
-        for decision in decisions
-    )
+    """JSON-valid: exactly {"decisions": [...]}, every decision with a valid action and exactly that action's keys,
+    all of them strings."""
+    return matches(output, {"decisions": ListOf(lambda decision: (
+        isinstance(decision, dict) and one_of(decision.get("action"), L2_DECISION_KEYS)
+        and matches(decision, dict.fromkeys(L2_DECISION_KEYS[decision["action"]], str))))})
 
 
 def check_layer2(payload, output):
@@ -341,7 +357,8 @@ def check_layer2(payload, output):
 
 # ---------------------------------------------------------------------------
 # Layers 3 and 4, mirroring pyscript/data_cleaning/layer3_*_rule_based_clean.py and layer4_*_rule_based_clean.py.
-# keys_valid(output) checks the exact key sets and counts toward json_valid.
+# keys_valid(output) is json_valid: exactly the expected keys at every level (any order) with the expected value
+# types (string, int, bool, null, list, object). Enums, empty text and counts are rules, checked by check().
 # check(payload, output) returns (violations, stats); every violation is one of four categories:
 #     invalid_value   an enum, a count or a required text is wrong
 #     input_mismatch  names, sources, query refs or brands do not match the input, or repeat it
@@ -364,6 +381,11 @@ def string_list(value, allow_empty=True):
     return isinstance(value, list) and (allow_empty or bool(value)) and all(has_text(item) for item in value)
 
 
+def one_of(value, allowed):
+    """Enum check that is safe for any JSON value (lists and dicts are unhashable)."""
+    return isinstance(value, str) and value in allowed
+
+
 def has_duplicates(values):
     folded = [str(value).strip().casefold() for value in values]
     return len(set(folded)) < len(folded)
@@ -379,15 +401,8 @@ def query_format_ok(query, language, min_words, max_words):
 def names_match(payload, returned):
     """True when the returned names are exactly the input interest names, once each."""
     expected = [interest.get("interest_name") for interest in dicts(payload.get("interests"))]
-    return len(set(expected)) == len(expected) and Counter(returned) == Counter(expected)
-
-
-def exact_list_keys(value, keys):
-    return isinstance(value, list) and all(isinstance(item, dict) and set(item) == keys for item in value)
-
-
-def exact_dict_keys(value, keys):
-    return isinstance(value, dict) and set(value) == keys
+    return (all(isinstance(name, str) for name in returned)
+            and len(set(expected)) == len(expected) and Counter(returned) == Counter(expected))
 
 
 # L3 Persona: {"interest_personas": [{"interest_name", "category", "persona"}]}
@@ -395,8 +410,7 @@ L3P_CATEGORY = re.compile(r"^(/[^/\s]([^/]*[^/\s])?)+$")
 
 
 def l3_persona_keys_valid(output):
-    return set(output) == {"interest_personas"} and exact_list_keys(
-        output["interest_personas"], {"interest_name", "category", "persona"})
+    return matches(output, {"interest_personas": ListOf({"interest_name": str, "category": str, "persona": str})})
 
 
 def check_l3_persona(payload, output):
@@ -426,9 +440,9 @@ L3C_STAGES = {"discovery", "research", "consideration", "purchase", "post-purcha
 
 
 def l3_commercial_keys_valid(output):
-    return set(output) == {"interest_commercial"} and exact_list_keys(
-        output["interest_commercial"],
-        {"interest_name", "commercial", "commercial_score", "intent_funnel_stage", *L3C_LIST_KEYS})
+    return matches(output, {"interest_commercial": ListOf({
+        "interest_name": str, "commercial": bool, "commercial_score": (str, NULL), "intent_funnel_stage": (str, NULL),
+        **dict.fromkeys(L3C_LIST_KEYS, ListOf(str))})})
 
 
 def l3_commercial_entry_valid(entry):
@@ -438,7 +452,8 @@ def l3_commercial_entry_valid(entry):
     if not all(string_list(entry.get(key)) for key in L3C_LIST_KEYS):
         return False
     if entry["commercial"]:
-        return (entry.get("commercial_score") in L3C_SCORES and entry.get("intent_funnel_stage") in L3C_STAGES
+        return (one_of(entry.get("commercial_score"), L3C_SCORES)
+                and one_of(entry.get("intent_funnel_stage"), L3C_STAGES)
                 and 1 <= len(entry["predicted_queries"]) <= 3)
     return (entry.get("commercial_score") is None and entry.get("intent_funnel_stage") is None
             and not any(entry[key] for key in L3C_LIST_KEYS))
@@ -468,15 +483,15 @@ L4B_CONFIDENCES = {"high", "medium", "low"}
 
 
 def l4_biography_keys_valid(output):
-    return set(output) == {"life_stage", "biography"} and exact_dict_keys(
-        output["life_stage"], {"value", "confidence", "evidence"})
+    return matches(output, {"life_stage": {"value": str, "confidence": str, "evidence": ListOf(str)}, "biography": str})
 
 
 def check_l4_biography(payload, output):
     violations = set()
     life_stage = output.get("life_stage") if isinstance(output.get("life_stage"), dict) else {}
     evidence, biography = life_stage.get("evidence"), output.get("biography")
-    if (life_stage.get("value") not in L4B_LIFE_STAGES or life_stage.get("confidence") not in L4B_CONFIDENCES
+    if (not one_of(life_stage.get("value"), L4B_LIFE_STAGES)
+            or not one_of(life_stage.get("confidence"), L4B_CONFIDENCES)
             or not string_list(evidence, allow_empty=False) or not has_text(biography)):
         violations.add("invalid_value")
         return violations
@@ -498,41 +513,48 @@ L4P_SHOPPER_TYPES = {"ResearchDriven", "ImpulseDriven", "DealDriven", "PremiumDr
                      "NoveltySeeker", "ConvenienceDriven", "ValueDriven"}
 L4P_RESTRICTIONS = {"Vegan", "Vegetarian", "Keto", "Halal", "Kosher", "No Shellfish", "No Nuts", "No Gluten",
                     "Dairy-Free", "Low-Carb", "Paleo", "Pescatarian"}
-VALUE_DETAILS = {"value", "details"}
+
+
+def l4p_details_schema(level_key):
+    return ListOf({"area": str, level_key: str, "evidence": str, "signal_strength": str})
+
+
+L4P_SCHEMA = {
+    "deal_seeking": {"value": str, "details": l4p_details_schema("seeking")},
+    "price_tier": {"value": str, "details": l4p_details_schema("tier")},
+    "affinity": {
+        "shopping": {
+            "product_categories": ListOf({"category": str, "description": str}),
+            "shopper_type": {"value": ListOf(str), "details": l4p_details_schema("type")},
+        },
+        "dining": {"restrictions": {"value": ListOf(str), "details": l4p_details_schema("restriction")}},
+    },
+}
 
 
 def l4_commercial_preference_keys_valid(output):
-    affinity = output.get("affinity")
-    return (set(output) == {"deal_seeking", "price_tier", "affinity"}
-            and exact_dict_keys(output["deal_seeking"], VALUE_DETAILS)
-            and exact_dict_keys(output["price_tier"], VALUE_DETAILS)
-            and exact_dict_keys(affinity, {"shopping", "dining"})
-            and exact_dict_keys(affinity["shopping"], {"product_categories", "shopper_type"})
-            and exact_dict_keys(affinity["shopping"]["shopper_type"], VALUE_DETAILS)
-            and exact_dict_keys(affinity["dining"], {"restrictions"})
-            and exact_dict_keys(affinity["dining"]["restrictions"], VALUE_DETAILS))
+    return matches(output, L4P_SCHEMA)
 
 
 def l4p_details_valid(details, level_key, levels):
-    return exact_list_keys(details, {"area", level_key, "evidence", "signal_strength"}) and all(
-        has_text(d["area"]) and has_text(d["evidence"]) and d[level_key] in levels
-        and d["signal_strength"] in L4P_STRENGTHS for d in details)
+    return all(has_text(d["area"]) and has_text(d["evidence"]) and one_of(d[level_key], levels)
+               and one_of(d["signal_strength"], L4P_STRENGTHS) for d in details)
 
 
 def l4p_values_valid(output):
+    """Enum and non-empty checks; the shape and value types are already checked by L4P_SCHEMA."""
     deal, tier = output["deal_seeking"], output["price_tier"]
     shopping, restrictions = output["affinity"]["shopping"], output["affinity"]["dining"]["restrictions"]
     shopper, categories = shopping["shopper_type"], shopping["product_categories"]
-    return (deal["value"] in L4P_DEAL_LEVELS | {"unknown"}
+    return (one_of(deal["value"], L4P_DEAL_LEVELS | {"unknown"})
             and l4p_details_valid(deal["details"], "seeking", L4P_DEAL_LEVELS)
-            and tier["value"] in L4P_TIERS | {"unknown"}
+            and one_of(tier["value"], L4P_TIERS | {"unknown"})
             and l4p_details_valid(tier["details"], "tier", L4P_TIERS)
-            and exact_list_keys(categories, {"category", "description"})
-            and all(c["category"] in L4P_CATEGORIES and has_text(c["description"]) for c in categories)
-            and isinstance(shopper["value"], list) and all(v in L4P_SHOPPER_TYPES for v in shopper["value"])
+            and all(one_of(c["category"], L4P_CATEGORIES) and has_text(c["description"]) for c in categories)
+            and all(one_of(v, L4P_SHOPPER_TYPES) for v in shopper["value"])
             and l4p_details_valid(shopper["details"], "type", L4P_SHOPPER_TYPES)
-            and isinstance(restrictions["value"], list) and bool(restrictions["value"])
-            and all(v in L4P_RESTRICTIONS | {"Unknown"} for v in restrictions["value"])
+            and bool(restrictions["value"])
+            and all(one_of(v, L4P_RESTRICTIONS | {"Unknown"}) for v in restrictions["value"])
             and l4p_details_valid(restrictions["details"], "restriction", L4P_RESTRICTIONS))
 
 
@@ -570,8 +592,8 @@ L4D_INTEREST_HEADING = re.compile(r"(?m)^### Interest \d+: (.+)$")
 
 
 def l4_mission_discovery_keys_valid(output):
-    return set(output) == {"candidate_missions"} and exact_list_keys(
-        output["candidate_missions"], {"mission_name", "source_interests", "scenarios"})
+    return matches(output, {"candidate_missions": ListOf(
+        {"mission_name": str, "source_interests": ListOf(str), "scenarios": ListOf(str)})})
 
 
 def check_l4_mission_discovery(payload, output):
@@ -584,7 +606,7 @@ def check_l4_mission_discovery(payload, output):
         sources, scenarios = mission.get("source_interests"), mission.get("scenarios")
         if (not has_text(mission.get("mission_name")) or not string_list(sources, allow_empty=False)
                 or not isinstance(scenarios, list) or not scenarios
-                or not all(s in L4_SCENARIOS for s in scenarios)):
+                or not all(one_of(s, L4_SCENARIOS) for s in scenarios)):
             violations.add("invalid_value")
             continue
         if any(source not in known for source in sources):
@@ -597,11 +619,15 @@ def check_l4_mission_discovery(payload, output):
 
 
 # L4 Mission Enhancement: {[audit blocks], "enhanced_missions": [{..., "predicted_queries": [...]}]}
-L4E_TOP_KEYS = {"geo_resolution", "professional_opportunities", "price_tier_resolution",
-                "shopping_category_opportunities", "preference_opportunities", "enhanced_missions"}
-L4E_MISSION_KEYS = {"input_mission_name", "mission_name", "source_interests", "scenarios", "predicted_brands",
-                    "predicted_queries", "enrichment_sources"}
-L4E_QUERY_KEYS = {"query", "value_type", "source_query_refs", "delta_source", "delta_evidence", "decision_change"}
+L4E_QUERY_SCHEMA = {"query": str, "value_type": str, "source_query_refs": ListOf(str), "delta_source": str,
+                    "delta_evidence": str, "decision_change": str}
+L4E_MISSION_SCHEMA = {"input_mission_name": str, "mission_name": str, "source_interests": ListOf(str),
+                      "scenarios": ListOf(str), "predicted_brands": ListOf(str),
+                      "predicted_queries": ListOf(L4E_QUERY_SCHEMA), "enrichment_sources": ListOf(str)}
+# The prompt only asks for the audit blocks whose context is supplied, so they are optional (as in cleaning).
+L4E_TOP_SCHEMA = {"geo_resolution": dict, "professional_opportunities": ListOf(dict), "price_tier_resolution": dict,
+                  "shopping_category_opportunities": ListOf(dict), "preference_opportunities": ListOf(dict),
+                  "enhanced_missions": ListOf(L4E_MISSION_SCHEMA)}
 L4E_VALUE_TYPES = {"explore", "refine", "advance"}
 L4E_ENRICHMENT_SOURCES = {"cross_interest", "commercial_preference", "personal_context", "professional_context",
                           "world_knowledge"}
@@ -610,9 +636,8 @@ L4E_SOURCE_HEADING = re.compile(r"(?m)^### Source interest \d+: (.+)$")
 
 
 def l4_mission_enhancement_keys_valid(output):
-    missions = output.get("enhanced_missions")
-    return set(output) <= L4E_TOP_KEYS and exact_list_keys(missions, L4E_MISSION_KEYS) and all(
-        exact_list_keys(m["predicted_queries"], L4E_QUERY_KEYS) for m in missions)
+    return ("enhanced_missions" in output and set(output) <= set(L4E_TOP_SCHEMA)
+            and all(matches(value, L4E_TOP_SCHEMA[key]) for key, value in output.items()))
 
 
 def l4e_source_blocks(evidence):
@@ -634,13 +659,14 @@ def l4e_source_blocks(evidence):
 
 def l4e_mission_valid(mission, queries):
     scenarios, brands, enrichment = (mission.get(key) for key in ("scenarios", "predicted_brands", "enrichment_sources"))
-    return (has_text(mission.get("mission_name")) and string_list(mission.get("source_interests"), allow_empty=False)
-            and isinstance(scenarios, list) and bool(scenarios) and all(s in L4_SCENARIOS for s in scenarios)
+    return (has_text(mission.get("input_mission_name")) and has_text(mission.get("mission_name"))
+            and string_list(mission.get("source_interests"), allow_empty=False)
+            and isinstance(scenarios, list) and bool(scenarios) and all(one_of(s, L4_SCENARIOS) for s in scenarios)
             and string_list(brands) and len(brands) <= 3 and 1 <= len(queries) <= 4
-            and isinstance(enrichment, list) and all(s in L4E_ENRICHMENT_SOURCES for s in enrichment)
+            and isinstance(enrichment, list) and all(one_of(s, L4E_ENRICHMENT_SOURCES) for s in enrichment)
             and all(has_text(q.get(key)) for q in queries for key in ("query", "delta_evidence", "decision_change"))
-            and all(q.get("value_type") in L4E_VALUE_TYPES and q.get("delta_source") in L4E_DELTA_SOURCES
-                    and isinstance(q.get("source_query_refs"), list) for q in queries))
+            and all(one_of(q.get("value_type"), L4E_VALUE_TYPES) and one_of(q.get("delta_source"), L4E_DELTA_SOURCES)
+                    and string_list(q.get("source_query_refs")) for q in queries))
 
 
 def check_l4_mission_enhancement(payload, output):
@@ -828,8 +854,8 @@ def ratio(numerator, denominator):
 
 
 def summarize_records(records):
-    """Metrics per dataset config, keyed "<config>/<metric>". Ratios other than json_valid_ratio
-    are computed over JSON-valid outputs only, so JSON failures are not double-counted."""
+    """Metrics per dataset config, keyed "<config>/<metric>". json_valid_ratio, rule_based_pass_ratio and
+    truncated_ratio are over all samples; the other ratios are over JSON-valid outputs only."""
     records_by_config = defaultdict(list)
     for record in records:
         if not record.get("skipped"):
@@ -842,19 +868,19 @@ def summarize_records(records):
         for r in valid:
             totals.update(r["stats"])
 
-        values = {"json_valid_ratio": ratio(len(valid), len(items))}
+        values = {
+            "json_valid_ratio": ratio(len(valid), len(items)),
+            "rule_based_pass_ratio": ratio(sum(bool(r["rule_pass"]) for r in items), len(items)),
+            "truncated_ratio": ratio(sum(r.get("finish_reason") == "length" for r in items), len(items)),
+        }
         stage = items[0]["stage"]
         if stage == "layer1":
             values["topic_evidence_valid_ratio"] = ratio(totals["valid_topics"], totals["topics"])
-            values["simple_rules_pass_ratio"] = ratio(
-                sum(not set(r["violations"]) - L1_EVIDENCE_RULES for r in valid), len(valid))
             values["avg_interest_num"] = ratio(totals["interests"], len(valid))
         elif stage == "layer2":
-            values["simple_rules_pass_ratio"] = ratio(sum(not r["violations"] for r in valid), len(valid))
-            values["delta_exact_match_ratio"] = ratio(totals["delta_exact_match"], len(valid))
+            values["input_match_ratio"] = ratio(totals["delta_exact_match"], len(valid))
             values["merge_ratio"] = ratio(totals["merges"], totals["decisions"])
         elif stage in TASK_CHECKERS:
-            values["simple_rules_pass_ratio"] = ratio(sum(not r["violations"] for r in valid), len(valid))
             if stage not in ("l4_biography", "l4_commercial_preference"):
                 values["input_match_ratio"] = ratio(
                     sum("input_mismatch" not in r["violations"] for r in valid), len(valid))
