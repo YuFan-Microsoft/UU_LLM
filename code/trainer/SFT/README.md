@@ -357,8 +357,9 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
   Rollout scoring rules exist for all eight configs (see the rollout metrics below).
 - The train split is mixed with `--dataset_mixing_alpha 0.5` (default in `deepspeed_user_profile_trainer.py`):
   each epoch has the rows of one natural epoch, split across configs in proportion to `rows ** 0.5`. Large
-  configs (L1, L2, L4 Mission Enhancement, ~0.7-0.9 passes per epoch) see fresh rows each epoch; small configs
-  repeat (L4 Commercial Preference ~3 passes per epoch), so train for one epoch. The test split is not mixed.
+  configs (L1, L2, L4 Mission Enhancement, ~0.7-0.9 passes per epoch) see fresh rows each epoch and are fully
+  covered after two epochs; small configs repeat (L4 Commercial Preference ~3 passes per epoch, ~9 over the three
+  epochs of `run_user_profile_multi_gpu.sh`). The test split is not mixed.
   The per-config quotas are printed at startup.
 - The chat template is applied with `enable_thinking=False`. Loss is computed only on the assistant answer
   (through its final EOS); the prompt tokens are masked with `-100`.
