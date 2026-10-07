@@ -704,7 +704,8 @@ URL_LIKE = re.compile(r"(https?://|www\.|^\S+\.(com|net|org|de|jp|fr|co|io|uk|au
 QUERY_GETTERS = {
     "l3_commercial": lambda output: [
         query for entry in dicts(output.get("interest_commercial"))
-        for query in entry.get("predicted_queries") or [] if isinstance(query, str)],
+        if isinstance(entry.get("predicted_queries"), list)
+        for query in entry["predicted_queries"] if isinstance(query, str)],
     "l4_mission_enhancement": lambda output: [
         query.get("query") for mission in dicts(output.get("enhanced_missions"))
         for query in dicts(mission.get("predicted_queries")) if isinstance(query.get("query"), str)],
