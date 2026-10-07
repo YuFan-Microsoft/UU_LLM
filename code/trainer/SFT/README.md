@@ -397,15 +397,15 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 | `--zero_stage` | 3 | ZeRO-3 with tuned communication (500M reduce/prefetch buckets, 1e9 max live parameters, overlapped communication, contiguous gradients, reduce-scatter) |
 | `--checkpoint_steps` | 5000 | Eval + checkpoint interval |
 | `--do_eval` / `--max_eval_steps` | 1 / -1 | Perplexity on the test split |
-| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `train/*`, `eval/*`, `<task>_evaluation/*` |
+| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `Train/*`, `Eval/*`, `<Task>_Evaluation/*` |
 
 Eval perplexity (x-axis `eval_step`):
 
-- `eval/batch_loss`, `eval/batch_ppl`: mean of per-batch losses, then over ranks.
-- `eval/token_loss`, `eval/token_ppl`: total NLL / total supervised tokens over the whole test
+- `Eval/batch_loss`, `Eval/batch_ppl`: mean of per-batch losses, then over ranks.
+- `Eval/token_loss`, `Eval/token_ppl`: total NLL / total supervised tokens over the whole test
   split. Checkpoint names use `token_ppl`.
-- `<task>_evaluation/token_ppl`: the same token-level perplexity for each dataset config, e.g.
-  `L3_Persona_evaluation/token_ppl`. It sits in the same wandb section as that task's rollout metrics.
+- `<Task>_Evaluation/token_ppl`: the same token-level perplexity for each dataset config, e.g.
+  `L3_Persona_Evaluation/token_ppl`. It sits in the same wandb section as that task's rollout metrics.
 
 ## Checkpoints
 
@@ -443,7 +443,7 @@ Saved under `--output_dir` as `epoch_<e>_step_<s>_ppl_<ppl>/`:
   summarize+write, total) and `Rollout throughput` (total tokens, avg generated tokens per prompt, overall
   gen tok/s, prompts/s, outputs that hit `max_tokens`).
 
-**Metrics** (wandb `<task>_evaluation/<metric>`, next to the task's eval perplexity, one section per task: `L1`, `L2`, `L3_Persona`,
+**Metrics** (wandb `<Task>_Evaluation/<metric>`, next to the task's eval perplexity, one section per task: `L1`, `L2`, `L3_Persona`,
 `L3_Commercial`, `L4_Biography`, `L4_CommercialPreference`, `L4_MissionDiscovery`, `L4_MissionEnhancement`;
 x-axis `eval_step`)
 

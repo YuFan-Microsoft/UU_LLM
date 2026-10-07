@@ -697,9 +697,9 @@ def evaluation(model, eval_dataloader, device, max_eval_steps=-1, label_logits_o
 
 
 def eval_log(result: dict, wandb_module) -> dict:
-    """wandb keys for an evaluation() result: overall numbers under eval/, each task's token_ppl under
-    <task>_evaluation/ (the same section as that task's rollout metrics)."""
-    log = {f"eval/{key}": value for key, value in result.items() if key != "configs"}
+    """wandb keys for an evaluation() result: overall numbers under Eval/, each task's token_ppl under
+    <Task>_Evaluation/ (the same section as that task's rollout metrics)."""
+    log = {f"Eval/{key}": value for key, value in result.items() if key != "configs"}
     for config, values in result.get("configs", {}).items():
         section = task_wandb_section(config)
         wandb_module.define_metric(f"{section}/*", step_metric="eval_step")
@@ -784,8 +784,9 @@ def task_name(config):
 
 
 def task_wandb_section(config):
-    """W&B panel section of a task, shared by its eval perplexity and rollout metrics, e.g. "L3_Persona_evaluation"."""
-    return f"{task_name(config)}_evaluation"
+    """W&B panel section of a task, shared by its eval perplexity and rollout metrics, e.g. "L3_Persona_Evaluation"."""
+    name = task_name(config)
+    return f"{'All' if name == 'all' else name}_Evaluation"
 
 
 def require_linear_attention_kernels():
@@ -896,9 +897,9 @@ def main(argument_defaults=None, rollout_scorer=None):
             init_kwargs.update({"id": args.wandb_run_id, "resume": "allow"})
         wandb.init(**init_kwargs)
         wandb.define_metric("train_step")
-        wandb.define_metric("train/*", step_metric="train_step")
+        wandb.define_metric("Train/*", step_metric="train_step")
         wandb.define_metric("eval_step")
-        wandb.define_metric("eval/*", step_metric="eval_step")
+        wandb.define_metric("Eval/*", step_metric="eval_step")
 
     if cur_rank == 0:
         log_sft_template_sample(train_dataset.dataset[0]["messages"], tokenizer)
@@ -963,10 +964,10 @@ def main(argument_defaults=None, rollout_scorer=None):
                 )
                 if use_wandb:
                     wandb.log({
-                        "train/loss": current_loss,
-                        "train/ppl": ppl,
-                        "train/lr": current_lr,
-                        "train/max_seq_len": max_seq_len,
+                        "Train/loss": current_loss,
+                        "Train/ppl": ppl,
+                        "Train/lr": current_lr,
+                        "Train/max_seq_len": max_seq_len,
                         "epoch": epoch + 1,
                         "global_step": global_step,
                         "train_step": global_step,
