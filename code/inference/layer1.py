@@ -1,10 +1,11 @@
 """Layer 1: one model call replaces maiprofilev3dev's layer1_delta -> layer1_actual -> layer1_intent and gives the
 layer1_postprocessing record."""
 
-from utils import HERE, INPUT_MARKER, MAX_SIGNAL_ACTIONS, PROMPT_BUDGET, cap, dumps, layer1_keys_valid
+from utils import (HERE, INPUT_MARKER, MAX_SIGNAL_ACTIONS, PROMPT_BUDGET, cap, dumps, layer1_keys_valid,
+                   normalize_language_tag)
 
-# Must stay identical to PROMPT in pyscript/data_cleaning/layer1_step3_build_sft_data.py.
-PROMPT = (HERE / "prompt_l1.md").read_text(encoding="utf-8")
+# Must stay identical to UU_LLM/prompts/prompt_l1.md, the prompt of the V1 SFT data.
+PROMPT = (HERE / "prompts" / "prompt_l1.md").read_text(encoding="utf-8")
 
 
 def build_message(signals: list[dict]) -> str:
@@ -57,8 +58,10 @@ def to_record(user_id: str, date_str: str, output: dict | None, signals: list[di
     Layer1Delta keeps the interests and topics as the model wrote them and rebuilds evidence from the indices
     (_reconstruct_evidence_from_indices: unknown / repeated indices are dropped); Layer1PostProcessing adds
     temporal / decay defaults (LongTerm / 0.9) and the actual_activity / inferred_intent text. An answer that never
-    became valid gives no interests, like an unparseable layer1_delta response.
+    became valid gives no interests, like an unparseable layer1_delta response. predicted_content_locale is kept
+    only when it is a valid language tag (Layer1Delta: normalize_language_tag).
     """
+    locale = normalize_language_tag((output or {}).get("predicted_content_locale"))
     interests = []
     for interest in (output or {}).get("interests", []):
         topics = []
@@ -84,5 +87,5 @@ def to_record(user_id: str, date_str: str, output: dict | None, signals: list[di
             "inferred_intent": interest["inferred_intent"],
         })
     return {"user_id": user_id, "date": date_str, "layer": "layer1_postprocessing",
-            "predicted_content_locale": (output or {}).get("predicted_content_locale", ""),
+            **({"predicted_content_locale": locale} if locale else {}),
             "interests": interests}

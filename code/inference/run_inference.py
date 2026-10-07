@@ -1,4 +1,4 @@
-"""Layer-1 + Layer-2 user-profile inference with one Qwen3.5 SFT checkpoint, reproducing maiprofilev3dev.
+"""Layer-1 to Layer-4 user-profile inference with one Qwen3.5 SFT checkpoint, reproducing maiprofilev3dev.
 
 See README.md in this directory.
 """
@@ -15,13 +15,17 @@ import shutil
 
 import layer1
 import layer2
+import layer3
+import layer4
+from task import UserProfile
 from utils import (MAX_MODEL_LEN, build_grid, build_prompt_ids, build_windows, dumps, generate, load_users,
                    new_item, read_rows, visible_gpus)
 
-LAYERS = ["layer1_postprocessing", "layer2_postmerge"]
-# Per-engine progress in a shared array: phase and Layer-1 / Layer-2 requests done / total.
-PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL = range(FIELDS := 5)
-PHASES = ["loading", "layer1", "layer2", "done"]
+LAYERS = ["layer1_postprocessing", "layer2_postmerge"]  # written for every window
+L34_STAGES = [task.stage for task in layer3.TASKS + layer4.TASKS]
+# Per-engine progress in a shared array: phase and the requests done / total of each layer.
+PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL, L3_DONE, L3_TOTAL, L4_DONE, L4_TOTAL = range(FIELDS := 9)
+PHASES = ["loading", "layer1", "layer2", "layer3", "layer4", "done"]
 REFRESH_SECONDS = 2
 
 
@@ -44,7 +48,8 @@ def parse_args() -> argparse.Namespace:
 def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows: list, dates: list[str],
                shard_path: Path, progress) -> None:
     """One vLLM engine on one GPU: Layer 1 for all windows of its users, then Layer 2 window by window, because
-    each user's Layer 2 needs their snapshot from the previous window. Reports progress in `progress` (see PHASE)."""
+    each user's Layer 2 needs their snapshot from the previous window, then Layer 3 and Layer 4 on each user's final
+    snapshot (all on the last window, like the production run). Reports progress in `progress` (see PHASE)."""
     from transformers import AutoProcessor
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     from tqdm import tqdm
@@ -103,8 +108,10 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
             emit(kind="call", stage="l1", user_id=item["user_id"], date=item["date"], attempts=item["attempts"],
                  valid=item["output"] is not None, signals_dropped=item["dropped"],
                  interests=len(record["interests"]), text=item["text"])
-        # Every user-window with Layer-1 interests is one Layer-2 call, so the total is known now.
-        progress[base + L2_TOTAL] = sum(1 for record in deltas.values() if record["interests"])
+        # Every user-window with Layer-1 interests after the user's first one is one Layer-2 call (the first starts
+        # the snapshot without a call); exact unless a snapshot decays to nothing, corrected after Layer 2.
+        with_interests = Counter(user_id for (user_id, _), record in deltas.items() if record["interests"])
+        progress[base + L2_TOTAL] = sum(count - 1 for count in with_interests.values())
         progress[base + PHASE] = 2
 
         # Layer 2: window by window, carrying each user's snapshot.
@@ -116,7 +123,7 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
                 if delta is None:
                     continue
                 mode, snapshot = layer2.plan(delta, snapshots.get(user_id))
-                if mode == "empty":
+                if mode != "merge":
                     plans[user_id] = (mode, None, 0)
                     continue
                 prompt_ids, dropped = layer2.fit_prompt(snapshot, delta["interests"], encode)
@@ -140,13 +147,35 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
                 if user_id not in plans:  # idle this window: pipeline._carry_forward keeps the record as is
                     snapshots[user_id] = {**snapshot, "_carried_forward": True}
                     emit(kind="record", layer="layer2_postmerge", date=date_str, record=snapshots[user_id])
-    progress[base + PHASE] = 3
+        progress[base + L2_TOTAL] = l2_done
+
+        def round_runner(done_field: int, total_field: int):
+            """Generates one round of a layer's requests; the layer's total grows by each round's size."""
+            done = 0
+
+            def run_round(items: list[dict]) -> None:
+                nonlocal done
+                progress[base + total_field] += len(items)
+                generate(llm, items, None, "l34", progress_bar=counter(done_field), **sampling)
+                done += len(items)
+                progress[base + done_field] = done
+            return run_round
+
+        # Layers 3 and 4 on each user's final snapshot (carried forward if idle at the end).
+        profiles = [UserProfile(user_id, snapshot, dates[-1]) for user_id, snapshot in snapshots.items()]
+        progress[base + PHASE] = 3
+        layer3.run(profiles, encode, round_runner(L3_DONE, L3_TOTAL), emit)
+        progress[base + PHASE] = 4
+        layer4.run(profiles, encode, round_runner(L4_DONE, L4_TOTAL), emit)
+    progress[base + PHASE] = 5
 
 
 def show_progress(processes: list, progress, l1_total: int) -> None:
-    """Two progress bars over all engines until every engine exits. They start once every engine has loaded its
-    model, so vLLM's loading logs come first. The Layer-2 total grows as engines finish Layer 1 (each user-window with
-    Layer-1 interests is one call); only first attempts are counted."""
+    """One progress bar per layer over all engines until every engine exits. They start once every engine has loaded
+    its model, so vLLM's loading logs come first. Each bar's clock (rate / ETA) starts at its layer's first finished
+    call. Totals: Layer 1 is known up front; Layer 2 once an engine finishes Layer 1 (each user-window with Layer-1
+    interests after the user's first one is one call); Layer 3 once an engine starts it (one round); Layer 4 grows
+    round by round (enhancement calls depend on the discovered missions). Only first attempts are counted."""
     from tqdm import tqdm
 
     engines = len(processes)
@@ -154,26 +183,34 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
             progress[rank * FIELDS + PHASE] == 0 for rank in range(engines)):
         mp.connection.wait([p.sentinel for p in processes if p.is_alive()], timeout=1)
     print(flush=True)
-    layer1 = tqdm(total=l1_total, desc="Layer 1", unit="window", position=0, dynamic_ncols=True)
-    layer2 = tqdm(total=0, desc="Layer 2", unit="call", position=1, dynamic_ncols=True)
-    started = False
+    # (bar, done field, total field, phase from which an engine's total is known)
+    bars = [(tqdm(total=l1_total, desc="Layer 1", unit="window", position=0, dynamic_ncols=True), L1_DONE, None, 0),
+            (tqdm(total=0, desc="Layer 2", unit="call", position=1, dynamic_ncols=True), L2_DONE, L2_TOTAL, 2),
+            (tqdm(total=0, desc="Layer 3", unit="call", position=2, dynamic_ncols=True), L3_DONE, L3_TOTAL, 3),
+            (tqdm(total=0, desc="Layer 4", unit="call", position=3, dynamic_ncols=True), L4_DONE, L4_TOTAL, 5)]
+    started = [False] * len(bars)
     while any(process.is_alive() for process in processes):
         mp.connection.wait([p.sentinel for p in processes if p.is_alive()], timeout=REFRESH_SECONDS)
         rows = [progress[rank * FIELDS:(rank + 1) * FIELDS] for rank in range(engines)]
         phases = Counter(PHASES[int(row[PHASE])] for row in rows)
-        known = sum(row[PHASE] >= 2 for row in rows)
-        l2_done = int(sum(row[L2_DONE] for row in rows))
-        if l2_done and not started:  # start Layer 2's clock (rate / ETA) at its first call
-            layer2.reset(total=int(sum(row[L2_TOTAL] for row in rows)))
-            started = True
-        layer1.n = int(sum(row[L1_DONE] for row in rows))
-        layer2.total, layer2.n = int(sum(row[L2_TOTAL] for row in rows)), l2_done
-        layer1.set_postfix_str("engines: " + ", ".join(f"{phases[p]} {p}" for p in PHASES if phases[p]), refresh=False)
-        layer2.set_postfix_str("" if known == engines else f"total known for {known}/{engines} engines", refresh=False)
-        layer1.refresh()
-        layer2.refresh()
-    layer1.close()
-    layer2.close()
+        for index, (bar, done_field, total_field, known_phase) in enumerate(bars):
+            done = int(sum(row[done_field] for row in rows))
+            if total_field is not None:
+                total = int(sum(row[total_field] for row in rows))
+                if done and not started[index]:
+                    bar.reset(total=total)
+                    started[index] = True
+                bar.total = total
+                known = sum(row[PHASE] >= known_phase for row in rows)
+                bar.set_postfix_str("" if known == engines else f"total known for {known}/{engines} engines",
+                                    refresh=False)
+            bar.n = done
+        bars[0][0].set_postfix_str("engines: " + ", ".join(f"{phases[p]} {p}" for p in PHASES if phases[p]),
+                                   refresh=False)
+        for bar, *_ in bars:
+            bar.refresh()
+    for bar, *_ in bars:
+        bar.close()
 
 
 def run_engines(args: argparse.Namespace, windows: list, user_ids: list[str], dates: list[str]) -> list[dict]:
@@ -224,8 +261,9 @@ def keep_raw(rows, raw):
 
 def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], profile_date: str,
                          final: dict[str, dict]) -> None:
-    """final_profiles.jsonl: per user, the raw past / future behaviors and the final Layer-2 profile (the latest
-    layer2_postmerge snapshot; no interests if the user never had a Layer-1 interest)."""
+    """final_profiles.jsonl: per user, the raw past / future behaviors and the final profile, the user's
+    layer4_postprocessing record (Layer-3-enriched interests with confidence >= 0.2 plus the hyper-commercial
+    missions, biography, life stage and commercial preferences); empty if the user never had a Layer-1 interest."""
     wanted = set(user_ids)
     with raw_path.open(encoding="utf-8") as source, (output_dir / "final_profiles.jsonl").open("w", encoding="utf-8") as out:
         for line in source:
@@ -233,14 +271,19 @@ def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], 
             if raw["user_id"] not in wanted:
                 continue
             wanted.discard(raw["user_id"])
-            snapshot = final.get(raw["user_id"], {})
+            profile = final.get(raw["user_id"], {})
             out.write(dumps({
                 "user_id": raw["user_id"],
                 "profile_date": profile_date,
-                "last_update": snapshot.get("date"),
+                "last_update": profile.get("date"),
                 "past_behaviors": raw["past_behaviors"],
                 "future_behaviors": raw["future_behaviors"],
-                "interests": [{k: v for k, v in i.items() if k != "_run_event"} for i in snapshot.get("interests", [])],
+                "predicted_content_locale": profile.get("predicted_content_locale"),
+                "interests": profile.get("interests", []),
+                "biography": profile.get("biography", ""),
+                "life_stage": profile.get("life_stage", {}),
+                "commercial_preferences": profile.get("commercial_preferences", {}),
+                "enriched_commercial_interests": profile.get("enriched_commercial_interests", []),
             }) + "\n")
     raw_path.unlink()
 
@@ -265,21 +308,22 @@ def main() -> None:
     files = {(layer, d): [] for layer in LAYERS for d in dates}
     for row in rows:
         if row["kind"] == "record":
-            files[(row["layer"], row["date"])].append(row["record"])
-    for (layer, date_str), records in files.items():  # every window, even empty: maiprofilev3dev --base-run needs it
+            files.setdefault((row["layer"], row["date"]), []).append(row["record"])
+    # Layer 1 / 2 files exist for every window, even empty (maiprofilev3dev --base-run needs them); Layer 3 / 4
+    # files only for the windows where some user's final snapshot was built.
+    for (layer, date_str), records in files.items():
         path = args.output_dir / date_str / f"{layer}.jsonl"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("".join(dumps(r) + "\n" for r in sorted(records, key=lambda r: r["user_id"])), encoding="utf-8")
     calls = sorted((row for row in rows if row["kind"] == "call"), key=lambda c: (c["date"], c["stage"], c["user_id"]))
     (args.output_dir / "predictions.jsonl").write_text("".join(dumps(c) + "\n" for c in calls), encoding="utf-8")
 
-    final = {}  # latest snapshot per user: files are in date order
-    for (layer, _), records in files.items():
-        if layer == "layer2_postmerge":
-            final.update({r["user_id"]: r for r in records})
+    final = {r["user_id"]: r for (layer, _), records in files.items() if layer == "layer4_postprocessing"
+             for r in records}
     write_final_profiles(args.output_dir, raw_path, user_ids, dates[-1], final)
 
     l2_calls = [c for c in calls if c["stage"] == "l2"]
+    hyper = [r for (layer, _), records in files.items() if layer == "layer4_hyper_commercial_interest" for r in records]
     summary = {
         "args": {key: str(value) for key, value in vars(args).items()},
         "grid": {"start": str(grid[0][0]), "end": str(grid[-1][1]), "windows": len(grid)},
@@ -287,8 +331,14 @@ def main() -> None:
         "l1": call_stats([c for c in calls if c["stage"] == "l1"]),
         "l2": {**call_stats(l2_calls), "modes": dict(Counter(c["mode"] for c in l2_calls)),
                "actions": dict(sum((Counter(c["actions"]) for c in l2_calls), Counter()))},
-        "final_snapshot_avg_interests": (
-            sum(len(r["interests"]) for r in final.values()) / len(final) if final else None),
+        **{stage: call_stats([c for c in calls if c["stage"] == stage]) for stage in L34_STAGES},
+        "final_profiles": len(final),
+        "final_avg_interests": (
+            sum(sum(i.get("interest_type") != "hyper_commercial" for i in r["interests"]) for r in final.values())
+            / len(final) if final else None),
+        "final_avg_hyper_missions": (
+            sum(len(r["hyper_commercial_interests"]) for r in hyper) / len(hyper) if hyper else None),
+        "hyper_failures": sum(bool(r.get("_failed")) for r in hyper),
     }
     (args.output_dir / "inference_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)

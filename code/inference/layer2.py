@@ -3,17 +3,21 @@ carry a temporal class); postmerge (no model) applies them to the user's previou
 
 from datetime import date, datetime
 
-from utils import HERE, INPUT_MARKER, PROMPT_BUDGET, dumps, layer2_keys_valid
+from utils import HERE, INPUT_MARKER, PROMPT_BUDGET, dumps, layer2_keys_valid, normalize_language_tag
 
-# Must stay identical to PROMPT in pyscript/data_cleaning/layer2_step2_build_sft_data.py.
-PROMPT = (HERE / "prompt_l2.md").read_text(encoding="utf-8")
+# Must stay identical to UU_LLM/prompts/prompt_l2.md, the prompt of the V1 SFT data.
+PROMPT = (HERE / "prompts" / "prompt_l2.md").read_text(encoding="utf-8")
 TEMPORALS = {"Ephemeral", "ShortTerm", "LongTerm", "Persistent"}  # layer2_temporal: decay is 1.0 for all of them
+# init (no previous snapshot): maiprofilev3dev adds every delta interest without a merge call and classifies them
+# with a layer2_temporal call. The model takes no empty-snapshot input (the V1 L2 data has none), so there is no
+# call: the interests keep Layer 1's temporal label and get the decay layer2_temporal gives every class.
+INIT_TEMPORAL = "LongTerm"
 
 
 def plan(delta: dict, prev_snapshot: dict | None) -> tuple[str, list[dict]]:
     """(mode, snapshot interests shown to the model) for one active user, following layer2_merge:
-    "empty" (no delta interests: no call), "init" (no previous interests: synthetic add-all, the model only
-    supplies temporal) or "merge" (only non-Archived interests with confidence > 0.2 are shown)."""
+    "empty" (no delta interests: no call), "init" (no previous interests: synthetic add-all, no call) or "merge"
+    (one call; only non-Archived interests with confidence > 0.2 are shown)."""
     previous = (prev_snapshot or {}).get("interests", [])
     if not delta["interests"]:
         return "empty", []
@@ -50,25 +54,27 @@ def is_valid(output: dict) -> bool:
 def to_decisions(mode: str, delta: list[dict], output: dict | None) -> tuple[list[dict] | None, list[dict]]:
     """(layer2_merge decisions, layer2_temporal interests) for one active user.
 
-    init: the synthetic add-all layer2_merge writes when there is no snapshot; the model only supplies temporal.
+    init: the synthetic add-all layer2_merge writes when there is no snapshot, each interest with INIT_TEMPORAL and
+    decay 1.0 (no model call).
     merge: the model's decisions, plus a synthetic add for every delta without one (layer2_merge._backfill_missing).
     Each decision's temporal is filed under the name layer2_temporal summarizes it by (merged name / delta name);
     postmerge looks them up by name, so a later entry with the same name wins, as in its temporal_map.
     """
     if mode == "empty":
         return None, []
-    answer = (output or {}).get("decisions", [])
     if mode == "init":
-        decisions = [{"action": "add", "delta_interest_name": interest["interest_name"]} for interest in delta]
-    else:
-        decisions = [{key: value for key, value in d.items() if key != "temporal"} for d in answer]
-        covered = {d["delta_interest_name"].lower() for d in decisions}
-        decisions += [{"action": "add", "delta_interest_name": interest["interest_name"]}
-                      for interest in delta if interest["interest_name"].lower() not in covered]
+        return ([{"action": "add", "delta_interest_name": interest["interest_name"]} for interest in delta],
+                [{"interest_name": interest["interest_name"], "temporal": INIT_TEMPORAL, "decay": 1.0}
+                 for interest in delta])
+    answer = (output or {}).get("decisions", [])
+    decisions = [{key: value for key, value in d.items() if key != "temporal"} for d in answer]
+    covered = {d["delta_interest_name"].lower() for d in decisions}
+    decisions += [{"action": "add", "delta_interest_name": interest["interest_name"]}
+                  for interest in delta if interest["interest_name"].lower() not in covered]
     temporal = []
     for d in answer:
-        merged = mode == "merge" and d["action"] == "merge"
-        name = (d.get("merged_interest_name") or d["delta_interest_name"]) if merged else d["delta_interest_name"]
+        name = (d.get("merged_interest_name") or d["delta_interest_name"]) if d["action"] == "merge" \
+            else d["delta_interest_name"]
         if d["temporal"] in TEMPORALS and name:
             temporal.append({"interest_name": name, "temporal": d["temporal"], "decay": 1.0})
     return decisions, temporal
@@ -309,4 +315,8 @@ def postmerge(user_id: str, date_str: str, decisions: list[dict] | None, delta: 
         t = temporal_by_name.get(interest.get("interest_name", "").lower())
         if t:
             interest["temporal"], interest["decay"] = t["temporal"], float(t["decay"])
-    return {"user_id": user_id, "date": date_str, "layer": "layer2_postmerge", "interests": _prune_sort(interests)}
+    # _resolve_predicted_content_locale: this window's Layer-1 locale, else the previous snapshot's.
+    locale = (normalize_language_tag(delta.get("predicted_content_locale"))
+              or normalize_language_tag((prev_snapshot or {}).get("predicted_content_locale")))
+    return {"user_id": user_id, "date": date_str, "layer": "layer2_postmerge", "interests": _prune_sort(interests),
+            **({"predicted_content_locale": locale} if locale else {})}

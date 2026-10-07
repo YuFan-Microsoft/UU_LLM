@@ -4,19 +4,22 @@ from datetime import date, timedelta
 import json
 import os
 from pathlib import Path
+import re
 import subprocess
 import zlib
 
 HERE = Path(__file__).resolve().parent
 
-# maiprofilev3dev settings.
-SOURCE_RANK = {source: rank for rank, source in enumerate(  # config.signal_source_priority, best first
-    ["MSN", "Bing", "Copilot", "Ads", "Shopping", "Uet", "Edge", "ChromeImports"])}
-MAX_SIGNAL_ACTIONS = 1000       # config.max_signal_actions
+# maiprofilev3dev settings of the production run the SFT data comes from (mini_mai/config.py: --signal-source-priority
+# MSN,Bing,Ads,Shopping,Uet,Edge,ChromeImports --max-user-actions 200; the V1 L1 inputs have exactly these sources and
+# at most 200 signals).
+SOURCE_RANK = {source: rank for rank, source in enumerate(  # signal_source_priority, best first
+    ["MSN", "Bing", "Ads", "Shopping", "Uet", "Edge", "ChromeImports"])}
+MAX_SIGNAL_ACTIONS = 200        # max_signal_actions (production --max-user-actions)
 MAX_ACTION_CHARS = 128          # data_reader.clean_signals
 MIN_VALID_DATE = "2025-01-01"   # data_reader.MIN_VALID_DATE
 
-MAX_MODEL_LEN = 15360
+MAX_MODEL_LEN = 20480           # the V1 SFT rows and the trainer's rollout eval use 20,480 tokens
 MAX_TOKENS = 8192
 MIN_OUTPUT_TOKENS = 4096        # prompts are trimmed until this many tokens are left for the answer
 PROMPT_BUDGET = MAX_MODEL_LEN - MIN_OUTPUT_TOKENS
@@ -25,6 +28,38 @@ PROMPT_BUDGET = MAX_MODEL_LEN - MIN_OUTPUT_TOKENS
 def dumps(value) -> str:
     """Minified JSON with raw UTF-8, as the SFT data was written."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
+
+
+# ---------------------------------------------------------------------------
+# maiprofilev3dev modules/query_language.py. There is no user context (Market) here, so the query language is
+# the snapshot's predicted_content_locale, else English.
+# ---------------------------------------------------------------------------
+
+_COMPACT_BCP47 = re.compile(r"^(?P<language>[A-Za-z]{2,3})(?:-(?P<script>[A-Za-z]{4}))?(?:-(?P<region>[A-Za-z]{2}|[0-9]{3}))?$")
+
+
+def normalize_language_tag(value) -> str | None:
+    """normalize_language_tag: a canonical compact BCP-47 tag, or None when invalid (or "mul" / "und"). The Layer-1
+    SFT labels also use "mix" (no single dominant language), which maiprofilev3dev never produces; it is treated
+    like no detected locale, so the query language falls back to the previous locale or English ("mix" never
+    occurs as a query language in the L3 / L4 SFT data)."""
+    if not isinstance(value, str):
+        return None
+    match = _COMPACT_BCP47.fullmatch(value.strip())
+    if not match or match["language"].lower() in {"mul", "und", "mix"}:
+        return None
+    parts = [match["language"].lower()]
+    if match["script"]:
+        parts.append(match["script"].title())
+    if match["region"]:
+        parts.append(match["region"].upper() if match["region"].isalpha() else match["region"])
+    return "-".join(parts)
+
+
+def query_language(predicted_content_locale) -> dict:
+    """resolve_query_language({}, locale).state(): {"locale", "source"}."""
+    detected = normalize_language_tag(predicted_content_locale)
+    return {"locale": detected, "source": "predicted_content_locale"} if detected else {"locale": "en", "source": "default"}
 
 
 # ---------------------------------------------------------------------------
@@ -196,7 +231,8 @@ def build_windows(users: dict[str, list[dict]], grid: list[tuple[date, date]],
 # ---------------------------------------------------------------------------
 
 def new_item(key: str, prompt_ids: list[int]) -> dict:
-    """One model request; `key` (user|window) seeds its sampling."""
+    """One model request; `key` (user|window) seeds its sampling. An item may carry its own "stage" (sampling seed
+    and log name) and "check" (answer validator), which override the ones given to generate."""
     return {"key": key, "prompt_ids": prompt_ids, "budget": min(MAX_TOKENS, MAX_MODEL_LEN - len(prompt_ids)),
             "output": None, "text": "", "attempts": 0}
 
@@ -213,7 +249,8 @@ def generate(llm, items: list[dict], is_valid, stage: str, temperature: float, t
         if not todo:
             break
         params = [SamplingParams(max_tokens=item["budget"], temperature=temperature, top_p=top_p,
-                                 seed=(seed + zlib.crc32(f"{stage}|{item['key']}|{attempt}".encode())) % 2**31)
+                                 seed=(seed + zlib.crc32(f"{item.get('stage', stage)}|{item['key']}|{attempt}"
+                                                         .encode())) % 2**31)
                   for item in todo]
         outputs = llm.generate([{"prompt_token_ids": item["prompt_ids"]} for item in todo], params,
                                use_tqdm=progress_bar if attempt == 0 and progress_bar else False)
@@ -222,7 +259,7 @@ def generate(llm, items: list[dict], is_valid, stage: str, temperature: float, t
             item["attempts"] += 1
             item["text"] = output.outputs[0].text
             parsed = parse_json_object(item["text"])
-            if parsed is not None and is_valid(parsed):
+            if parsed is not None and (item.get("check") or is_valid)(parsed):
                 item["output"] = parsed
             else:
                 retry.append(item)
