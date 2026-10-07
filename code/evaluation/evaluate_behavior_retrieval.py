@@ -5,9 +5,10 @@ from collections import Counter
 import csv
 from dataclasses import dataclass
 import json
+import os
 from pathlib import Path
 import sys
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from tqdm import tqdm
 
@@ -40,6 +41,9 @@ DEFAULT_EMBEDDING_PATHS = {
     ),
 }
 STREAMING_SEARCH_CHUNK_SIZE = 500_000
+TOP_INTERESTS = 10
+TOP30_QUERIES_PER_INTEREST = 3
+LAYER3_TOPK_KEYS = ["layer3_top10", "layer3_top30"]
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -47,6 +51,130 @@ def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
         for line in source:
             if line.strip():
                 yield json.loads(line)
+
+
+def clean_queries(queries: Any) -> list[str]:
+    if not isinstance(queries, list):
+        return []
+    seen, result = set(), []
+    for query in queries:
+        if isinstance(query, str) and (query := query.strip()) and query not in seen:
+            seen.add(query)
+            result.append(query)
+    return result
+
+
+def interest_confidence(interest: dict[str, Any]) -> float:
+    try:
+        return float(interest.get("confidence_score") or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def build_topk_layers(record: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+    """layer3_top10: the first query of each of the top-10 interests by confidence_score; layer3_top30: the first 3
+    queries of each of those interests. Interests without a non-blank predicted query are not ranked."""
+    ranked = []
+    for interest in record.get("interests") or []:
+        if not isinstance(interest, dict):
+            continue
+        queries = clean_queries(interest.get("predicted_queries"))
+        if queries:
+            ranked.append(
+                (interest_confidence(interest), str(interest.get("interest_name") or ""), queries)
+            )
+    ranked.sort(key=lambda item: item[0], reverse=True)  # stable: ties keep the file order
+    interests = [(name, queries) for _, name, queries in ranked[:TOP_INTERESTS]]
+
+    top10 = [{"interest_name": name, "predicted_queries": queries[:1]} for name, queries in interests]
+    top30 = [
+        {"interest_name": name, "predicted_queries": queries[:TOP30_QUERIES_PER_INTEREST]}
+        for name, queries in interests
+    ]
+    return {"layer3_top10": top10, "layer3_top30": top30}
+
+
+def read_dataset_rows(
+    dataset_paths: list[Path] | None, hf_split: str
+) -> Iterator[dict[str, Any]]:
+    """Like inference/utils.read_rows: local JSONL files, or the User_Profile_TestSet split streamed from HF."""
+    if dataset_paths:
+        for path in dataset_paths:
+            yield from iter_jsonl(path)
+    else:
+        from datasets import load_dataset
+
+        yield from load_dataset(
+            "yufan/user_profile_dataset",
+            "User_Profile_TestSet",
+            split=hf_split,
+            streaming=True,
+            token=os.getenv("HF_TOKEN"),
+        )
+
+
+def keep_action_ids(behaviors: Any) -> tuple[list[dict[str, Any]], int]:
+    kept, missing = [], 0
+    for behavior in behaviors or []:
+        if isinstance(behavior, dict) and behavior.get("action_id") is not None:
+            kept.append({"action_id": behavior["action_id"]})
+        else:
+            missing += 1
+    return kept, missing
+
+
+def build_eval_data(
+    layer3_path: Path,
+    dataset_rows: Iterable[dict[str, Any]],
+    output_path: Path,
+) -> None:
+    """Write --eval_data rows {user_id, past_behaviors, future_behaviors, layer3_top10, layer3_top30} for the users
+    of layer3_postprocessing.jsonl; behaviors keep only their action_id, users missing from the dataset are dropped."""
+    layers_by_user = {
+        str(record["user_id"]): build_topk_layers(record)
+        for record in iter_jsonl(layer3_path)
+    }
+    behaviors_by_user: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    missing_action_ids = 0
+    for row in dataset_rows:
+        user_id = str(row["user_id"])
+        if user_id not in layers_by_user or user_id in behaviors_by_user:
+            continue
+        past, past_missing = keep_action_ids(row.get("past_behaviors"))
+        future, future_missing = keep_action_ids(row.get("future_behaviors"))
+        behaviors_by_user[user_id] = {"past_behaviors": past, "future_behaviors": future}
+        missing_action_ids += past_missing + future_missing
+        if len(behaviors_by_user) == len(layers_by_user):
+            break
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    query_counts = Counter()
+    with output_path.open("w", encoding="utf-8") as output:
+        for user_id, layers in layers_by_user.items():
+            if user_id not in behaviors_by_user:
+                continue
+            output.write(
+                json.dumps(
+                    {"user_id": user_id, **behaviors_by_user[user_id], **layers},
+                    ensure_ascii=False,
+                )
+                + "\n"
+            )
+            for key, interests in layers.items():
+                query_counts[key] += sum(len(i["predicted_queries"]) for i in interests)
+
+    users = len(behaviors_by_user)
+    print(
+        f"Built {users:,} users -> {output_path} "
+        f"({len(layers_by_user) - users:,} layer3 users not in the dataset, dropped)"
+    )
+    if users:
+        print(
+            "Queries/user: "
+            + ", ".join(f"{key}={query_counts[key] / users:.2f}" for key in LAYER3_TOPK_KEYS)
+        )
+    if missing_action_ids:
+        print(f"Warning: skipped {missing_action_ids:,} behaviors without action_id")
 
 
 def load_index(index_path: Path) -> list[int]:
@@ -581,9 +709,35 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--eval_data",
-        required=True,
         type=Path,
-        help="JSONL with behavior action IDs and layer3/layer4 predicted_queries",
+        help=(
+            "JSONL with behavior action IDs and predicted_queries layers; with "
+            "--layer3 it is written there (default: <layer3>.eval_input.jsonl)"
+        ),
+    )
+    parser.add_argument(
+        "--layer3",
+        type=Path,
+        help=(
+            "run_inference.py layer3_postprocessing.jsonl: build --eval_data from "
+            "it and the dataset behaviors, then evaluate layer3_top10 and layer3_top30"
+        ),
+    )
+    parser.add_argument(
+        "--hf_split",
+        default="user_1200",
+        help="User_Profile_TestSet split for --layer3: user_1200 or user_12000 (needs HF_TOKEN)",
+    )
+    parser.add_argument(
+        "--dataset_jsonl",
+        type=Path,
+        nargs="+",
+        help="Local dataset JSONL files for --layer3 instead of the Hugging Face split",
+    )
+    parser.add_argument(
+        "--build_only",
+        action="store_true",
+        help="With --layer3: only write --eval_data, without evaluating",
     )
     parser.add_argument(
         "--index",
@@ -598,8 +752,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--layer_key",
-        default="layer3",
-        help="Record key containing predicted_queries (default: layer3)",
+        nargs="+",
+        help=(
+            "Record key(s) containing predicted_queries, evaluated one after another "
+            "(default: layer3, or layer3_top10 layer3_top30 with --layer3)"
+        ),
     )
     parser.add_argument(
         "--embeddings",
@@ -609,7 +766,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output",
         type=Path,
-        help="Final recall summary JSON (default: <eval_data>.<target>-eval.json)",
+        help=(
+            "Final recall summary JSON (default: <eval_data>.<target>-eval.json); "
+            "with several --layer_key, .<layer_key> is added before .json"
+        ),
     )
     parser.add_argument(
         "--skip_log",
@@ -663,22 +823,44 @@ def parse_args() -> argparse.Namespace:
         help="Print the full metrics table every N evaluated users (default: 10)",
     )
     parser.add_argument("--attn_implementation")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.layer3 is None and args.eval_data is None:
+        parser.error("one of --eval_data or --layer3 is required")
+    if args.build_only and args.layer3 is None:
+        parser.error("--build_only needs --layer3")
+    if args.layer3 is not None:
+        args.eval_data = args.eval_data or args.layer3.with_suffix(".eval_input.jsonl")
+    args.layer_key = args.layer_key or (
+        LAYER3_TOPK_KEYS if args.layer3 is not None else ["layer3"]
+    )
+    return args
+
+
+def with_layer_key(path: Path, layer_key: str, multiple: bool) -> Path:
+    return path.with_name(f"{path.stem}.{layer_key}{path.suffix}") if multiple else path
 
 
 def resolve_paths(
     args: argparse.Namespace,
-) -> tuple[list[int], Path, Path, Path]:
+) -> tuple[list[int], Path, dict[str, tuple[Path, Path]]]:
+    """Top-k values, the embedding path and {layer_key: (output, skip log)}."""
     top_ks = sorted(set(args.top_k))
     args.index = args.index or DEFAULT_INDEX_PATHS[args.target]
     embedding_path = args.embeddings or DEFAULT_EMBEDDING_PATHS[args.target]
-    output_path = args.output or args.eval_data.with_suffix(
+    multiple = len(args.layer_key) > 1
+    output_base = args.output or args.eval_data.with_suffix(
         f".{args.target}-eval.json"
     )
-    skip_log_path = args.skip_log or output_path.with_suffix(
-        ".skip-reasons.tsv"
-    )
-    return top_ks, embedding_path, output_path, skip_log_path
+    paths = {}
+    for layer_key in args.layer_key:
+        output_path = with_layer_key(output_base, layer_key, multiple)
+        skip_log_path = (
+            with_layer_key(args.skip_log, layer_key, multiple)
+            if args.skip_log
+            else output_path.with_suffix(".skip-reasons.tsv")
+        )
+        paths[layer_key] = (output_path, skip_log_path)
+    return top_ks, embedding_path, paths
 
 
 def load_model(args: argparse.Namespace) -> tuple[Any, Any, Any]:
@@ -749,41 +931,53 @@ def load_search_index(
 def main() -> int:
     args = parse_args()
     try:
-        top_ks, embedding_path, output_path, skip_log_path = resolve_paths(args)
+        if args.layer3 is not None:
+            build_eval_data(
+                args.layer3,
+                read_dataset_rows(args.dataset_jsonl, args.hf_split),
+                args.eval_data,
+            )
+            if args.build_only:
+                return 0
+        top_ks, embedding_path, paths = resolve_paths(args)
         tokenizer, model, device = load_model(args)
         search_index, search_chunk_size = load_search_index(
             args, embedding_path, device
         )
-        config = EvaluationConfig(
-            target=args.target,
-            layer_key=args.layer_key,
-            top_ks=top_ks,
-            query_batch_size=args.query_batch_size,
-            search_chunk_size=search_chunk_size,
-            max_length=args.max_length,
-            instruction=args.instruction,
-            max_users=args.max_users,
-            metrics_print_interval=args.metrics_print_interval,
-        )
+        summaries = {}
+        for layer_key, (output_path, skip_log_path) in paths.items():
+            print(f"Evaluating {layer_key} against {args.target} behaviors")
+            config = EvaluationConfig(
+                target=args.target,
+                layer_key=layer_key,
+                top_ks=top_ks,
+                query_batch_size=args.query_batch_size,
+                search_chunk_size=search_chunk_size,
+                max_length=args.max_length,
+                instruction=args.instruction,
+                max_users=args.max_users,
+                metrics_print_interval=args.metrics_print_interval,
+            )
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        summary = evaluate(
-            args.eval_data,
-            output_path,
-            skip_log_path,
-            search_index,
-            tokenizer,
-            model,
-            device,
-            config,
-        )
+            output_path.parent.mkdir(parents=True, exist_ok=True)
+            summaries[layer_key] = evaluate(
+                args.eval_data,
+                output_path,
+                skip_log_path,
+                search_index,
+                tokenizer,
+                model,
+                device,
+                config,
+            )
     except (OSError, RuntimeError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
 
-    print(json.dumps(summary, indent=2))
-    print(f"Wrote final summary: {output_path}")
-    print(f"Wrote skip-reason log: {skip_log_path}")
+    for layer_key, (output_path, skip_log_path) in paths.items():
+        print(json.dumps(summaries[layer_key], indent=2))
+        print(f"Wrote final summary: {output_path}")
+        print(f"Wrote skip-reason log: {skip_log_path}")
     return 0
 
 
