@@ -211,7 +211,7 @@ def create_dataset(dataset_name,
     return train_llm_dataset, test_llm_dataset
 
 
-def log_sft_template_sample(messages, tokenizer, wandb_module=None):
+def log_sft_template_sample(messages, tokenizer):
     messages = [
         {"role": message["role"], "content": message["content"]}
         for message in messages
@@ -248,27 +248,6 @@ def log_sft_template_sample(messages, tokenizer, wandb_module=None):
     print(f"Response start token: {response_start}")
     print(f"Total tokens: {len(input_ids)}")
     print("***** End SFT template sample *****", flush=True)
-
-    if wandb_module is not None:
-        table = wandb_module.Table(
-            columns=[
-                "raw_messages",
-                "full_training_text",
-                "inference_generation_prompt",
-                "supervised_suffix",
-                "response_start_token",
-                "total_tokens",
-            ],
-            data=[[
-                raw_messages,
-                full_text,
-                generation_prompt_text,
-                supervised_text,
-                response_start,
-                len(input_ids),
-            ]],
-        )
-        wandb_module.log({"debug/sft_template_sample": table})
 
 def get_train_ds_config(stage=3):
     # Communication tuning benchmarked in README "Training speed optimization log" (ZeRO-3 communication tuning).
@@ -713,7 +692,6 @@ def evaluation(model, eval_dataloader, device, max_eval_steps=-1, label_logits_o
         "batch_ppl": _ppl(batch_loss),
         "token_loss": token_loss,
         "token_ppl": _ppl(token_loss),
-        "tokens": int(token_count),
         "configs": configs,
     }
 
@@ -923,11 +901,7 @@ def main(argument_defaults=None, rollout_scorer=None):
         wandb.define_metric("eval/*", step_metric="eval_step")
 
     if cur_rank == 0:
-        log_sft_template_sample(
-            train_dataset.dataset[0]["messages"],
-            tokenizer,
-            wandb if use_wandb else None,
-        )
+        log_sft_template_sample(train_dataset.dataset[0]["messages"], tokenizer)
 
     if args.do_eval:
         if cur_rank == 0:

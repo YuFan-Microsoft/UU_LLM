@@ -15,7 +15,8 @@ Metrics:
     Layer 2: json_valid_ratio, simple_rules_pass_ratio, delta_exact_match_ratio, merge_ratio
     Every L3 / L4 task: json_valid_ratio, simple_rules_pass_ratio, and input_match_ratio
         (not for L4 Biography / L4 Commercial Preference, which copy no names from the input)
-    L3 Commercial and L4 Mission Enhancement also: query_language_match_ratio (fastText lid.176) and
+    L3 Commercial and L4 Mission Enhancement also: query_language_match_ratio_en / _glb (fastText lid.176;
+        requested query_language "en" / any other language) and
         avg_query_num (queries per commercial interest / per enhanced mission)
 """
 
@@ -808,8 +809,10 @@ def score_example(messages, generated_text):
             stats["queries"], stats["query_units"] = len(queries), QUERY_UNIT_COUNTERS[stage](output)
             detected = detect_query_language(queries)
             if detected is not None:
-                stats["language_match"] = int(same_language(detected, payload.get("query_language") or ""))
-                if not stats["language_match"]:
+                requested = payload.get("query_language") or ""
+                matched = int(same_language(detected, requested))
+                stats[f"language_match_{'en' if requested == 'en' else 'glb'}"] = matched
+                if not matched:
                     violations.add("wrong_language")
     return {
         "stage": stage,
@@ -856,8 +859,10 @@ def summarize_records(records):
                 values["input_match_ratio"] = ratio(
                     sum("input_mismatch" not in r["violations"] for r in valid), len(valid))
             if stage in QUERY_GETTERS:
-                values["query_language_match_ratio"] = ratio(
-                    totals["language_match"], sum("language_match" in r["stats"] for r in valid))
+                for group in ("en", "glb"):
+                    key = f"language_match_{group}"
+                    values[f"query_language_match_ratio_{group}"] = ratio(
+                        totals[key], sum(key in r["stats"] for r in valid))
                 values["avg_query_num"] = ratio(totals["queries"], totals["query_units"])
 
         for name, value in values.items():

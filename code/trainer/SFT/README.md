@@ -402,7 +402,7 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 Eval perplexity (x-axis `eval_step`):
 
 - `eval/batch_loss`, `eval/batch_ppl`: mean of per-batch losses, then over ranks.
-- `eval/token_loss`, `eval/token_ppl`, `eval/tokens`: total NLL / total supervised tokens over the whole test
+- `eval/token_loss`, `eval/token_ppl`: total NLL / total supervised tokens over the whole test
   split. Checkpoint names use `token_ppl`.
 - `<task>_evaluation/token_ppl`: the same token-level perplexity for each dataset config, e.g.
   `L3_Persona_evaluation/token_ppl`. It sits in the same wandb section as that task's rollout metrics.
@@ -460,7 +460,8 @@ x-axis `eval_step`)
 | L3 / L4 | `json_valid_ratio` | Outputs that parse as a JSON object with exactly the task's keys at every level |
 | L3 / L4 | `simple_rules_pass_ratio` | Outputs with no violation of the categories below |
 | L3 / L4 | `input_match_ratio` | Outputs with no `input_mismatch`. Not logged for L4 Biography and L4 Commercial Preference |
-| L3 Commercial, L4 Enhancement | `query_language_match_ratio` | Outputs whose queries are in the requested `query_language` (fastText, below) |
+| L3 Commercial, L4 Enhancement | `query_language_match_ratio_en` | Outputs whose queries are in the requested `query_language` (fastText, below), over rows requesting `en` |
+| L3 Commercial, L4 Enhancement | `query_language_match_ratio_glb` | Same, over rows requesting any other language |
 | L3 Commercial, L4 Enhancement | `avg_query_num` | Predicted queries per commercial interest (L3, prompt allows 1-3) / per enhanced mission (L4, 1-4) |
 
 L3 / L4 rule categories:
@@ -477,7 +478,8 @@ L3 / L4 rule categories:
 (`pyscript/data_cleaning/layer3_commercial_step2_language_detection.py`): every distinct non-URL query tagged
 with probability >= 0.5 votes, the top language needs >= 60% of the votes (otherwise "mix", a mismatch), and
 Chinese is split into `zh-Hans` / `zh-Hant` with OpenCC. Rollouts with no taggable query are not checked.
-Those two tasks also log `query_language_match_ratio` (over checked rollouts). It needs `fasttext-wheel` and
+Those two tasks also log `query_language_match_ratio_en` / `query_language_match_ratio_glb` (over checked
+rollouts requesting `en` / any other language). It needs `fasttext-wheel` and
 `opencc-python-reimplemented` (in the Dockerfile and `requirements_inference.txt`). The model is read from
 `$LID_MODEL_PATH` (default `UU_LLM/models/lid.176.bin`) and downloaded there on first use when missing.
 
