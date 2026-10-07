@@ -775,12 +775,17 @@ def rollout_evaluation(args, rollout, examples, rollout_scorer, model, tokenizer
         wandb_module.log(log)
 
 
+TASK_DISPLAY_NAMES = {"L1": "L1_Delta", "L2": "L2_Merge"}
+
+
 def task_name(config):
     """Short task name of a dataset config: "User_Profile_L1_gpt54_MaxLen15360" or "V1_User_Profile_L1_gpt54"
-    -> "L1", "V1_User_Profile_L3_Persona_gpt54" -> "L3_Persona"."""
+    -> "L1_Delta", "V1_User_Profile_L2_gpt54" -> "L2_Merge", "V1_User_Profile_L3_Persona_gpt54" -> "L3_Persona"."""
     match = re.search(r"(?:^|_)(L\d+(?:_[A-Za-z]+)?)_gpt54(?:_|$)", config or "") \
         or re.search(r"(?:^|_)(L\d+)(?:_|$)", config or "")
-    return match.group(1) if match else config or "all"
+    if not match:
+        return config or "all"
+    return TASK_DISPLAY_NAMES.get(match.group(1), match.group(1))
 
 
 def task_wandb_section(config):

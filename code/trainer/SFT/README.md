@@ -444,7 +444,7 @@ Saved under `--output_dir` as `epoch_<e>_step_<s>_ppl_<ppl>/`:
   summarize+write, total) and `Rollout throughput` (total tokens, avg generated tokens per prompt, overall
   gen tok/s, prompts/s, outputs that hit `max_tokens`).
 
-**Metrics** (wandb `<Task>_Evaluation/<metric>`, next to the task's eval perplexity, one section per task: `L1`, `L2`, `L3_Persona`,
+**Metrics** (wandb `<Task>_Evaluation/<metric>`, next to the task's eval perplexity, one section per task: `L1_Delta`, `L2_Merge`, `L3_Persona`,
 `L3_Commercial`, `L4_Biography`, `L4_CommercialPreference`, `L4_MissionDiscovery`, `L4_MissionEnhancement`;
 x-axis `eval_step`)
 
