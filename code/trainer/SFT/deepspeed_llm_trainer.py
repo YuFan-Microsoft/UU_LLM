@@ -428,7 +428,7 @@ def parse_args(argument_defaults=None):
     parser = argparse.ArgumentParser(description="Train and save a full Qwen3.5 multimodal model")
 
     parser.add_argument('--use_wandb', action=argparse.BooleanOptionalAction, default=True)
-    parser.add_argument('--wandb_project', type=str, default="qwen3_5_text_training")
+    parser.add_argument('--wandb_project', type=str, default="user_profile_slm_qwen35_4B")
     parser.add_argument('--wandb_run_name', type=str, default=None)
     parser.add_argument('--wandb_run_id', type=str, default=None)
     parser.add_argument('--do_eval', type=int, default=1)
