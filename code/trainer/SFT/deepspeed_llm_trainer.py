@@ -77,11 +77,15 @@ def encode_sft_example(messages, tokenizer, max_seq_length):
     return input_ids, labels, attention_mask
 
 class LLMDataset(Dataset):
-    def __init__(self, dataset, tokenizer, max_seq_len, data_slice) -> None:
+    """With config_names, every item also carries "config_index" (its dataset config), used by the
+    per-task eval perplexity; pair it with ConfigIndexCollator."""
+
+    def __init__(self, dataset, tokenizer, max_seq_len, data_slice, config_names=None) -> None:
         super().__init__()
         self.dataset = dataset[data_slice]
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
+        self.config_names = config_names
         self.print = 0
 
     def __len__(self):
@@ -89,17 +93,91 @@ class LLMDataset(Dataset):
         return length
 
     def __getitem__(self, idx):
-        messages = self.dataset[idx]["messages"]
+        row = self.dataset[idx]
+        input_ids, labels, _ = encode_sft_example(row["messages"], self.tokenizer, self.max_seq_len)
+        item = {"input_ids": input_ids.tolist(), "labels": labels.tolist()}
+        if self.config_names:
+            item["config_index"] = row["config_index"]
+        return item
+
+
+class ConfigIndexCollator:
+    """Pads with the wrapped collator and passes "config_index" through as a [batch] tensor."""
+
+    def __init__(self, collator):
+        self.collator = collator
+
+    def __call__(self, features):
+        config_index = [feature.pop("config_index") for feature in features] if "config_index" in features[0] else None
+        batch = self.collator(features)
+        if config_index is not None:
+            batch["config_index"] = torch.tensor(config_index, dtype=torch.long)
+        return batch
+
+
+def mixture_quotas(sizes, alpha):
+    """Rows per epoch for each config: total rows of one natural epoch split in proportion to n ** alpha
+    (alpha=1 keeps the natural mix, alpha=0 gives every config the same share)."""
+    total = sum(sizes)
+    weights = [size ** alpha for size in sizes]
+    return [max(1, int(round(total * weight / sum(weights)))) for weight in weights]
+
+
+class MixedEpochLLMDataset(Dataset):
+    """Train set that mixes several configs with per-epoch quotas (temperature sampling).
+
+    Each config keeps one fixed shuffled order. Epoch e takes positions [e * quota, (e + 1) * quota) of that order,
+    wrapping around, so a large config sees fresh rows every epoch until it is exhausted and a small config is
+    repeated about quota / size times per epoch. The epoch's rows are then shuffled together. The epoch length is
+    constant, so the LR schedule is unchanged. Call set_epoch(epoch) on every rank before each epoch.
+    """
+
+    def __init__(self, config_datasets, config_names, tokenizer, max_seq_len, alpha, seed) -> None:
+        super().__init__()
+        self.dataset = concatenate_datasets(config_datasets)
+        self.tokenizer = tokenizer
+        self.max_seq_len = max_seq_len
+        self.seed = seed
+        self.sizes = [len(dataset) for dataset in config_datasets]
+        self.quotas = mixture_quotas(self.sizes, alpha)
+        self.offsets = np.cumsum([0] + self.sizes[:-1])
+        rng = np.random.default_rng(seed)
+        self.orders = [rng.permutation(size) for size in self.sizes]
+        self.config_names = config_names
+        self.set_epoch(0)
+
+    def describe(self):
+        return [
+            {"config": name, "rows": size, "rows_per_epoch": quota, "passes_per_epoch": round(quota / size, 2)}
+            for name, size, quota in zip(self.config_names, self.sizes, self.quotas)
+        ]
+
+    def set_epoch(self, epoch):
+        parts = [
+            offset + order[(epoch * quota + np.arange(quota)) % size]
+            for offset, order, size, quota in zip(self.offsets, self.orders, self.sizes, self.quotas)
+        ]
+        indices = np.concatenate(parts)
+        np.random.default_rng(self.seed + epoch + 1).shuffle(indices)
+        self.indices = indices
+
+    def __len__(self):
+        return len(self.indices)
+
+    def __getitem__(self, idx):
+        messages = self.dataset[int(self.indices[idx])]["messages"]
         input_ids, labels, _ = encode_sft_example(messages, self.tokenizer, self.max_seq_len)
         return {"input_ids": input_ids.tolist(),
             "labels": labels.tolist()}
+
 
 def create_dataset(dataset_name,
                    tokenizer,
                    max_seq_len,
                    dataset_configs=None,
                    hf_token=None,
-                   shuffle_seed=42):
+                   shuffle_seed=42,
+                   mixing_alpha=None):
     load_kwargs = {"token": hf_token} if hf_token else {}
     if dataset_configs:
         config_datasets = [
@@ -111,12 +189,25 @@ def create_dataset(dataset_name,
                 config_dataset[split_name]
                 for config_dataset in config_datasets
             ]).shuffle(seed=shuffle_seed)
-            for split_name in ("train", "test")
+            for split_name in ("train",)
         }
+        dataset["test"] = concatenate_datasets([
+            config_dataset["test"].add_column("config_index", [index] * len(config_dataset["test"]))
+            for index, config_dataset in enumerate(config_datasets)
+        ]).shuffle(seed=shuffle_seed)
     else:
         dataset = load_dataset(dataset_name, **load_kwargs)
-    train_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "train")
-    test_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "test")
+    if dataset_configs and mixing_alpha is not None:
+        train_llm_dataset = MixedEpochLLMDataset(
+            [config_dataset["train"] for config_dataset in config_datasets], list(dataset_configs),
+            tokenizer, max_seq_len, mixing_alpha, shuffle_seed)
+        if torch.distributed.get_rank() == 0:
+            print(f"Train mixture (alpha={mixing_alpha}, {len(train_llm_dataset)} rows per epoch): "
+                  f"{json.dumps(train_llm_dataset.describe(), indent=2)}", flush=True)
+    else:
+        train_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "train")
+    test_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "test",
+                                  list(dataset_configs) if dataset_configs else None)
     return train_llm_dataset, test_llm_dataset
 
 
@@ -367,6 +458,10 @@ def parse_args(argument_defaults=None):
     parser.add_argument('--dataset_configs', nargs='+', default=None)
     parser.add_argument('--hf_token', type=str, default=os.getenv("HF_TOKEN"))
     parser.add_argument('--dataset_shuffle_seed', type=int, default=42)
+    parser.add_argument('--dataset_mixing_alpha', type=float, default=None,
+                        help="Mix --dataset_configs with per-epoch quotas proportional to rows ** alpha "
+                             "(e.g. 0.5); large configs rotate through fresh rows, small ones repeat. "
+                             "Default: concatenate all configs")
     parser.add_argument('--model_name_or_path', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='./checkpoints')
 
@@ -496,6 +591,35 @@ def prepare_model(args):
     return model, processor, optimizer
 
 
+def supervised_logits(model, batch, label_logits_only=True):
+    """(logits [N, vocab], targets [N], rows [N]) for the N supervised positions of the batch, in row-major
+    order; rows[i] is the batch row of position i. See compute_loss for label_logits_only."""
+    labels = batch["labels"]
+    inputs = {key: value for key, value in batch.items() if key not in ("labels", "config_index")}
+    # Logit t predicts token t + 1, so keep position t when labels[t + 1] is supervised.
+    keep = torch.zeros_like(labels, dtype=torch.bool)
+    keep[:, :-1] = labels[:, 1:] != -100
+    targets = labels[:, 1:][keep[:, :-1]]
+    rows = keep.nonzero(as_tuple=True)[0]
+    if not label_logits_only:
+        return model(**inputs, use_cache=False).logits[keep].float(), targets, rows
+
+    module = model.module if hasattr(model, "module") else model
+    lm_head = module.lm_head
+
+    def select_supervised_hidden_states(_, args):
+        return (args[0][keep],) + tuple(args[1:])
+
+    # lm_head sits outside the checkpointed decoder layers, so the hook is not needed for backward recompute.
+    handle = lm_head.register_forward_pre_hook(select_supervised_hidden_states)
+    try:
+        # logits_to_keep=0 hands all positions to lm_head; the hook narrows them to [N, hidden].
+        logits = model(**inputs, use_cache=False, logits_to_keep=0).logits.float()
+    finally:
+        handle.remove()
+    return logits, targets, rows
+
+
 def compute_loss(model, batch, label_logits_only=True):
     """Causal-LM loss, the mean over supervised tokens (same value as the model's built-in loss).
 
@@ -511,35 +635,34 @@ def compute_loss(model, batch, label_logits_only=True):
     if not label_logits_only:
         return model(**batch, use_cache=False).loss
 
-    labels = batch["labels"]
-    inputs = {key: value for key, value in batch.items() if key != "labels"}
-    # Logit t predicts token t + 1, so keep position t when labels[t + 1] is supervised.
-    keep = torch.zeros_like(labels, dtype=torch.bool)
-    keep[:, :-1] = labels[:, 1:] != -100
-    targets = labels[:, 1:][keep[:, :-1]]
-
-    module = model.module if hasattr(model, "module") else model
-    lm_head = module.lm_head
-
-    def select_supervised_hidden_states(_, args):
-        return (args[0][keep],) + tuple(args[1:])
-
-    # lm_head sits outside the checkpointed decoder layers, so the hook is not needed for backward recompute.
-    handle = lm_head.register_forward_pre_hook(select_supervised_hidden_states)
-    try:
-        # logits_to_keep=0 hands all positions to lm_head; the hook narrows them to [N, hidden].
-        logits = model(**inputs, use_cache=False, logits_to_keep=0).logits.float()
-    finally:
-        handle.remove()
+    logits, targets, _ = supervised_logits(model, batch, label_logits_only)
     if targets.numel() == 0:
         # Every rank must still run the forward (ZeRO-3 gathers collectively); contribute a zero loss.
         return logits.sum() * 0.0
     return F.cross_entropy(logits, targets)
 
 
+def _ppl(loss: float) -> float:
+    try:
+        return math.exp(loss)
+    except OverflowError:
+        return float("inf")
+
+
 def evaluation(model, eval_dataloader, device, max_eval_steps=-1, label_logits_only=True):
+    """Evaluate eval loss / perplexity and return a dict.
+
+    batch_*: mean of per-batch losses, then mean over ranks (each batch and rank weighted equally).
+    token_*: total NLL over all supervised tokens on all ranks / total supervised tokens (standard perplexity,
+             independent of batch size, rank count, and batch composition).
+    configs: {dataset config: {token_loss, token_ppl, tokens}}, the token-level numbers per task, when the eval
+             set carries config_index.
+    """
     model.eval()
-    losses = 0
+    config_names = getattr(eval_dataloader.dataset, "config_names", None) or []
+    batch_losses = torch.zeros((), device=device, dtype=torch.float64)
+    config_nll = torch.zeros(len(config_names) + 1, device=device, dtype=torch.float64)
+    config_tokens = torch.zeros(len(config_names) + 1, device=device, dtype=torch.float64)
     evaluated_steps = 0
     progress_bar = tqdm(
         eval_dataloader,
@@ -552,22 +675,58 @@ def evaluation(model, eval_dataloader, device, max_eval_steps=-1, label_logits_o
             break
         batch = to_device(batch, device)
         with torch.no_grad():
-            loss = compute_loss(model, batch, label_logits_only)
-        losses += loss.float()
+            logits, targets, rows = supervised_logits(model, batch, label_logits_only)
+            token_nll = F.cross_entropy(logits, targets, reduction="none").double()
+        # Rows without a config (no config_index) go to the last slot, which only feeds the overall numbers.
+        row_config = batch.get("config_index")
+        if row_config is None:
+            row_config = torch.full((batch["labels"].shape[0],), len(config_names), device=device, dtype=torch.long)
+        config_nll.index_add_(0, row_config[rows], token_nll)
+        config_tokens.index_add_(0, row_config[rows], torch.ones_like(token_nll))
+        batch_losses += token_nll.mean() if token_nll.numel() else 0.0
         evaluated_steps += 1
     if evaluated_steps == 0:
         raise RuntimeError("Evaluation dataloader produced no batches")
-    losses = losses / evaluated_steps
+    batch_loss = batch_losses / evaluated_steps
     try:
-        losses = get_all_reduce_mean(losses)
+        batch_loss = get_all_reduce_mean(batch_loss)
+        torch.distributed.all_reduce(config_nll, op=torch.distributed.ReduceOp.SUM)
+        torch.distributed.all_reduce(config_tokens, op=torch.distributed.ReduceOp.SUM)
     except:
         pass
-    try:
-        ppl = torch.exp(losses).item()
-    except OverflowError:
-        ppl = float("inf")
+    token_count = config_tokens.sum().item()
+    token_loss = config_nll.sum().item() / max(token_count, 1)
+    batch_loss = batch_loss.item()
+    configs = {}
+    for index, name in enumerate(config_names):
+        tokens = config_tokens[index].item()
+        if tokens:
+            loss = config_nll[index].item() / tokens
+            configs[name] = {"token_loss": loss, "token_ppl": _ppl(loss), "tokens": int(tokens)}
+    if configs and torch.distributed.get_rank() == 0:
+        for name, values in configs.items():
+            print(f"  {task_name(name):<24} token ppl {values['token_ppl']:.4f} | token loss "
+                  f"{values['token_loss']:.4f} | tokens {values['tokens']}", flush=True)
     model.train()
-    return ppl, losses.item()
+    return {
+        "batch_loss": batch_loss,
+        "batch_ppl": _ppl(batch_loss),
+        "token_loss": token_loss,
+        "token_ppl": _ppl(token_loss),
+        "tokens": int(token_count),
+        "configs": configs,
+    }
+
+
+def eval_log(result: dict, wandb_module) -> dict:
+    """wandb keys for an evaluation() result: overall numbers under eval/, per-task ones under
+    <task>_evaluation/ (the same section as that task's rollout metrics)."""
+    log = {f"eval/{key}": value for key, value in result.items() if key != "configs"}
+    for config, values in result.get("configs", {}).items():
+        section = task_wandb_section(config)
+        wandb_module.define_metric(f"{section}/*", step_metric="eval_step")
+        log.update({f"{section}/{key}": value for key, value in values.items()})
+    return log
 
 
 def create_rollout_evaluator(args, tokenizer, rollout_scorer):
@@ -631,17 +790,24 @@ def rollout_evaluation(args, rollout, examples, rollout_scorer, model, tokenizer
         log = {}
         for name, value in metrics.items():
             config, _, metric = name.rpartition("/")
-            section = rollout_wandb_section(config)
+            section = task_wandb_section(config)
             wandb_module.define_metric(f"{section}/*", step_metric="eval_step")
             log[f"{section}/{metric}"] = value
         log["eval_step"] = step
         wandb_module.log(log)
 
 
-def rollout_wandb_section(config):
-    """W&B panel section for a dataset config, e.g. "User_Profile_L1_gpt54_MaxLen15360" -> "L1_rollout_evaluation"."""
-    match = re.search(r"(?:^|_)(L\d+)(?:_|$)", config)
-    return f"{match.group(1) if match else config or 'rollout'}_rollout_evaluation"
+def task_name(config):
+    """Short task name of a dataset config: "User_Profile_L1_gpt54_MaxLen15360" or "V1_User_Profile_L1_gpt54"
+    -> "L1", "V1_User_Profile_L3_Persona_gpt54" -> "L3_Persona"."""
+    match = re.search(r"(?:^|_)(L\d+(?:_[A-Za-z]+)?)_gpt54(?:_|$)", config or "") \
+        or re.search(r"(?:^|_)(L\d+)(?:_|$)", config or "")
+    return match.group(1) if match else config or "all"
+
+
+def task_wandb_section(config):
+    """W&B panel section of a task, shared by its eval perplexity and rollout metrics, e.g. "L3_Persona_evaluation"."""
+    return f"{task_name(config)}_evaluation"
 
 
 def require_linear_attention_kernels():
@@ -682,6 +848,7 @@ def main(argument_defaults=None, rollout_scorer=None):
         dataset_configs=args.dataset_configs,
         hf_token=args.hf_token,
         shuffle_seed=args.dataset_shuffle_seed,
+        mixing_alpha=args.dataset_mixing_alpha,
     )
     rollout, rollout_examples = None, None
     if args.rollout_eval:
@@ -703,7 +870,7 @@ def main(argument_defaults=None, rollout_scorer=None):
     )
     eval_dataloader = DataLoader(
         eval_dataset,
-        collate_fn=collator,
+        collate_fn=ConfigIndexCollator(collator),
         sampler=eval_sampler,
         batch_size=args.per_device_eval_batch_size,
         pin_memory=True
@@ -768,12 +935,12 @@ def main(argument_defaults=None, rollout_scorer=None):
         evaluation_result = evaluation(
             model, eval_dataloader, device, args.max_eval_steps, args.label_logits_only
         )
-        initial_ppl = evaluation_result[0]
-        initial_loss = evaluation_result[1]
+        initial_ppl = evaluation_result["token_ppl"]
         if cur_rank == 0:
-            print(f"Init ppl: {initial_ppl}, loss: {initial_loss}")
+            print(f"Init token ppl: {evaluation_result['token_ppl']}, token loss: {evaluation_result['token_loss']} | "
+                  f"batch ppl: {evaluation_result['batch_ppl']}, batch loss: {evaluation_result['batch_loss']}")
         if use_wandb:
-            wandb.log({"eval/loss": initial_loss, "eval/ppl": initial_ppl, "eval_step": 0})
+            wandb.log({**eval_log(evaluation_result, wandb), "eval_step": 0})
     if rollout is not None:
         rollout_evaluation(args, rollout, rollout_examples, rollout_scorer, model, tokenizer, 0,
                            wandb if use_wandb else None)
@@ -785,6 +952,8 @@ def main(argument_defaults=None, rollout_scorer=None):
         if cur_rank == 0:
             print(f"===== Epoch {epoch + 1}/{args.num_train_epochs} =====")
         model.train()
+        if hasattr(train_dataset, "set_epoch"):
+            train_dataset.set_epoch(epoch)
 
         for step, batch in enumerate(train_dataloader):
             start_time = time.time()
@@ -839,15 +1008,18 @@ def main(argument_defaults=None, rollout_scorer=None):
                 if args.do_eval:
                     if cur_rank == 0:
                         print("***** Evaluating perplexity *****")
-                    ppl_eval, eval_loss = evaluation(
+                    evaluation_result = evaluation(
                         model, eval_dataloader, device, args.max_eval_steps, args.label_logits_only
                     )
+                    ppl_eval = evaluation_result["token_ppl"]
                     if cur_rank == 0:
-                        print(f"Eval ppl: {ppl_eval}, loss: {eval_loss}")
+                        print(f"Eval token ppl: {evaluation_result['token_ppl']}, "
+                              f"token loss: {evaluation_result['token_loss']} | "
+                              f"batch ppl: {evaluation_result['batch_ppl']}, "
+                              f"batch loss: {evaluation_result['batch_loss']}")
                     if use_wandb:
                         wandb.log({
-                            "eval/loss": eval_loss,
-                            "eval/ppl": ppl_eval,
+                            **eval_log(evaluation_result, wandb),
                             "epoch": epoch,
                             "global_step": global_step,
                             "eval_step": global_step,

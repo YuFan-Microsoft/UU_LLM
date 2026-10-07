@@ -351,9 +351,15 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 
 - Hugging Face dataset with `train` / `test` splits and a `messages` column
   (`[{"role": "user", ...}, {"role": "assistant", ...}]`).
-- User-profile SFT loads `yufan/user_profile_dataset`, configs `User_Profile_L1_gpt54_MaxLen15360` and
-  `User_Profile_L2_gpt54_MaxLen15360` (the GPT-5.4 subsets filtered to ≤ 15360 tokens), concatenates them and
-  shuffles with `--dataset_shuffle_seed`.
+- User-profile SFT loads `yufan/user_profile_dataset`, the eight `V1_` configs (L1, L2, L3 Persona, L3 Commercial,
+  L4 Biography, L4 Commercial Preference, L4 Mission Discovery, L4 Mission Enhancement; each with the simplified
+  task prompt and rows ≤ 20,480 Qwen3.5-4B tokens), concatenates them and shuffles with `--dataset_shuffle_seed`.
+  Rollout scoring rules exist for L1 and L2; the other configs report `json_valid_ratio` only.
+- The train split is mixed with `--dataset_mixing_alpha 0.5` (default in `deepspeed_user_profile_trainer.py`):
+  each epoch has the rows of one natural epoch, split across configs in proportion to `rows ** 0.5`. Large
+  configs (L1, L2, L4 Mission Enhancement, ~0.7-0.9 passes per epoch) see fresh rows each epoch; small configs
+  repeat (L4 Commercial Preference ~3 passes per epoch), so train for one epoch. The test split is not mixed.
+  The per-config quotas are printed at startup.
 - The chat template is applied with `enable_thinking=False`. Loss is computed only on the assistant answer
   (through its final EOS); the prompt tokens are masked with `-100`.
 
@@ -361,8 +367,8 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 
 | Setting | Value |
 | --- | --- |
-| Recommended `--max_seq_len` | **15360** (used by `run_user_profile_multi_gpu.sh`) |
-| Hard limit | **19456** — do not go above this |
+| Recommended `--max_seq_len` | **20480** (used by `run_user_profile_multi_gpu.sh`; covers every `V1_` row) |
+| Previously validated limit | **19456** — 20480 with batch size 2 is not yet validated; watch for OOM on the first run |
 
 - `--max_seq_len` bounds the full sequence (prompt + answer) per example. With the default
   `--pad_to_max_seq_len`, every batch is also padded to exactly this length, so per-step time and memory do not
@@ -375,8 +381,8 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
   python UU_LLM/pyscript/analyze_sequence_lengths.py --hf_token "$HF_TOKEN"
   ```
 
-- For rollout eval, `--rollout_max_model_len` (default 15360) must cover prompt + generated answer; keep it at
-  or above `--max_seq_len` and no higher than 19456. Prompts that leave no room for generation are skipped, and
+- For rollout eval, `--rollout_max_model_len` (default 15360, the script uses 20480) must cover prompt + generated
+  answer; keep it at or above `--max_seq_len`. Prompts that leave no room for generation are skipped, and
   the generation budget per example is `min(--rollout_max_tokens, rollout_max_model_len - prompt_tokens)`.
 
 ## Main training arguments
@@ -396,7 +402,15 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 | `--zero_stage` | 3 | ZeRO-3 with tuned communication (500M reduce/prefetch buckets, 1e9 max live parameters, overlapped communication, contiguous gradients, reduce-scatter) |
 | `--checkpoint_steps` | 5000 | Eval + checkpoint interval |
 | `--do_eval` / `--max_eval_steps` | 1 / -1 | Perplexity on the test split |
-| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `train/*`, `eval/*`, `L1_rollout_evaluation/*`, `L2_rollout_evaluation/*` |
+| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `train/*`, `eval/*`, `<task>_evaluation/*` |
+
+Eval perplexity (x-axis `eval_step`):
+
+- `eval/batch_loss`, `eval/batch_ppl`: mean of per-batch losses, then over ranks.
+- `eval/token_loss`, `eval/token_ppl`, `eval/tokens`: total NLL / total supervised tokens over the whole test
+  split. Checkpoint names use `token_ppl`.
+- `<task>_evaluation/token_loss`, `token_ppl`, `tokens`: the same token-level numbers for each dataset config,
+  e.g. `L3_Persona_evaluation/token_ppl`. They sit in the same wandb section as that task's rollout metrics.
 
 ## Checkpoints
 
@@ -434,8 +448,9 @@ Saved under `--output_dir` as `epoch_<e>_step_<s>_ppl_<ppl>/`:
   summarize+write, total) and `Rollout throughput` (total tokens, avg generated tokens per prompt, overall
   gen tok/s, prompts/s, outputs that hit `max_tokens`).
 
-**Metrics** (wandb `L1_rollout_evaluation/<metric>` and `L2_rollout_evaluation/<metric>`, x-axis `eval_step`;
-the section comes from the `L<N>` token in the dataset config name)
+**Metrics** (wandb `<task>_evaluation/<metric>`, next to the task's eval perplexity, one section per task: `L1`, `L2`, `L3_Persona`,
+`L3_Commercial`, `L4_Biography`, `L4_CommercialPreference`, `L4_MissionDiscovery`, `L4_MissionEnhancement`;
+x-axis `eval_step`)
 
 | Layer | Metric | Meaning |
 | --- | --- | --- |
@@ -447,6 +462,29 @@ the section comes from the `L<N>` token in the dataset config name)
 | L2 | `simple_rules_pass_ratio` | Outputs passing every Layer-2 cleaning rule |
 | L2 | `delta_exact_match_ratio` | Outputs whose decided `delta_interest_name` values exactly equal the input delta names (same count, each side found in the other, case-sensitive) |
 | L2 | `merge_ratio` | Share of `merge` among add/merge decisions |
+| L3 / L4 | `json_valid_ratio` | Outputs that parse as a JSON object with exactly the task's keys at every level |
+| L3 / L4 | `simple_rules_pass_ratio` | Outputs with no violation of the categories below |
+| L3 / L4 | `input_match_ratio` | Outputs with no `input_mismatch`. Not logged for L4 Biography and L4 Commercial Preference |
+| L3 Commercial, L4 Enhancement | `query_language_match_ratio` | Outputs whose queries are in the requested `query_language` (fastText, below) |
+| L3 Commercial, L4 Enhancement | `avg_query_num` | Predicted queries per commercial interest (L3, prompt allows 1-3) / per enhanced mission (L4, 1-4) |
+
+L3 / L4 rule categories:
+
+| Category | Rules |
+| --- | --- |
+| `invalid_value` | Bad enum (category path, score, funnel stage, life stage, tier, shopper type, restriction, scenario, value_type, delta_source), empty required text, wrong count (> 12 discovery missions, > 3 brands, 1-4 enhancement queries, 1-3 L3 queries), L3 commercial=false with non-null fields |
+| `input_mismatch` | Interest names not exactly the input names once each (L3), source interests not in the input (Discovery), unknown input mission, sources or query refs, or brands / queries already in the input (Enhancement) |
+| `inconsistent` | Duplicate personas, entities, queries, evidence, categories or missions; category spelled two ways; Commercial Preference values disagreeing with their details |
+| `text_quality` | Query ending in `?` or outside 2-10 words (L3) / 2-7 words (Enhancement), skipped for ja/zh/th; JSON fragments in biography text |
+| `wrong_language` | L3 Commercial and L4 Mission Enhancement only: the predicted queries are not in the input `query_language` |
+
+`wrong_language` uses the same fastText lid.176 vote as the data cleaning
+(`pyscript/data_cleaning/layer3_commercial_step2_language_detection.py`): every distinct non-URL query tagged
+with probability >= 0.5 votes, the top language needs >= 60% of the votes (otherwise "mix", a mismatch), and
+Chinese is split into `zh-Hans` / `zh-Hant` with OpenCC. Rollouts with no taggable query are not checked.
+Those two tasks also log `query_language_match_ratio` (over checked rollouts). It needs `fasttext-wheel` and
+`opencc-python-reimplemented` (in the Dockerfile and `requirements_inference.txt`). The model is read from
+`$LID_MODEL_PATH` (default `UU_LLM/models/lid.176.bin`) and downloaded there on first use when missing.
 
 Apart from `json_valid_ratio` (over all samples), ratios are computed over JSON-valid outputs, so read them
 together with
@@ -458,7 +496,7 @@ together with
 | Argument | Default | Notes |
 | --- | --- | --- |
 | `--rollout_eval_samples` | 256 | Per config; `<= 0` = whole split |
-| `--rollout_max_model_len` | 15360 | Prompt + generation; ≤ 19456 |
+| `--rollout_max_model_len` | 15360 | Prompt + generation; the script uses 20480 |
 | `--rollout_max_tokens` | 8192 | Max generated tokens |
 | `--rollout_gpu_memory_utilization` | 0.3 | vLLM share of total GPU memory while awake (the script uses 0.7 on 80 GB); lower it on OOM |
 | `--rollout_max_num_seqs` | 64 | Concurrent sequences per GPU |

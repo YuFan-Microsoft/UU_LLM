@@ -24,7 +24,16 @@ from vllm_colocate_rollout import load_rollout_eval_examples
 
 QWEN3_5_FULL_ARCH = "Qwen3_5ForConditionalGeneration"
 DEFAULT_DATASET = "yufan/user_profile_dataset"
-DEFAULT_CONFIGS = ["User_Profile_L1_gpt54_MaxLen15360", "User_Profile_L2_gpt54_MaxLen15360"]
+DEFAULT_CONFIGS = [
+    "V1_User_Profile_L1_gpt54",
+    "V1_User_Profile_L2_gpt54",
+    "V1_User_Profile_L3_Persona_gpt54",
+    "V1_User_Profile_L3_Commercial_gpt54",
+    "V1_User_Profile_L4_Biography_gpt54",
+    "V1_User_Profile_L4_CommercialPreference_gpt54",
+    "V1_User_Profile_L4_MissionDiscovery_gpt54",
+    "V1_User_Profile_L4_MissionEnhancement_gpt54",
+]
 
 
 def parse_args() -> argparse.Namespace:

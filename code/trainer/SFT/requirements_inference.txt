@@ -2,6 +2,8 @@ vllm==0.28.0
 transformers==5.15.0
 datasets
 tqdm
+fasttext-wheel
+opencc-python-reimplemented
 gradio==6.27.0
 gradio-client==2.7.0
 hf-gradio==0.4.1

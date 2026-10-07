@@ -4,6 +4,7 @@ The rules mirror the data-cleaning scripts, so an output "passes" when it would
 survive cleaning:
     Layer 1: pyscript/data_cleaning/layer1_step1_rule_based_clean.py
     Layer 2: pyscript/data_cleaning/layer2_step1_rule_based_clean.py
+    Layers 3 and 4: pyscript/data_cleaning/layer3_*_rule_based_clean.py, layer4_*_rule_based_clean.py
 
 Flow:
     score_example(messages, text)  -> one record per rollout (stage, json_valid, violations, stats)
@@ -12,11 +13,18 @@ Flow:
 Metrics:
     Layer 1: json_valid_ratio, topic_evidence_valid_ratio, simple_rules_pass_ratio, avg_interest_num
     Layer 2: json_valid_ratio, simple_rules_pass_ratio, delta_exact_match_ratio, merge_ratio
+    Every L3 / L4 task: json_valid_ratio, simple_rules_pass_ratio, and input_match_ratio
+        (not for L4 Biography / L4 Commercial Preference, which copy no names from the input)
+    L3 Commercial and L4 Mission Enhancement also: query_language_match_ratio (fastText lid.176) and
+        avg_query_num (queries per commercial interest / per enhanced mission)
 """
 
 import json
+import os
+from pathlib import Path
 import re
 from collections import Counter, defaultdict
+import urllib.request
 
 
 INPUT_MARKER = "\nInput:\n"
@@ -47,7 +55,7 @@ def parse_json_object(text):
 
 
 def read_input(messages):
-    """Return (stage, payload) from the user prompt; stage is "layer1", "layer2" or "unknown"."""
+    """Return (stage, payload) from the user prompt; stage is "layer1", "layer2", a TASK_CHECKERS key or "unknown"."""
     user_content = next(m["content"] for m in reversed(messages) if m["role"] == "user")
     if INPUT_MARKER not in user_content:
         return "unknown", None
@@ -61,6 +69,19 @@ def read_input(messages):
         return "layer1", payload
     if "delta" in payload:
         return "layer2", payload
+    if "candidate_missions" in payload:
+        return "l4_mission_enhancement", payload
+    if "commercial_interests" in payload and "personal_context" in payload:
+        return "l4_mission_discovery", payload
+    if "life_stage" in payload:
+        return "l4_commercial_preference", payload
+    if "query_language" in payload and "interests" in payload:
+        return "l3_commercial", payload
+    if "facts" in payload and "interests" in payload:
+        interests = payload["interests"] if isinstance(payload["interests"], list) else []
+        if any(isinstance(interest, dict) and "persona" in interest for interest in interests):
+            return "l4_biography", payload
+        return "l3_persona", payload
     return "unknown", payload
 
 
@@ -318,6 +339,449 @@ def check_layer2(payload, output):
 
 
 # ---------------------------------------------------------------------------
+# Layers 3 and 4, mirroring pyscript/data_cleaning/layer3_*_rule_based_clean.py and layer4_*_rule_based_clean.py.
+# keys_valid(output) checks the exact key sets and counts toward json_valid.
+# check(payload, output) returns (violations, stats); every violation is one of four categories:
+#     invalid_value   an enum, a count or a required text is wrong
+#     input_mismatch  names, sources, query refs or brands do not match the input, or repeat it
+#     inconsistent    the output contradicts or repeats itself
+#     text_quality    badly formed queries, or JSON fragments inside text
+# L3 Commercial and L4 Mission Enhancement add wrong_language (see "Query language" below).
+# ---------------------------------------------------------------------------
+
+# Query languages written without spaces between words; query word counts are not checked for them.
+UNSPACED_LANGUAGES = {"ja", "zh", "zh-Hans", "zh-Hant", "th"}
+JSON_ARTIFACT = re.compile(r'[{}`]|"(?:life_stage|biography|value|confidence|evidence)"\s*:')
+L4_SCENARIOS = {"shopping", "dining", "learning", "travel", "hobbies", "fitness", "technology"}
+
+
+def dicts(value):
+    return [item for item in value if isinstance(item, dict)] if isinstance(value, list) else []
+
+
+def string_list(value, allow_empty=True):
+    return isinstance(value, list) and (allow_empty or bool(value)) and all(has_text(item) for item in value)
+
+
+def has_duplicates(values):
+    folded = [str(value).strip().casefold() for value in values]
+    return len(set(folded)) < len(folded)
+
+
+def query_format_ok(query, language, min_words, max_words):
+    text = query.strip()
+    if text.endswith(("?", "？")):
+        return False
+    return language in UNSPACED_LANGUAGES or min_words <= len(text.split()) <= max_words
+
+
+def names_match(payload, returned):
+    """True when the returned names are exactly the input interest names, once each."""
+    expected = [interest.get("interest_name") for interest in dicts(payload.get("interests"))]
+    return len(set(expected)) == len(expected) and Counter(returned) == Counter(expected)
+
+
+def exact_list_keys(value, keys):
+    return isinstance(value, list) and all(isinstance(item, dict) and set(item) == keys for item in value)
+
+
+def exact_dict_keys(value, keys):
+    return isinstance(value, dict) and set(value) == keys
+
+
+# L3 Persona: {"interest_personas": [{"interest_name", "category", "persona"}]}
+L3P_CATEGORY = re.compile(r"^(/[^/\s]([^/]*[^/\s])?)+$")
+
+
+def l3_persona_keys_valid(output):
+    return set(output) == {"interest_personas"} and exact_list_keys(
+        output["interest_personas"], {"interest_name", "category", "persona"})
+
+
+def check_l3_persona(payload, output):
+    violations = set()
+    entries = dicts(output.get("interest_personas"))
+    if not entries or not all(
+            has_text(e.get("interest_name")) and has_text(e.get("persona"))
+            and isinstance(e.get("category"), str) and L3P_CATEGORY.match(e["category"]) for e in entries):
+        violations.add("invalid_value")
+    if not names_match(payload, [e.get("interest_name") for e in entries]):
+        violations.add("input_mismatch")
+    # A category segment spelled two ways ("&" vs "and"), or two interests sharing one persona.
+    spellings = defaultdict(set)
+    for entry in entries:
+        for segment in str(entry.get("category") or "").split("/"):
+            if segment:
+                spellings[" ".join(segment.casefold().replace("&", " and ").split())].add(segment)
+    if any(len(values) > 1 for values in spellings.values()) or has_duplicates([e.get("persona") for e in entries]):
+        violations.add("inconsistent")
+    return violations
+
+
+# L3 Commercial: {"interest_commercial": [{"interest_name", "commercial", "commercial_score", ...}]}
+L3C_LIST_KEYS = ("brands", "retailers", "products", "predicted_queries")
+L3C_SCORES = {"low", "medium", "high"}
+L3C_STAGES = {"discovery", "research", "consideration", "purchase", "post-purchase"}
+
+
+def l3_commercial_keys_valid(output):
+    return set(output) == {"interest_commercial"} and exact_list_keys(
+        output["interest_commercial"],
+        {"interest_name", "commercial", "commercial_score", "intent_funnel_stage", *L3C_LIST_KEYS})
+
+
+def l3_commercial_entry_valid(entry):
+    """commercial true: valid score and stage, 1-3 queries. commercial false: nulls and empty lists."""
+    if not has_text(entry.get("interest_name")) or not isinstance(entry.get("commercial"), bool):
+        return False
+    if not all(string_list(entry.get(key)) for key in L3C_LIST_KEYS):
+        return False
+    if entry["commercial"]:
+        return (entry.get("commercial_score") in L3C_SCORES and entry.get("intent_funnel_stage") in L3C_STAGES
+                and 1 <= len(entry["predicted_queries"]) <= 3)
+    return (entry.get("commercial_score") is None and entry.get("intent_funnel_stage") is None
+            and not any(entry[key] for key in L3C_LIST_KEYS))
+
+
+def check_l3_commercial(payload, output):
+    violations = set()
+    entries = dicts(output.get("interest_commercial"))
+    language = payload.get("query_language") or ""
+    if not names_match(payload, [e.get("interest_name") for e in entries]):
+        violations.add("input_mismatch")
+    for entry in entries:
+        if not l3_commercial_entry_valid(entry):
+            violations.add("invalid_value")
+        elif entry["commercial"]:
+            if any(has_duplicates(entry[key]) for key in L3C_LIST_KEYS):
+                violations.add("inconsistent")
+            if not all(query_format_ok(q, language, 2, 10) for q in entry["predicted_queries"]):
+                violations.add("text_quality")
+    return violations
+
+
+# L4 Biography: {"life_stage": {"value", "confidence", "evidence"}, "biography"}
+L4B_LIFE_STAGES = {"single", "married", "parenting", "caregiving", "job_seeking", "new_grad", "retirement",
+                   "unknown"}
+L4B_CONFIDENCES = {"high", "medium", "low"}
+
+
+def l4_biography_keys_valid(output):
+    return set(output) == {"life_stage", "biography"} and exact_dict_keys(
+        output["life_stage"], {"value", "confidence", "evidence"})
+
+
+def check_l4_biography(payload, output):
+    violations = set()
+    life_stage = output.get("life_stage") if isinstance(output.get("life_stage"), dict) else {}
+    evidence, biography = life_stage.get("evidence"), output.get("biography")
+    if (life_stage.get("value") not in L4B_LIFE_STAGES or life_stage.get("confidence") not in L4B_CONFIDENCES
+            or not string_list(evidence, allow_empty=False) or not has_text(biography)):
+        violations.add("invalid_value")
+        return violations
+    if has_duplicates(evidence):
+        violations.add("inconsistent")
+    if any(JSON_ARTIFACT.search(text) for text in [biography, *evidence]):
+        violations.add("text_quality")
+    return violations
+
+
+# L4 Commercial Preference: {"deal_seeking", "price_tier", "affinity": {"shopping", "dining"}}
+L4P_DEAL_LEVELS = {"high", "medium", "low"}
+L4P_TIERS = {"premium", "mid", "budget"}
+L4P_STRENGTHS = {"strong", "moderate", "weak"}
+L4P_CATEGORIES = {"Apparel", "BeautyPersonalCare", "ComputersConsumerElectronics", "Finance", "Health",
+                  "HomeGarden", "InternetTelecom", "RetailersGeneralMerchandise", "SportsFitness",
+                  "TravelTourism", "Vehicles"}
+L4P_SHOPPER_TYPES = {"ResearchDriven", "ImpulseDriven", "DealDriven", "PremiumDriven", "BrandRetailerLoyal",
+                     "NoveltySeeker", "ConvenienceDriven", "ValueDriven"}
+L4P_RESTRICTIONS = {"Vegan", "Vegetarian", "Keto", "Halal", "Kosher", "No Shellfish", "No Nuts", "No Gluten",
+                    "Dairy-Free", "Low-Carb", "Paleo", "Pescatarian"}
+VALUE_DETAILS = {"value", "details"}
+
+
+def l4_commercial_preference_keys_valid(output):
+    affinity = output.get("affinity")
+    return (set(output) == {"deal_seeking", "price_tier", "affinity"}
+            and exact_dict_keys(output["deal_seeking"], VALUE_DETAILS)
+            and exact_dict_keys(output["price_tier"], VALUE_DETAILS)
+            and exact_dict_keys(affinity, {"shopping", "dining"})
+            and exact_dict_keys(affinity["shopping"], {"product_categories", "shopper_type"})
+            and exact_dict_keys(affinity["shopping"]["shopper_type"], VALUE_DETAILS)
+            and exact_dict_keys(affinity["dining"], {"restrictions"})
+            and exact_dict_keys(affinity["dining"]["restrictions"], VALUE_DETAILS))
+
+
+def l4p_details_valid(details, level_key, levels):
+    return exact_list_keys(details, {"area", level_key, "evidence", "signal_strength"}) and all(
+        has_text(d["area"]) and has_text(d["evidence"]) and d[level_key] in levels
+        and d["signal_strength"] in L4P_STRENGTHS for d in details)
+
+
+def l4p_values_valid(output):
+    deal, tier = output["deal_seeking"], output["price_tier"]
+    shopping, restrictions = output["affinity"]["shopping"], output["affinity"]["dining"]["restrictions"]
+    shopper, categories = shopping["shopper_type"], shopping["product_categories"]
+    return (deal["value"] in L4P_DEAL_LEVELS | {"unknown"}
+            and l4p_details_valid(deal["details"], "seeking", L4P_DEAL_LEVELS)
+            and tier["value"] in L4P_TIERS | {"unknown"}
+            and l4p_details_valid(tier["details"], "tier", L4P_TIERS)
+            and exact_list_keys(categories, {"category", "description"})
+            and all(c["category"] in L4P_CATEGORIES and has_text(c["description"]) for c in categories)
+            and isinstance(shopper["value"], list) and all(v in L4P_SHOPPER_TYPES for v in shopper["value"])
+            and l4p_details_valid(shopper["details"], "type", L4P_SHOPPER_TYPES)
+            and isinstance(restrictions["value"], list) and bool(restrictions["value"])
+            and all(v in L4P_RESTRICTIONS | {"Unknown"} for v in restrictions["value"])
+            and l4p_details_valid(restrictions["details"], "restriction", L4P_RESTRICTIONS))
+
+
+def check_l4_commercial_preference(payload, output):
+    if not l4_commercial_preference_keys_valid(output) or not l4p_values_valid(output):
+        return {"invalid_value"}
+    deal = output["deal_seeking"]
+    shopper = output["affinity"]["shopping"]["shopper_type"]
+    restrictions = output["affinity"]["dining"]["restrictions"]
+    categories = output["affinity"]["shopping"]["product_categories"]
+
+    # deal_seeking: unknown <=> no details; one level => that level; high and low => medium.
+    levels = {d["seeking"] for d in deal["details"]}
+    if deal["value"] == "unknown" or not levels:
+        deal_ok = deal["value"] == "unknown" and not levels
+    else:
+        deal_ok = deal["value"] in levels if len(levels) == 1 else (
+            not {"high", "low"} <= levels or deal["value"] == "medium")
+    # shopper_type and restrictions: values equal their detail types; "Unknown" stands alone without details.
+    shopper_ok = not has_duplicates(shopper["value"]) and set(shopper["value"]) == {
+        d["type"] for d in shopper["details"]}
+    if "Unknown" in restrictions["value"]:
+        restrictions_ok = restrictions["value"] == ["Unknown"] and not restrictions["details"]
+    else:
+        restrictions_ok = not has_duplicates(restrictions["value"]) and set(restrictions["value"]) == {
+            d["restriction"] for d in restrictions["details"]}
+    if not (deal_ok and shopper_ok and restrictions_ok) or has_duplicates([c["category"] for c in categories]):
+        return {"inconsistent"}
+    return set()
+
+
+# L4 Mission Discovery: {"candidate_missions": [{"mission_name", "source_interests", "scenarios"}]}
+L4D_MAX_MISSIONS = 12
+L4D_INTEREST_HEADING = re.compile(r"(?m)^### Interest \d+: (.+)$")
+
+
+def l4_mission_discovery_keys_valid(output):
+    return set(output) == {"candidate_missions"} and exact_list_keys(
+        output["candidate_missions"], {"mission_name", "source_interests", "scenarios"})
+
+
+def check_l4_mission_discovery(payload, output):
+    violations = set()
+    known = set(L4D_INTEREST_HEADING.findall(str(payload.get("commercial_interests") or "")))
+    missions = dicts(output.get("candidate_missions"))
+    if len(missions) > L4D_MAX_MISSIONS:
+        violations.add("invalid_value")
+    for mission in missions:
+        sources, scenarios = mission.get("source_interests"), mission.get("scenarios")
+        if (not has_text(mission.get("mission_name")) or not string_list(sources, allow_empty=False)
+                or not isinstance(scenarios, list) or not scenarios
+                or not all(s in L4_SCENARIOS for s in scenarios)):
+            violations.add("invalid_value")
+            continue
+        if any(source not in known for source in sources):
+            violations.add("input_mismatch")
+        if has_duplicates(sources):
+            violations.add("inconsistent")
+    if has_duplicates([m.get("mission_name") for m in missions]):
+        violations.add("inconsistent")
+    return violations
+
+
+# L4 Mission Enhancement: {[audit blocks], "enhanced_missions": [{..., "predicted_queries": [...]}]}
+L4E_TOP_KEYS = {"geo_resolution", "professional_opportunities", "price_tier_resolution",
+                "shopping_category_opportunities", "preference_opportunities", "enhanced_missions"}
+L4E_MISSION_KEYS = {"input_mission_name", "mission_name", "source_interests", "scenarios", "predicted_brands",
+                    "predicted_queries", "enrichment_sources"}
+L4E_QUERY_KEYS = {"query", "value_type", "source_query_refs", "delta_source", "delta_evidence", "decision_change"}
+L4E_VALUE_TYPES = {"explore", "refine", "advance"}
+L4E_ENRICHMENT_SOURCES = {"cross_interest", "commercial_preference", "personal_context", "professional_context",
+                          "world_knowledge"}
+L4E_DELTA_SOURCES = L4E_ENRICHMENT_SOURCES | {"source_interest"}
+L4E_SOURCE_HEADING = re.compile(r"(?m)^### Source interest \d+: (.+)$")
+
+
+def l4_mission_enhancement_keys_valid(output):
+    missions = output.get("enhanced_missions")
+    return set(output) <= L4E_TOP_KEYS and exact_list_keys(missions, L4E_MISSION_KEYS) and all(
+        exact_list_keys(m["predicted_queries"], L4E_QUERY_KEYS) for m in missions)
+
+
+def l4e_source_blocks(evidence):
+    """Map each "### Source interest N: <name>" to (its Existing queries, its lowercased Brands)."""
+    heads = list(L4E_SOURCE_HEADING.finditer(evidence))
+    blocks = {}
+    for i, head in enumerate(heads):
+        block = evidence[head.end():heads[i + 1].start() if i + 1 < len(heads) else len(evidence)]
+        queries = set()
+        if "- Existing queries:" in block:
+            for line in block.split("- Existing queries:", 1)[1].splitlines()[1:]:
+                if not line.startswith("  - "):
+                    break
+                queries.add(line[4:].strip())
+        brands = re.search(r"(?m)^- Brands: (.+)$", block)
+        blocks[head.group(1)] = (queries, {b.strip().casefold() for b in brands.group(1).split(",")} if brands else set())
+    return blocks
+
+
+def l4e_mission_valid(mission, queries):
+    scenarios, brands, enrichment = (mission.get(key) for key in ("scenarios", "predicted_brands", "enrichment_sources"))
+    return (has_text(mission.get("mission_name")) and string_list(mission.get("source_interests"), allow_empty=False)
+            and isinstance(scenarios, list) and bool(scenarios) and all(s in L4_SCENARIOS for s in scenarios)
+            and string_list(brands) and len(brands) <= 3 and 1 <= len(queries) <= 4
+            and isinstance(enrichment, list) and all(s in L4E_ENRICHMENT_SOURCES for s in enrichment)
+            and all(has_text(q.get(key)) for q in queries for key in ("query", "delta_evidence", "decision_change"))
+            and all(q.get("value_type") in L4E_VALUE_TYPES and q.get("delta_source") in L4E_DELTA_SOURCES
+                    and isinstance(q.get("source_query_refs"), list) for q in queries))
+
+
+def check_l4_mission_enhancement(payload, output):
+    violations = set()
+    candidates = dicts(payload.get("candidate_missions"))
+    candidate_names = {c.get("mission_name") for c in candidates}
+    candidate_sources = {s for c in candidates for s in c.get("source_interests") or []}
+    blocks = l4e_source_blocks(str(payload.get("source_evidence") or ""))
+    language = payload.get("query_language") or ""
+    all_queries = []
+    for mission in dicts(output.get("enhanced_missions")):
+        queries = dicts(mission.get("predicted_queries"))
+        if not l4e_mission_valid(mission, queries):
+            violations.add("invalid_value")
+            continue
+        sources = mission["source_interests"]
+        existing = set().union(*(blocks.get(s, (set(), set()))[0] for s in sources))
+        known_brands = set().union(*(blocks.get(s, (set(), set()))[1] for s in sources))
+        existing_folded = {e.casefold() for e in existing}
+        texts = [q["query"].strip() for q in queries]
+        all_queries.extend(texts)
+        # Copy the mission and its sources from the input, cite only existing queries, add only new brands
+        # and queries.
+        if (mission.get("input_mission_name") not in candidate_names or not set(sources) <= candidate_sources
+                or any(ref not in existing for q in queries for ref in q["source_query_refs"])
+                or any(b.strip().casefold() in known_brands for b in mission["predicted_brands"])
+                or any(text.casefold() in existing_folded for text in texts)):
+            violations.add("input_mismatch")
+        if not all(query_format_ok(text, language, 2, 7) for text in texts):
+            violations.add("text_quality")
+    if has_duplicates(all_queries):
+        violations.add("inconsistent")
+    return violations
+
+
+# stage -> (keys_valid, check)
+TASK_CHECKERS = {
+    "l3_persona": (l3_persona_keys_valid, check_l3_persona),
+    "l3_commercial": (l3_commercial_keys_valid, check_l3_commercial),
+    "l4_biography": (l4_biography_keys_valid, check_l4_biography),
+    "l4_commercial_preference": (l4_commercial_preference_keys_valid, check_l4_commercial_preference),
+    "l4_mission_discovery": (l4_mission_discovery_keys_valid, check_l4_mission_discovery),
+    "l4_mission_enhancement": (l4_mission_enhancement_keys_valid, check_l4_mission_enhancement),
+}
+
+
+# ---------------------------------------------------------------------------
+# Query language (L3 Commercial, L4 Mission Enhancement): the predicted queries must be in the
+# requested query_language. Same fastText lid.176 vote as
+# pyscript/data_cleaning/layer3_commercial_step2_language_detection.py: each distinct non-URL query
+# with probability >= 0.5 votes, the top language needs >= 60% of the votes (else "mix"), and Chinese
+# is split into zh-Hans / zh-Hant with OpenCC. Rollouts whose queries cannot be tagged are not checked.
+# ---------------------------------------------------------------------------
+
+LID_MODEL_PATH = Path(os.environ.get("LID_MODEL_PATH",
+                                     Path(__file__).resolve().parents[3] / "models" / "lid.176.bin"))
+LID_MODEL_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
+LID_MIN_CONFIDENCE = 0.5
+LID_MIN_SHARE = 0.6
+URL_LIKE = re.compile(r"(https?://|www\.|^\S+\.(com|net|org|de|jp|fr|co|io|uk|au|cn|br|es|it|nl|ru)(/\S*)?$)", re.I)
+
+QUERY_GETTERS = {
+    "l3_commercial": lambda output: [
+        query for entry in dicts(output.get("interest_commercial"))
+        for query in entry.get("predicted_queries") or [] if isinstance(query, str)],
+    "l4_mission_enhancement": lambda output: [
+        query.get("query") for mission in dicts(output.get("enhanced_missions"))
+        for query in dicts(mission.get("predicted_queries")) if isinstance(query.get("query"), str)],
+}
+
+# Units that carry queries, for avg_query_num: commercial interests (L3) and enhanced missions (L4).
+QUERY_UNIT_COUNTERS = {
+    "l3_commercial": lambda output: sum(e.get("commercial") is True for e in dicts(output.get("interest_commercial"))),
+    "l4_mission_enhancement": lambda output: len(dicts(output.get("enhanced_missions"))),
+}
+
+_language_tools = None
+
+
+def language_tools():
+    """(fastText model, OpenCC (t2s, s2t) or None), loaded once. Downloads lid.176.bin when missing."""
+    global _language_tools
+    if _language_tools is None:
+        import fasttext
+
+        if not LID_MODEL_PATH.exists():
+            LID_MODEL_PATH.parent.mkdir(parents=True, exist_ok=True)
+            temporary = LID_MODEL_PATH.with_name(f"{LID_MODEL_PATH.name}.{os.getpid()}.tmp")
+            urllib.request.urlretrieve(LID_MODEL_URL, temporary)
+            os.replace(temporary, LID_MODEL_PATH)
+        fasttext.FastText.eprint = lambda *args, **kwargs: None
+        try:
+            import opencc
+            converters = (opencc.OpenCC("t2s"), opencc.OpenCC("s2t"))
+        except ImportError:
+            converters = None
+        _language_tools = (fasttext.load_model(str(LID_MODEL_PATH)), converters)
+    return _language_tools
+
+
+def chinese_script(texts, converters):
+    if converters is None:
+        return "zh"
+    t2s, s2t = converters
+    traditional = simplified = 0
+    for char in "".join(texts):
+        if "\u4e00" <= char <= "\u9fff":
+            traditional += t2s.convert(char) != char
+            simplified += s2t.convert(char) != char
+    return "zh-Hant" if traditional > simplified else "zh-Hans" if simplified > traditional else "zh"
+
+
+def detect_query_language(queries):
+    """Voted lid.176 language of the queries, "mix", or None when no query can be tagged."""
+    texts, seen = [], set()
+    for query in queries:
+        text = " ".join(query.split())
+        if text and text.casefold() not in seen and not URL_LIKE.search(text):
+            seen.add(text.casefold())
+            texts.append(text)
+    if not texts:
+        return None
+    model, converters = language_tools()
+    labels, probabilities = model.f.multilinePredict(texts, 1, 0.0, "strict")
+    by_language = defaultdict(list)
+    for text, label, probability in zip(texts, labels, probabilities):
+        if label and float(probability[0]) >= LID_MIN_CONFIDENCE:
+            by_language[label[0][len("__label__"):]].append(text)
+    if not by_language:
+        return None
+    language, tagged = max(by_language.items(), key=lambda item: len(item[1]))
+    if len(tagged) < LID_MIN_SHARE * sum(len(texts) for texts in by_language.values()):
+        return "mix"
+    return chinese_script(tagged, converters) if language == "zh" else language
+
+
+def same_language(detected, requested):
+    """Exact match; a bare "zh" (no OpenCC, or no script-specific characters) matches either script."""
+    return detected == requested or (detected == "zh" and requested.startswith("zh"))
+
+
+# ---------------------------------------------------------------------------
 # Scoring and summary
 # ---------------------------------------------------------------------------
 
@@ -334,6 +798,18 @@ def score_example(messages, generated_text):
     elif output is not None and stage == "layer2":
         json_valid = layer2_keys_valid(output)
         violations, stats = check_layer2(payload, output)
+    elif output is not None and stage in TASK_CHECKERS:
+        keys_valid, check = TASK_CHECKERS[stage]
+        json_valid = keys_valid(output)
+        violations = check(payload, output)
+        if stage in QUERY_GETTERS:
+            queries = QUERY_GETTERS[stage](output)
+            stats["queries"], stats["query_units"] = len(queries), QUERY_UNIT_COUNTERS[stage](output)
+            detected = detect_query_language(queries)
+            if detected is not None:
+                stats["language_match"] = int(same_language(detected, payload.get("query_language") or ""))
+                if not stats["language_match"]:
+                    violations.add("wrong_language")
     return {
         "stage": stage,
         "json_valid": json_valid,
@@ -373,6 +849,15 @@ def summarize_records(records):
             values["simple_rules_pass_ratio"] = ratio(sum(not r["violations"] for r in valid), len(valid))
             values["delta_exact_match_ratio"] = ratio(totals["delta_exact_match"], len(valid))
             values["merge_ratio"] = ratio(totals["merges"], totals["decisions"])
+        elif stage in TASK_CHECKERS:
+            values["simple_rules_pass_ratio"] = ratio(sum(not r["violations"] for r in valid), len(valid))
+            if stage not in ("l4_biography", "l4_commercial_preference"):
+                values["input_match_ratio"] = ratio(
+                    sum("input_mismatch" not in r["violations"] for r in valid), len(valid))
+            if stage in QUERY_GETTERS:
+                values["query_language_match_ratio"] = ratio(
+                    totals["language_match"], sum("language_match" in r["stats"] for r in valid))
+                values["avg_query_num"] = ratio(totals["queries"], totals["query_units"])
 
         for name, value in values.items():
             if value is not None:

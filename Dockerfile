@@ -40,10 +40,13 @@ RUN curl -fsSL https://gh.io/copilot-install | bash && \
 # --- Project deps NOT covered by the base image or by vLLM ---
 #   deepspeed : Stage-1/2 SFT (phase1_alignment_sft / phase2_reasoning_activation)
 #   fire      : evaluation scripts + SFT launchers
+#   fasttext-wheel / opencc-python-reimplemented : query-language rule of the user-profile rollout evaluation
 RUN pip install --upgrade pip
 RUN pip install --no-cache-dir \
     deepspeed \
     fire \
+    fasttext-wheel \
+    opencc-python-reimplemented \
     ipykernel \
     tqdm \
     azure-core==1.30.1 \
