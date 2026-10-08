@@ -19,8 +19,9 @@ import layer2
 import layer3
 import layer4
 from task import UserProfile
-from utils import (MAX_MODEL_LEN, SPEED_FIELDS, build_grid, build_prompt_ids, build_windows, dumps, generate,
-                   load_users, new_item, read_rows, visible_gpus)
+from utils import (MAX_MODEL_LEN, SPEC_FIELDS, SPEC_PER_POS, SPEED_FIELDS, add_lists, build_grid, build_prompt_ids,
+                   build_windows, dumps, generate, load_users, new_item, read_rows, spec_counters, spec_summary,
+                   visible_gpus)
 
 LAYERS = ["layer1_postprocessing", "layer2_postmerge"]  # written for every window
 L34_STAGES = [task.stage for task in layer3.TASKS + layer4.TASKS]
@@ -46,6 +47,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_p", type=float, default=0.8)
     parser.add_argument("--max_retries", type=int, default=2, help="Regenerations of an invalid answer")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num_speculative_tokens", type=int, default=0,
+                        help="MTP speculative decoding with this many draft tokens per step (0 = off); the checkpoint "
+                             "needs the mtp.* weights (see official_mtp_run_inference.py)")
     parser.add_argument("--benchmark", action="store_true",
                         help="Speed benchmark: one engine on the first visible GPU, Layer-3 tasks in separate rounds, "
                              "and speed_summary.json with per-task / per-layer / end-to-end timings and tokens/s")
@@ -59,6 +63,9 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
     snapshot (all on the last window, like the production run). Reports progress in `progress` (see PHASE).
     With --benchmark, also times each layer (model loaded, as in serving) and counts tokens per task (one "speed"
     row)."""
+    if args.num_speculative_tokens:
+        # Stats stay on for the MTP counters (llm.get_metrics()); stop vLLM from also logging them every 10 s.
+        os.environ.setdefault("VLLM_LOG_STATS_INTERVAL", str(10**9))
     from transformers import AutoProcessor
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     from tqdm import tqdm
@@ -87,11 +94,15 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
     if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):  # transformers 5 + vLLM 0.24
         PreTrainedTokenizerBase.all_special_tokens_extended = property(lambda self: list(self.all_special_tokens))
     tokenizer = AutoProcessor.from_pretrained(args.checkpoint, trust_remote_code=True).tokenizer
+    speculative = args.num_speculative_tokens > 0
+    spec_config = {"method": "mtp", "num_speculative_tokens": args.num_speculative_tokens} if speculative else None
     llm = LLM(model=args.checkpoint, hf_overrides={"architectures": ["Qwen3_5ForConditionalGeneration"]},
               dtype="bfloat16", gpu_memory_utilization=0.9, max_model_len=MAX_MODEL_LEN, max_num_seqs=256,
               max_num_batched_tokens=32768, seed=args.seed + rank, trust_remote_code=True,
-              limit_mm_per_prompt={"image": 0, "video": 0}, disable_log_stats=True)
-    sampling = dict(temperature=args.temperature, top_p=args.top_p, max_retries=args.max_retries, seed=args.seed)
+              limit_mm_per_prompt={"image": 0, "video": 0}, speculative_config=spec_config,
+              disable_log_stats=not speculative)  # the MTP acceptance counters need stats
+    sampling = dict(temperature=args.temperature, top_p=args.top_p, max_retries=args.max_retries, seed=args.seed,
+                    speculative=speculative)
     speed = {} if args.benchmark else None  # per task: utils.SPEED_FIELDS
     sampling["stats"] = speed
     layer_seconds = {}
@@ -189,6 +200,8 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
         layer_seconds["L4"] = time.perf_counter() - layer_started
         if args.benchmark:
             emit(kind="speed", rank=rank, layer_seconds=layer_seconds, stages=speed)
+        if speculative:
+            emit(kind="spec", rank=rank, **spec_counters(llm))
     progress[base + PHASE] = 5
 
 
@@ -278,9 +291,11 @@ def ratio(numerator: float, denominator: float) -> float | None:
 
 
 def speed_metrics(values: dict, seconds: float) -> dict:
-    """Token counts of one task / layer (utils.SPEED_FIELDS) and their rates over `seconds`."""
+    """Token counts of one task / layer (utils.SPEED_FIELDS) and their rates over `seconds`, plus the MTP acceptance
+    (utils.spec_summary) with --num_speculative_tokens."""
+    speculative = spec_summary(values)
     return {
-        **{key: values[key] for key in SPEED_FIELDS if key != "gen_seconds"},
+        **{key: values[key] for key in SPEED_FIELDS if key != "gen_seconds" and key not in SPEC_FIELDS},
         "retry_ratio": ratio(values["retried_requests"], values["requests"]),
         "retry_gen_tokens_ratio": ratio(values["retry_gen_tokens"], values["gen_tokens"]),
         "seconds": seconds,
@@ -290,6 +305,7 @@ def speed_metrics(values: dict, seconds: float) -> dict:
         "seconds_per_request": ratio(seconds, values["requests"]),
         "avg_prompt_tokens": ratio(values["prompt_tokens"], values["attempts"]),
         "avg_gen_tokens": ratio(values["gen_tokens"], values["attempts"]),
+        **({"speculative": speculative} if speculative else {}),
     }
 
 
@@ -298,10 +314,11 @@ def speed_summary(speed: dict, users: int) -> dict:
     (generation time of its rounds), per layer (wall time: generation plus prompt building and postprocessing), end
     to end (Layers 1-4) and per user."""
     def merged(stages: list[str]) -> dict:
-        values = dict.fromkeys(SPEED_FIELDS, 0)
+        values = {**dict.fromkeys(SPEED_FIELDS, 0), SPEC_PER_POS: []}
         for stage in stages:
             for key in SPEED_FIELDS:
                 values[key] += speed["stages"].get(stage, {}).get(key, 0)
+            values[SPEC_PER_POS] = add_lists(values[SPEC_PER_POS], speed["stages"].get(stage, {}).get(SPEC_PER_POS, []))
         return values
 
     tasks = {stage: speed_metrics(values, values["gen_seconds"])
@@ -321,15 +338,20 @@ def speed_summary(speed: dict, users: int) -> dict:
 
 
 def format_speed_table(summary: dict) -> str:
-    header = (f"{'':<26}{'requests':>9}{'retried':>9}{'retry %':>9}{'avg prompt':>12}{'avg gen':>9}{'seconds':>10}"
-              f"{'gen tok/s':>11}{'total tok/s':>12}{'s/request':>11}")
-    lines = [header]
     rows = [*summary["tasks"].items(), *summary["layers"].items(), ("end to end", summary["end_to_end"])]
+    speculative = any("speculative" in values for _, values in rows)
+    header = (f"{'':<26}{'requests':>9}{'retried':>9}{'retry %':>9}{'avg prompt':>12}{'avg gen':>9}{'seconds':>10}"
+              f"{'gen tok/s':>11}{'total tok/s':>12}{'s/request':>11}" + (f"{'accept %':>10}{'accept len':>12}"
+                                                                         if speculative else ""))
+    lines = [header]
     for name, values in rows:
+        spec = values.get("speculative")
         lines.append(f"{name:<26}{values['requests']:>9,}{values['retried_requests']:>9,}"
                      f"{100 * (values['retry_ratio'] or 0):>8.1f}%{values['avg_prompt_tokens'] or 0:>12,.0f}"
                      f"{values['avg_gen_tokens'] or 0:>9,.0f}{values['seconds']:>10.1f}{values['gen_tokens_per_s'] or 0:>11.1f}"
-                     f"{values['total_tokens_per_s'] or 0:>12.1f}{values['seconds_per_request'] or 0:>11.3f}")
+                     f"{values['total_tokens_per_s'] or 0:>12.1f}{values['seconds_per_request'] or 0:>11.3f}"
+                     + (f"{100 * spec['acceptance_rate']:>9.1f}%{spec['mean_acceptance_length']:>12.2f}" if spec
+                        else f"{'-':>10}{'-':>12}" if speculative else ""))
     e2e, per_user = summary["end_to_end"], summary["per_user"]
     lines += [
         f"end to end: {e2e['seconds']:.1f}s for {e2e['users']} users, {e2e['users_per_s'] or 0:.2f} users/s",
@@ -429,6 +451,13 @@ def main() -> None:
             sum(len(r["hyper_commercial_interests"]) for r in hyper) / len(hyper) if hyper else None),
         "hyper_failures": sum(bool(r.get("_failed")) for r in hyper),
     }
+    if args.num_speculative_tokens:
+        # Whole run over all engines (retries included); --benchmark also splits it per task / layer.
+        spec_rows = [row for row in rows if row["kind"] == "spec"]
+        totals = {key: sum(row[key] for row in spec_rows) for key in SPEC_FIELDS}
+        totals[SPEC_PER_POS] = [sum(n) for n in zip(*(row[SPEC_PER_POS] for row in spec_rows))]
+        summary["speculative_decoding"] = {"method": "mtp", "num_speculative_tokens": args.num_speculative_tokens,
+                                           **(spec_summary(totals) or {})}
     (args.output_dir / "inference_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
 

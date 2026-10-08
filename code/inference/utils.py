@@ -239,11 +239,12 @@ def new_item(key: str, prompt_ids: list[int]) -> dict:
 
 
 def generate(llm, items: list[dict], is_valid, stage: str, temperature: float, top_p: float, max_retries: int,
-             seed: int, progress_bar=None, stats: dict | None = None) -> None:
+             seed: int, progress_bar=None, stats: dict | None = None, speculative: bool = False) -> None:
     """Sample each item; regenerate answers that are not valid JSON with the expected keys up to max_retries
     times. Sets item["output"] (None if never valid), item["text"] and item["attempts"]. `progress_bar` (a tqdm
     class) is given to vLLM for the first attempt. With `stats` (--benchmark), adds this call's wall time and token
-    counts per stage to stats[stage] (see record_speed)."""
+    counts per stage to stats[stage] (see record_speed), plus the MTP draft / accepted token counts if
+    `speculative`."""
     from vllm import SamplingParams
 
     todo = [item for item in items if item["budget"] > 0]
@@ -254,11 +255,14 @@ def generate(llm, items: list[dict], is_valid, stage: str, temperature: float, t
                                  seed=(seed + zlib.crc32(f"{item.get('stage', stage)}|{item['key']}|{attempt}"
                                                          .encode())) % 2**31)
                   for item in todo]
+        spec_before = spec_counters(llm) if stats is not None and speculative else None
         started = time.perf_counter()
         outputs = llm.generate([{"prompt_token_ids": item["prompt_ids"]} for item in todo], params,
                                use_tqdm=progress_bar if attempt == 0 and progress_bar else False)
         if stats is not None:
-            record_speed(stats, todo, outputs, stage, attempt, time.perf_counter() - started)
+            seconds = time.perf_counter() - started
+            spec = spec_delta(spec_counters(llm), spec_before) if spec_before else None
+            record_speed(stats, todo, outputs, stage, attempt, seconds, spec)
         retry = []
         for item, output in zip(todo, outputs):
             item["attempts"] += 1
@@ -271,14 +275,59 @@ def generate(llm, items: list[dict], is_valid, stage: str, temperature: float, t
         todo = retry
 
 
+# MTP speculative decoding counters (vLLM's cumulative spec_decode metrics, needs disable_log_stats=False): verify
+# steps with drafts, draft tokens proposed, draft tokens accepted, and accepted drafts per draft position.
+SPEC_METRICS = {"vllm:spec_decode_num_drafts": "spec_drafts", "vllm:spec_decode_num_draft_tokens": "spec_draft_tokens",
+                "vllm:spec_decode_num_accepted_tokens": "spec_accepted_tokens"}
+SPEC_FIELDS = tuple(SPEC_METRICS.values())
+SPEC_PER_POS = "spec_accepted_per_pos"
 SPEED_FIELDS = ("calls", "requests", "attempts", "retried_requests", "prompt_tokens", "gen_tokens", "retry_attempts",
-                "retry_prompt_tokens", "retry_gen_tokens", "gen_seconds")
+                "retry_prompt_tokens", "retry_gen_tokens", "gen_seconds", *SPEC_FIELDS)
 
 
-def record_speed(stats: dict, items: list[dict], outputs, default_stage: str, attempt: int, seconds: float) -> None:
+def add_lists(a: list, b: list) -> list:
+    return [x + y for x, y in zip(a + [0] * (len(b) - len(a)), b + [0] * (len(a) - len(b)))]
+
+
+def spec_counters(llm) -> dict:
+    """The engine's cumulative MTP counters (SPEC_FIELDS and SPEC_PER_POS)."""
+    values = {**dict.fromkeys(SPEC_FIELDS, 0), SPEC_PER_POS: []}
+    for metric in llm.get_metrics():
+        if metric.name in SPEC_METRICS:
+            values[SPEC_METRICS[metric.name]] += metric.value
+        elif metric.name == "vllm:spec_decode_num_accepted_tokens_per_pos":
+            values[SPEC_PER_POS] = add_lists(values[SPEC_PER_POS], list(metric.values))
+    return values
+
+
+def spec_delta(after: dict, before: dict) -> dict:
+    return {**{key: after[key] - before[key] for key in SPEC_FIELDS},
+            SPEC_PER_POS: add_lists(after[SPEC_PER_POS], [-n for n in before[SPEC_PER_POS]])}
+
+
+def spec_summary(values: dict) -> dict | None:
+    """Acceptance of MTP counters (None without drafts): acceptance_rate = accepted / proposed draft tokens,
+    mean_acceptance_length = tokens emitted per verify step (1 + accepted / drafts), acceptance_rate_per_pos[i] =
+    share of drafts whose token i was accepted."""
+    drafts = values.get("spec_drafts", 0)
+    if not drafts:
+        return None
+    return {
+        "drafts": drafts,
+        "draft_tokens": values["spec_draft_tokens"],
+        "accepted_tokens": values["spec_accepted_tokens"],
+        "acceptance_rate": values["spec_accepted_tokens"] / values["spec_draft_tokens"],
+        "mean_acceptance_length": 1 + values["spec_accepted_tokens"] / drafts,
+        "acceptance_rate_per_pos": [n / drafts for n in values.get(SPEC_PER_POS, [])],
+    }
+
+
+def record_speed(stats: dict, items: list[dict], outputs, default_stage: str, attempt: int, seconds: float,
+                 spec: dict | None = None) -> None:
     """Adds one llm.generate call to stats[stage]: requests (first attempts), retried_requests (requests regenerated
-    at least once, i.e. those in the first retry), attempts, prompt / generated tokens (retries also counted apart)
-    and wall seconds. A call mixing stages splits its seconds by generated tokens."""
+    at least once, i.e. those in the first retry), attempts, prompt / generated tokens (retries also counted apart),
+    wall seconds and the call's MTP counters `spec`. A call mixing stages splits its seconds and MTP counters by
+    generated tokens."""
     per_stage = {}
     for item, output in zip(items, outputs):
         values = per_stage.setdefault(item.get("stage", default_stage), dict.fromkeys(SPEED_FIELDS, 0))
@@ -295,8 +344,14 @@ def record_speed(stats: dict, items: list[dict], outputs, default_stage: str, at
             values["retry_gen_tokens"] += gen_tokens
     total_gen = sum(values["gen_tokens"] for values in per_stage.values())
     for stage, values in per_stage.items():
+        share = values["gen_tokens"] / total_gen if total_gen else 1 / len(per_stage)
         values["calls"] = 1
-        values["gen_seconds"] = seconds * (values["gen_tokens"] / total_gen if total_gen else 1 / len(per_stage))
+        values["gen_seconds"] = seconds * share
+        if spec:
+            for key in SPEC_FIELDS:
+                values[key] = spec[key] * share
         merged = stats.setdefault(stage, dict.fromkeys(SPEED_FIELDS, 0))
         for key in SPEED_FIELDS:
             merged[key] += values[key]
+        if spec:
+            merged[SPEC_PER_POS] = add_lists(merged.get(SPEC_PER_POS, []), [n * share for n in spec[SPEC_PER_POS]])

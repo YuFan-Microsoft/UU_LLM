@@ -8,7 +8,8 @@
 | `layer3.py` | Layer 3: `Persona` and `Commercial` task classes, `postprocess` (= `layer3_postprocessing`) and `run` (one round of calls) |
 | `layer4.py` | Layer 4: `Biography`, `CommercialPreference`, `MissionDiscovery` and `MissionEnhancement` task classes (payloads, answer checks, records, mission rendering / validation), `postprocess` (= `layer4_postprocessing`) and `run` (four rounds of calls) |
 | `task.py` | `Task` base class (prompt, answer key check, trimmed request, record) and `UserProfile` (one user's final snapshot and its Layer-3 / Layer-4 records) |
-| `utils.py` | Input loading and cleaning, weekly windows, signal dedupe / cap, query language, L1 / L2 answer key checks, `generate()` with retries |
+| `utils.py` | Input loading and cleaning, weekly windows, signal dedupe / cap, query language, L1 / L2 answer key checks, `generate()` with retries, speed / MTP acceptance counters |
+| `official_mtp_run_inference.py` | Adds the official Qwen3.5 MTP head (`mtp.*`) to an SFT checkpoint saved without it (see [MTP speculative decoding](#mtp-speculative-decoding)) |
 | `prompts/` | The eight task prompts (`prompt_l1.md` ... `prompt_l4_hyper_mission_enhancement.md`), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V1 SFT configs) |
 
 The prompt files are read as-is (line endings normalized to `\n`); the script builds each user message as
@@ -198,6 +199,44 @@ It writes `<out_dir>/speed_summary.json` and prints a table:
   tokens per user.
 
 Prompt tokens also count prefix-cache hits, so `gen_tokens_per_s` is the better decode-speed measure.
+
+With `--num_speculative_tokens`, every task / layer / end-to-end entry also has `speculative` (see below) and the
+table gains `accept %` and `accept len` columns.
+
+## MTP speculative decoding
+
+`--num_speculative_tokens N` (default 0 = off) runs vLLM's MTP speculative decoding
+(`speculative_config={"method": "mtp", "num_speculative_tokens": N}`): the MTP head drafts N tokens per step and the
+model verifies them in one forward pass. Outputs keep the target model's distribution (rejection sampling), but even
+with the same seeds the sampled text is not token-identical to a run without MTP.
+The checkpoint must contain the `mtp.*` weights. The SFT trainer drops them (transformers ignores `mtp.*` on load),
+so first graft the official head (trained against the original Qwen3.5-4B, not the SFT model) onto the checkpoint:
+
+```bash
+# --mtp_source (default /yufan/open_source_models/Qwen3.5_VLM/Qwen3.5-4B): the local official model (reads only the
+# mtp.* bytes), or a Hugging Face repo id such as Qwen/Qwen3.5-4B (fetches only the mtp.* bytes, ~240 MB, with HTTP
+# range requests)
+python official_mtp_run_inference.py --checkpoint <ckpt_dir> --output_dir <ckpt_dir>_mtp
+# Baseline vs MTP on the same users
+python run_inference.py --checkpoint <ckpt_dir> --output_dir <out>/base --max_users 200 --benchmark
+python run_inference.py --checkpoint <ckpt_dir>_mtp --output_dir <out>/mtp2 --max_users 200 --benchmark \
+    --num_speculative_tokens 2
+```
+
+`official_mtp_run_inference.py` symlinks the SFT files (`--copy` to copy), copies the 15 `mtp.*` tensors byte for byte (no torch
+needed) to `model-mtp.safetensors`,
+adds them to `model.safetensors.index.json` and copies `mtp_num_hidden_layers` / `mtp_use_dedicated_embeddings`
+from the official config; it refuses an official model of another size. The MTP head shares the SFT model's
+`embed_tokens` / `lm_head`.
+
+Acceptance comes from vLLM's `spec_decode` counters (so stats are enabled with MTP; their periodic log is silenced
+with `VLLM_LOG_STATS_INTERVAL`, unless you set it), retries included:
+`drafts` (verify steps with a draft), `draft_tokens` (proposed), `accepted_tokens`, `acceptance_rate`
+(accepted / proposed), `mean_acceptance_length` (tokens emitted per verify step, `1 + accepted / drafts`; the ideal
+speed-up) and `acceptance_rate_per_pos` (share of drafts whose i-th token was accepted). The whole run's totals are in
+`inference_summary.json` under `speculative_decoding`; `--benchmark` also splits them per task and layer in
+`speed_summary.json`. Compare `gen_tokens_per_s` against a run without MTP: under large batches the drafts take
+batch / KV-cache capacity, so a good acceptance does not always mean higher throughput.
 
 ## Outputs
 
