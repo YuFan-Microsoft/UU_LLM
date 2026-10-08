@@ -34,6 +34,8 @@ python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir>
 python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir> --max_users 20
 # Or local JSONL files with the same rows
 python run_inference.py --checkpoint <ckpt_dir> --input users.jsonl --output_dir <out_dir>
+# Speed benchmark on one GPU (see "Speed benchmark"); keep the same users across runs to compare
+python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir> --max_users 200 --benchmark
 ```
 
 After every engine has loaded its model (vLLM logs as usual), progress is shown as four tqdm bars over all engines
@@ -172,6 +174,30 @@ Temperature 0.6 / top-p 0.8 by default, the same as `evaluate_user_profile_vllm.
 fail the official validation) are regenerated up to `--max_retries` (2) times. Every request has its own seed
 derived from (stage, user, window, attempt), so results do not depend on sharding. Other arguments:
 `--window_days` (7), `--grid_start_date`, `--seed`.
+
+## Speed benchmark
+
+`--benchmark` measures speed; without it nothing is timed and runs are unchanged. It uses one engine on the first
+visible GPU (the engines are independent data-parallel copies, so one GPU's throughput scales to N GPUs) and runs
+the two Layer-3 tasks in separate rounds so that each task is timed exactly (with the same per-request seeds). As in
+serving, the model is assumed to be loaded already: model loading, data loading and output writing are not timed.
+It writes `<out_dir>/speed_summary.json` and prints a table:
+
+- `tasks` (`l1`, `l2`, `l3_persona`, `l3_commercial`, `l4_biography`, `l4_commercial_preference`,
+  `l4_mission_discovery`, `l4_mission_enhancement`): `requests` (first attempts), `retried_requests` (requests
+  regenerated at least once because the answer was invalid), `retry_ratio` (`retried_requests / requests`),
+  `attempts` (with retries), prompt / generated tokens (retries also counted apart as `retry_*`;
+  `retry_gen_tokens_ratio` is the share of generated tokens spent on retries), `seconds` (wall time of the task's
+  `llm.generate` calls), `gen_tokens_per_s`, `total_tokens_per_s` (prompt + generated), `requests_per_s`,
+  `seconds_per_request` (round time / requests, since requests run batched), average prompt / generated tokens per
+  attempt.
+- `layers` (`L1`-`L4`): the same over the layer's tasks, with `seconds` the layer's wall time (generation plus prompt
+  building and postprocessing).
+- `end_to_end`: the same over Layers 1-4 (`seconds` is their sum), plus `users` and `users_per_s`.
+- `per_user`: seconds per user (end-to-end time / users, since users run batched), requests and prompt / generated
+  tokens per user.
+
+Prompt tokens also count prefix-cache hits, so `gen_tokens_per_s` is the better decode-speed measure.
 
 ## Outputs
 

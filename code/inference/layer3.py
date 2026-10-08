@@ -93,8 +93,9 @@ def postprocess(snapshot: dict, persona: dict, commercial: dict) -> dict:
     return {**enriched, "interests": interests, "layer": "layer3_postprocessing"}
 
 
-def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
-    """One round with both tasks for every user; sets profile.layer3."""
+def run(profiles: list[UserProfile], encode, run_round, emit, split_rounds: bool = False) -> None:
+    """One round with both tasks for every user (two rounds, Persona then Commercial, with split_rounds, so
+    --benchmark can time each task); sets profile.layer3."""
     requests = {}
     for profile in profiles:
         interests = active_interests(profile.snapshot)
@@ -103,7 +104,11 @@ def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
             interests and COMMERCIAL.request(
                 profile, lambda k: COMMERCIAL.payload(interests[:k], profile.language["locale"]), len(interests),
                 encode))
-    run_round([item for pair in requests.values() for item in pair if item])
+    if split_rounds:
+        for task_index in range(len(TASKS)):
+            run_round([pair[task_index] for pair in requests.values() if pair[task_index]])
+    else:
+        run_round([item for pair in requests.values() for item in pair if item])
 
     for profile in profiles:
         persona_item, commercial_item = requests[profile.user_id]

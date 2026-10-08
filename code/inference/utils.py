@@ -6,6 +6,7 @@ import os
 from pathlib import Path
 import re
 import subprocess
+import time
 import zlib
 
 HERE = Path(__file__).resolve().parent
@@ -238,10 +239,11 @@ def new_item(key: str, prompt_ids: list[int]) -> dict:
 
 
 def generate(llm, items: list[dict], is_valid, stage: str, temperature: float, top_p: float, max_retries: int,
-             seed: int, progress_bar=None) -> None:
+             seed: int, progress_bar=None, stats: dict | None = None) -> None:
     """Sample each item; regenerate answers that are not valid JSON with the expected keys up to max_retries
     times. Sets item["output"] (None if never valid), item["text"] and item["attempts"]. `progress_bar` (a tqdm
-    class) is given to vLLM for the first attempt."""
+    class) is given to vLLM for the first attempt. With `stats` (--benchmark), adds this call's wall time and token
+    counts per stage to stats[stage] (see record_speed)."""
     from vllm import SamplingParams
 
     todo = [item for item in items if item["budget"] > 0]
@@ -252,8 +254,11 @@ def generate(llm, items: list[dict], is_valid, stage: str, temperature: float, t
                                  seed=(seed + zlib.crc32(f"{item.get('stage', stage)}|{item['key']}|{attempt}"
                                                          .encode())) % 2**31)
                   for item in todo]
+        started = time.perf_counter()
         outputs = llm.generate([{"prompt_token_ids": item["prompt_ids"]} for item in todo], params,
                                use_tqdm=progress_bar if attempt == 0 and progress_bar else False)
+        if stats is not None:
+            record_speed(stats, todo, outputs, stage, attempt, time.perf_counter() - started)
         retry = []
         for item, output in zip(todo, outputs):
             item["attempts"] += 1
@@ -264,3 +269,34 @@ def generate(llm, items: list[dict], is_valid, stage: str, temperature: float, t
             else:
                 retry.append(item)
         todo = retry
+
+
+SPEED_FIELDS = ("calls", "requests", "attempts", "retried_requests", "prompt_tokens", "gen_tokens", "retry_attempts",
+                "retry_prompt_tokens", "retry_gen_tokens", "gen_seconds")
+
+
+def record_speed(stats: dict, items: list[dict], outputs, default_stage: str, attempt: int, seconds: float) -> None:
+    """Adds one llm.generate call to stats[stage]: requests (first attempts), retried_requests (requests regenerated
+    at least once, i.e. those in the first retry), attempts, prompt / generated tokens (retries also counted apart)
+    and wall seconds. A call mixing stages splits its seconds by generated tokens."""
+    per_stage = {}
+    for item, output in zip(items, outputs):
+        values = per_stage.setdefault(item.get("stage", default_stage), dict.fromkeys(SPEED_FIELDS, 0))
+        prompt_tokens, gen_tokens = len(item["prompt_ids"]), len(output.outputs[0].token_ids)
+        values["attempts"] += 1
+        values["prompt_tokens"] += prompt_tokens
+        values["gen_tokens"] += gen_tokens
+        if attempt == 0:
+            values["requests"] += 1
+        else:
+            values["retried_requests"] += attempt == 1
+            values["retry_attempts"] += 1
+            values["retry_prompt_tokens"] += prompt_tokens
+            values["retry_gen_tokens"] += gen_tokens
+    total_gen = sum(values["gen_tokens"] for values in per_stage.values())
+    for stage, values in per_stage.items():
+        values["calls"] = 1
+        values["gen_seconds"] = seconds * (values["gen_tokens"] / total_gen if total_gen else 1 / len(per_stage))
+        merged = stats.setdefault(stage, dict.fromkeys(SPEED_FIELDS, 0))
+        for key in SPEED_FIELDS:
+            merged[key] += values[key]

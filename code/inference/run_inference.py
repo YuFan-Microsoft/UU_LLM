@@ -12,17 +12,21 @@ import multiprocessing.connection
 import os
 from pathlib import Path
 import shutil
+import time
 
 import layer1
 import layer2
 import layer3
 import layer4
 from task import UserProfile
-from utils import (MAX_MODEL_LEN, build_grid, build_prompt_ids, build_windows, dumps, generate, load_users,
-                   new_item, read_rows, visible_gpus)
+from utils import (MAX_MODEL_LEN, SPEED_FIELDS, build_grid, build_prompt_ids, build_windows, dumps, generate,
+                   load_users, new_item, read_rows, visible_gpus)
 
 LAYERS = ["layer1_postprocessing", "layer2_postmerge"]  # written for every window
 L34_STAGES = [task.stage for task in layer3.TASKS + layer4.TASKS]
+SPEED_STAGES = ["l1", "l2"] + L34_STAGES
+SPEED_LAYERS = {"L1": ["l1"], "L2": ["l2"], "L3": [task.stage for task in layer3.TASKS],
+                "L4": [task.stage for task in layer4.TASKS]}
 # Per-engine progress in a shared array: phase and the requests done / total of each layer.
 PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL, L3_DONE, L3_TOTAL, L4_DONE, L4_TOTAL = range(FIELDS := 9)
 PHASES = ["loading", "layer1", "layer2", "layer3", "layer4", "done"]
@@ -42,6 +46,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_p", type=float, default=0.8)
     parser.add_argument("--max_retries", type=int, default=2, help="Regenerations of an invalid answer")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--benchmark", action="store_true",
+                        help="Speed benchmark: one engine on the first visible GPU, Layer-3 tasks in separate rounds, "
+                             "and speed_summary.json with per-task / per-layer / end-to-end timings and tokens/s")
     return parser.parse_args()
 
 
@@ -49,7 +56,9 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
                shard_path: Path, progress) -> None:
     """One vLLM engine on one GPU: Layer 1 for all windows of its users, then Layer 2 window by window, because
     each user's Layer 2 needs their snapshot from the previous window, then Layer 3 and Layer 4 on each user's final
-    snapshot (all on the last window, like the production run). Reports progress in `progress` (see PHASE)."""
+    snapshot (all on the last window, like the production run). Reports progress in `progress` (see PHASE).
+    With --benchmark, also times each layer (model loaded, as in serving) and counts tokens per task (one "speed"
+    row)."""
     from transformers import AutoProcessor
     from transformers.tokenization_utils_base import PreTrainedTokenizerBase
     from tqdm import tqdm
@@ -83,6 +92,9 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
               max_num_batched_tokens=32768, seed=args.seed + rank, trust_remote_code=True,
               limit_mm_per_prompt={"image": 0, "video": 0}, disable_log_stats=True)
     sampling = dict(temperature=args.temperature, top_p=args.top_p, max_retries=args.max_retries, seed=args.seed)
+    speed = {} if args.benchmark else None  # per task: utils.SPEED_FIELDS
+    sampling["stats"] = speed
+    layer_seconds = {}
 
     def encode(content: str) -> list[int]:
         return build_prompt_ids(tokenizer, [{"role": "user", "content": content}])
@@ -92,6 +104,7 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
             shard.write(dumps(row) + "\n")
 
         # Layer 1: all windows at once (they are independent).
+        layer_started = time.perf_counter()
         progress[base + PHASE], progress[base + L1_TOTAL] = 1, len(windows)
         l1_items = []
         for user_id, date_str, signals in windows:
@@ -108,6 +121,7 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
             emit(kind="call", stage="l1", user_id=item["user_id"], date=item["date"], attempts=item["attempts"],
                  valid=item["output"] is not None, signals_dropped=item["dropped"],
                  interests=len(record["interests"]), text=item["text"])
+        layer_seconds["L1"] = time.perf_counter() - layer_started
         # Every user-window with Layer-1 interests after the user's first one is one Layer-2 call (the first starts
         # the snapshot without a call); exact unless a snapshot decays to nothing, corrected after Layer 2.
         with_interests = Counter(user_id for (user_id, _), record in deltas.items() if record["interests"])
@@ -115,6 +129,7 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
         progress[base + PHASE] = 2
 
         # Layer 2: window by window, carrying each user's snapshot.
+        layer_started = time.perf_counter()
         snapshots, l2_done = {}, 0
         for date_str in dates:
             plans = {}
@@ -148,6 +163,7 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
                     snapshots[user_id] = {**snapshot, "_carried_forward": True}
                     emit(kind="record", layer="layer2_postmerge", date=date_str, record=snapshots[user_id])
         progress[base + L2_TOTAL] = l2_done
+        layer_seconds["L2"] = time.perf_counter() - layer_started
 
         def round_runner(done_field: int, total_field: int):
             """Generates one round of a layer's requests; the layer's total grows by each round's size."""
@@ -162,11 +178,17 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
             return run_round
 
         # Layers 3 and 4 on each user's final snapshot (carried forward if idle at the end).
+        layer_started = time.perf_counter()
         profiles = [UserProfile(user_id, snapshot, dates[-1]) for user_id, snapshot in snapshots.items()]
         progress[base + PHASE] = 3
-        layer3.run(profiles, encode, round_runner(L3_DONE, L3_TOTAL), emit)
+        layer3.run(profiles, encode, round_runner(L3_DONE, L3_TOTAL), emit, split_rounds=args.benchmark)
+        layer_seconds["L3"] = time.perf_counter() - layer_started
+        layer_started = time.perf_counter()
         progress[base + PHASE] = 4
         layer4.run(profiles, encode, round_runner(L4_DONE, L4_TOTAL), emit)
+        layer_seconds["L4"] = time.perf_counter() - layer_started
+        if args.benchmark:
+            emit(kind="speed", rank=rank, layer_seconds=layer_seconds, stages=speed)
     progress[base + PHASE] = 5
 
 
@@ -214,8 +236,9 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
 
 
 def run_engines(args: argparse.Namespace, windows: list, user_ids: list[str], dates: list[str]) -> list[dict]:
-    """One spawned process per visible GPU; users are dealt round-robin so each user stays on one engine."""
-    gpus = visible_gpus()
+    """One spawned process per visible GPU (only the first one with --benchmark); users are dealt round-robin so each
+    user stays on one engine."""
+    gpus = visible_gpus()[:1] if args.benchmark else visible_gpus()
     shard_dir = args.output_dir / "shards"
     shard_dir.mkdir(parents=True, exist_ok=True)
     context = mp.get_context("spawn")
@@ -248,6 +271,72 @@ def call_stats(calls: list[dict]) -> dict:
         "valid_ratio": sum(c["valid"] for c in calls) / len(calls) if calls else None,
         "attempts": dict(Counter(c["attempts"] for c in calls)),
     }
+
+
+def ratio(numerator: float, denominator: float) -> float | None:
+    return numerator / denominator if denominator else None
+
+
+def speed_metrics(values: dict, seconds: float) -> dict:
+    """Token counts of one task / layer (utils.SPEED_FIELDS) and their rates over `seconds`."""
+    return {
+        **{key: values[key] for key in SPEED_FIELDS if key != "gen_seconds"},
+        "retry_ratio": ratio(values["retried_requests"], values["requests"]),
+        "retry_gen_tokens_ratio": ratio(values["retry_gen_tokens"], values["gen_tokens"]),
+        "seconds": seconds,
+        "gen_tokens_per_s": ratio(values["gen_tokens"], seconds),
+        "total_tokens_per_s": ratio(values["prompt_tokens"] + values["gen_tokens"], seconds),
+        "requests_per_s": ratio(values["requests"], seconds),
+        "seconds_per_request": ratio(seconds, values["requests"]),
+        "avg_prompt_tokens": ratio(values["prompt_tokens"], values["attempts"]),
+        "avg_gen_tokens": ratio(values["gen_tokens"], values["attempts"]),
+    }
+
+
+def speed_summary(speed: dict, users: int) -> dict:
+    """--benchmark timings of the one engine's "speed" row, with the model already loaded as in serving: per task
+    (generation time of its rounds), per layer (wall time: generation plus prompt building and postprocessing), end
+    to end (Layers 1-4) and per user."""
+    def merged(stages: list[str]) -> dict:
+        values = dict.fromkeys(SPEED_FIELDS, 0)
+        for stage in stages:
+            for key in SPEED_FIELDS:
+                values[key] += speed["stages"].get(stage, {}).get(key, 0)
+        return values
+
+    tasks = {stage: speed_metrics(values, values["gen_seconds"])
+             for stage in SPEED_STAGES if (values := merged([stage]))["requests"]}
+    layers = {}
+    for layer, stages in SPEED_LAYERS.items():
+        layers[layer] = speed_metrics(merged(stages), speed["layer_seconds"].get(layer, 0.0))
+    total, seconds = merged(SPEED_STAGES), sum(speed["layer_seconds"].values())
+    end_to_end = {**speed_metrics(total, seconds), "users": users, "users_per_s": ratio(users, seconds)}
+    per_user = {
+        "seconds": ratio(seconds, users),
+        "requests": ratio(total["requests"], users),
+        "prompt_tokens": ratio(total["prompt_tokens"], users),
+        "gen_tokens": ratio(total["gen_tokens"], users),
+    }
+    return {"tasks": tasks, "layers": layers, "end_to_end": end_to_end, "per_user": per_user}
+
+
+def format_speed_table(summary: dict) -> str:
+    header = (f"{'':<26}{'requests':>9}{'retried':>9}{'retry %':>9}{'avg prompt':>12}{'avg gen':>9}{'seconds':>10}"
+              f"{'gen tok/s':>11}{'total tok/s':>12}{'s/request':>11}")
+    lines = [header]
+    rows = [*summary["tasks"].items(), *summary["layers"].items(), ("end to end", summary["end_to_end"])]
+    for name, values in rows:
+        lines.append(f"{name:<26}{values['requests']:>9,}{values['retried_requests']:>9,}"
+                     f"{100 * (values['retry_ratio'] or 0):>8.1f}%{values['avg_prompt_tokens'] or 0:>12,.0f}"
+                     f"{values['avg_gen_tokens'] or 0:>9,.0f}{values['seconds']:>10.1f}{values['gen_tokens_per_s'] or 0:>11.1f}"
+                     f"{values['total_tokens_per_s'] or 0:>12.1f}{values['seconds_per_request'] or 0:>11.3f}")
+    e2e, per_user = summary["end_to_end"], summary["per_user"]
+    lines += [
+        f"end to end: {e2e['seconds']:.1f}s for {e2e['users']} users, {e2e['users_per_s'] or 0:.2f} users/s",
+        f"per user: {per_user['seconds'] or 0:.2f}s, {per_user['requests'] or 0:.1f} requests, "
+        f"{per_user['prompt_tokens'] or 0:,.0f} prompt tokens, {per_user['gen_tokens'] or 0:,.0f} gen tokens",
+    ]
+    return "\n".join(lines)
 
 
 def keep_raw(rows, raw):
@@ -342,6 +431,11 @@ def main() -> None:
     }
     (args.output_dir / "inference_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
+
+    if args.benchmark:
+        speed = speed_summary(next(row for row in rows if row["kind"] == "speed"), len(user_ids))
+        (args.output_dir / "speed_summary.json").write_text(json.dumps(speed, indent=2) + "\n", encoding="utf-8")
+        print(format_speed_table(speed), flush=True)
 
 
 if __name__ == "__main__":
