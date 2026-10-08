@@ -43,7 +43,7 @@ DEFAULT_EMBEDDING_PATHS = {
 STREAMING_SEARCH_CHUNK_SIZE = 500_000
 TOP_INTERESTS = 10
 TOP30_QUERIES_PER_INTEREST = 3
-LAYER3_TOPK_KEYS = ["layer3_top10", "layer3_top30"]
+LAYER3_TOPK_KEYS = ["layer3_top10", "layer3_top30", "layer3_all"]
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -73,7 +73,8 @@ def interest_confidence(interest: dict[str, Any]) -> float:
 
 def build_topk_layers(record: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
     """layer3_top10: the first query of each of the top-10 interests by confidence_score; layer3_top30: the first 3
-    queries of each of those interests. Interests without a non-blank predicted query are not ranked."""
+    queries of each of those interests; layer3_all: every query of every interest. Interests without a non-blank
+    predicted query are not ranked."""
     ranked = []
     for interest in record.get("interests") or []:
         if not isinstance(interest, dict):
@@ -84,14 +85,16 @@ def build_topk_layers(record: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
                 (interest_confidence(interest), str(interest.get("interest_name") or ""), queries)
             )
     ranked.sort(key=lambda item: item[0], reverse=True)  # stable: ties keep the file order
-    interests = [(name, queries) for _, name, queries in ranked[:TOP_INTERESTS]]
+    all_interests = [(name, queries) for _, name, queries in ranked]
+    interests = all_interests[:TOP_INTERESTS]
 
     top10 = [{"interest_name": name, "predicted_queries": queries[:1]} for name, queries in interests]
     top30 = [
         {"interest_name": name, "predicted_queries": queries[:TOP30_QUERIES_PER_INTEREST]}
         for name, queries in interests
     ]
-    return {"layer3_top10": top10, "layer3_top30": top30}
+    every = [{"interest_name": name, "predicted_queries": queries} for name, queries in all_interests]
+    return {"layer3_top10": top10, "layer3_top30": top30, "layer3_all": every}
 
 
 def read_dataset_rows(
@@ -128,8 +131,9 @@ def build_eval_data(
     dataset_rows: Iterable[dict[str, Any]],
     output_path: Path,
 ) -> None:
-    """Write --eval_data rows {user_id, past_behaviors, future_behaviors, layer3_top10, layer3_top30} for the users
-    of layer3_postprocessing.jsonl; behaviors keep only their action_id, users missing from the dataset are dropped."""
+    """Write --eval_data rows {user_id, past_behaviors, future_behaviors, layer3_top10, layer3_top30, layer3_all} for
+    the users of layer3_postprocessing.jsonl; behaviors keep only their action_id, users missing from the dataset are
+    dropped."""
     layers_by_user = {
         str(record["user_id"]): build_topk_layers(record)
         for record in iter_jsonl(layer3_path)
@@ -447,15 +451,10 @@ def calculate_user_metrics(
 @dataclass
 class MetricTotals:
     user_count: int = 0
-    recall_sum: float = 0.0
     hit_count: int = 0
     action_count: int = 0
     query_hit_count: int = 0
     query_count: int = 0
-
-    @property
-    def macro_recall(self) -> float:
-        return self.recall_sum / self.user_count if self.user_count else 0.0
 
     @property
     def micro_recall(self) -> float:
@@ -467,11 +466,9 @@ class MetricTotals:
         action_count: int,
         query_count: int,
     ) -> None:
-        recall = user_metrics["recall"]
-        if recall is None:
+        if user_metrics["recall"] is None:
             return
         self.user_count += 1
-        self.recall_sum += float(recall)
         self.hit_count += int(user_metrics["hit_count"])
         self.action_count += action_count
         self.query_hit_count += int(user_metrics["query_hit_count"])
@@ -479,7 +476,6 @@ class MetricTotals:
 
     def summary(self, target: str) -> dict[str, int | float | None]:
         return {
-            "macro_recall": self.macro_recall if self.user_count else None,
             "micro_recall": self.micro_recall if self.action_count else None,
             "query_hit_rate": (
                 self.query_hit_count / self.query_count if self.query_count else None
@@ -529,14 +525,10 @@ def format_metrics_table(
         f"interest_names={interest_name_count:,}, "
         f"interest_names/user={average_interest_names_per_user:.2f}, "
         f"skipped={skipped_user_count:,})",
-        f"{'K':>8} {'Macro Recall':>14} {'Micro Recall':>14}",
+        f"{'K':>8} {'Micro Recall':>14}",
     ]
     for top_k in top_ks:
-        values = totals[top_k]
-        lines.append(
-            f"{top_k:>8,} {values.macro_recall:>14.4f} "
-            f"{values.micro_recall:>14.4f}"
-        )
+        lines.append(f"{top_k:>8,} {totals[top_k].micro_recall:>14.4f}")
     return "\n".join(lines)
 
 
@@ -720,7 +712,7 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "run_inference.py layer3_postprocessing.jsonl: build --eval_data from "
-            "it and the dataset behaviors, then evaluate layer3_top10 and layer3_top30"
+            "it and the dataset behaviors, then evaluate layer3_top10, layer3_top30 and layer3_all"
         ),
     )
     parser.add_argument(
@@ -755,7 +747,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help=(
             "Record key(s) containing predicted_queries, evaluated one after another "
-            "(default: layer3, or layer3_top10 layer3_top30 with --layer3)"
+            "(default: layer3, or layer3_top10 layer3_top30 layer3_all with --layer3)"
         ),
     )
     parser.add_argument(
@@ -978,7 +970,25 @@ def main() -> int:
         print(json.dumps(summaries[layer_key], indent=2))
         print(f"Wrote final summary: {output_path}")
         print(f"Wrote skip-reason log: {skip_log_path}")
+    print(format_strategy_table(summaries, top_ks))
     return 0
+
+
+STRATEGY_NAMES = {"layer3_top10": "Top 10", "layer3_top30": "Top 30", "layer3_all": "All"}
+
+
+def format_strategy_table(summaries: dict[str, dict[str, Any]], top_ks: list[int]) -> str:
+    """Final tab-separated table (pastes into a spreadsheet): one row per layer key with its average queries per
+    evaluated user and micro recall at every top_k."""
+    lines = ["\t".join(["Query Strategy", "Avg. Queries / User", *(f"Recall@{top_k}" for top_k in top_ks)])]
+    for layer_key, summary in summaries.items():
+        recalls = [summary["metrics"][str(top_k)]["micro_recall"] for top_k in top_ks]
+        lines.append("\t".join([
+            STRATEGY_NAMES.get(layer_key, layer_key),
+            f"{summary['average_queries_per_user']:.1f}",
+            *("-" if recall is None else f"{recall:.4f}" for recall in recalls),
+        ]))
+    return "\n".join(lines)
 
 
 if __name__ == "__main__":
