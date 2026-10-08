@@ -7,6 +7,7 @@ from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
+import random
 import sys
 from typing import Any, Iterable, Iterator
 
@@ -43,7 +44,8 @@ DEFAULT_EMBEDDING_PATHS = {
 STREAMING_SEARCH_CHUNK_SIZE = 500_000
 TOP_INTERESTS = 10
 TOP30_QUERIES_PER_INTEREST = 3
-LAYER3_TOPK_KEYS = ["layer3_top10", "layer3_top30", "layer3_all"]
+LAYER3_TOPK_KEYS = ["layer3_top10", "layer3_random10", "layer3_top30", "layer3_random30", "layer3_all"]
+RANDOM_QUERY_COUNTS = {"layer3_random10": 10, "layer3_random30": 30}
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -71,10 +73,12 @@ def interest_confidence(interest: dict[str, Any]) -> float:
         return 0.0
 
 
-def build_topk_layers(record: dict[str, Any]) -> dict[str, list[dict[str, Any]]]:
+def build_topk_layers(record: dict[str, Any], random_seed: int = 0) -> dict[str, list[dict[str, Any]]]:
     """layer3_top10: the first query of each of the top-10 interests by confidence_score; layer3_top30: the first 3
-    queries of each of those interests; layer3_all: every query of every interest. Interests without a non-blank
-    predicted query are not ranked."""
+    queries of each of those interests; layer3_all: every query of every interest; layer3_random10 / _random30: 10 /
+    30 queries drawn at random (all of them if fewer) from the distinct queries of layer3_all. The random draw is one
+    shuffle per user seeded by (random_seed, user_id), so random10 is a prefix of random30. Interests without a
+    non-blank predicted query are not ranked."""
     ranked = []
     for interest in record.get("interests") or []:
         if not isinstance(interest, dict):
@@ -94,7 +98,18 @@ def build_topk_layers(record: dict[str, Any]) -> dict[str, list[dict[str, Any]]]
         for name, queries in interests
     ]
     every = [{"interest_name": name, "predicted_queries": queries} for name, queries in all_interests]
-    return {"layer3_top10": top10, "layer3_top30": top30, "layer3_all": every}
+
+    pool = {}  # distinct query -> its (highest-ranked) interest
+    for name, queries in all_interests:
+        for query in queries:
+            pool.setdefault(query, name)
+    shuffled = list(pool.items())
+    random.Random(f"{random_seed}:{record.get('user_id')}").shuffle(shuffled)
+    randoms = {
+        key: [{"interest_name": name, "predicted_queries": [query]} for query, name in shuffled[:count]]
+        for key, count in RANDOM_QUERY_COUNTS.items()
+    }
+    return {"layer3_top10": top10, "layer3_top30": top30, "layer3_all": every, **randoms}
 
 
 def read_dataset_rows(
@@ -130,12 +145,12 @@ def build_eval_data(
     layer3_path: Path,
     dataset_rows: Iterable[dict[str, Any]],
     output_path: Path,
+    random_seed: int = 0,
 ) -> None:
-    """Write --eval_data rows {user_id, past_behaviors, future_behaviors, layer3_top10, layer3_top30, layer3_all} for
-    the users of layer3_postprocessing.jsonl; behaviors keep only their action_id, users missing from the dataset are
-    dropped."""
+    """Write --eval_data rows {user_id, past_behaviors, future_behaviors, <LAYER3_TOPK_KEYS>} for the users of
+    layer3_postprocessing.jsonl; behaviors keep only their action_id, users missing from the dataset are dropped."""
     layers_by_user = {
-        str(record["user_id"]): build_topk_layers(record)
+        str(record["user_id"]): build_topk_layers(record, random_seed)
         for record in iter_jsonl(layer3_path)
     }
     behaviors_by_user: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -712,8 +727,15 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "run_inference.py layer3_postprocessing.jsonl: build --eval_data from "
-            "it and the dataset behaviors, then evaluate layer3_top10, layer3_top30 and layer3_all"
+            "it and the dataset behaviors, then evaluate layer3_top10, layer3_random10, "
+            "layer3_top30, layer3_random30 and layer3_all"
         ),
+    )
+    parser.add_argument(
+        "--random_seed",
+        type=int,
+        default=0,
+        help="Seed of the layer3_random10 / layer3_random30 query draws, combined with each user_id (default: 0)",
     )
     parser.add_argument(
         "--hf_split",
@@ -747,7 +769,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help=(
             "Record key(s) containing predicted_queries, evaluated one after another "
-            "(default: layer3, or layer3_top10 layer3_top30 layer3_all with --layer3)"
+            "(default: layer3, or the five layer3_* strategies with --layer3)"
         ),
     )
     parser.add_argument(
@@ -928,6 +950,7 @@ def main() -> int:
                 args.layer3,
                 read_dataset_rows(args.dataset_jsonl, args.hf_split),
                 args.eval_data,
+                args.random_seed,
             )
             if args.build_only:
                 return 0
@@ -974,7 +997,8 @@ def main() -> int:
     return 0
 
 
-STRATEGY_NAMES = {"layer3_top10": "Top 10", "layer3_top30": "Top 30", "layer3_all": "All"}
+STRATEGY_NAMES = {"layer3_top10": "Top 10", "layer3_random10": "Random 10", "layer3_top30": "Top 30",
+                  "layer3_random30": "Random 30", "layer3_all": "All"}
 
 
 def format_strategy_table(summaries: dict[str, dict[str, Any]], top_ks: list[int]) -> str:
