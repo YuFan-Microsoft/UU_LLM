@@ -46,13 +46,21 @@ TOP_INTERESTS = 10
 TOP30_QUERIES_PER_INTEREST = 3
 LAYER3_TOPK_KEYS = ["layer3_top10", "layer3_random10", "layer3_top30", "layer3_random30", "layer3_all"]
 RANDOM_QUERY_COUNTS = {"layer3_random10": 10, "layer3_random30": 30}
-# Oracle strategies are not stored in --eval_data: they pick, per user and with the ground truth, the queries of
-# layer3_all that best cover the target actions at recall@ORACLE_SELECTION_TOP_K.
+# Oracle strategies are not stored in --eval_data: they pick, per user and with the ground truth, from layer3_all
+# what best covers the target actions at recall@ORACLE_SELECTION_TOP_K. Interest oracles pick TOP_INTERESTS
+# interests and keep their first 1 / TOP30_QUERIES_PER_INTEREST queries (like layer3_top10 / layer3_top30); query
+# oracles pick 10 / 30 distinct queries regardless of their interest.
 ORACLE_POOL_KEY = "layer3_all"
-ORACLE_QUERY_COUNTS = {"layer3_oracle10": 10, "layer3_oracle30": 30}
+INTEREST_ORACLE_QUERIES_PER_INTEREST = {
+    "layer3_interest_oracle10": 1,
+    "layer3_interest_oracle30": TOP30_QUERIES_PER_INTEREST,
+}
+QUERY_ORACLE_COUNTS = {"layer3_query_oracle10": 10, "layer3_query_oracle30": 30}
+ORACLE_KEYS = [*INTEREST_ORACLE_QUERIES_PER_INTEREST, *QUERY_ORACLE_COUNTS]
 ORACLE_SELECTION_TOP_K = 50
-LAYER3_EVAL_KEYS = ["layer3_top10", "layer3_random10", "layer3_oracle10", "layer3_top30", "layer3_random30",
-                    "layer3_oracle30", "layer3_all"]
+LAYER3_EVAL_KEYS = ["layer3_random10", "layer3_random30", "layer3_top10", "layer3_top30",
+                    "layer3_interest_oracle10", "layer3_interest_oracle30",
+                    "layer3_query_oracle10", "layer3_query_oracle30", "layer3_all"]
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -289,6 +297,18 @@ def count_interest_names(query_specs: list[tuple[str, str]]) -> int:
             if interest_name.strip()
         }
     )
+
+
+def interest_query_groups(record: dict[str, Any], layer_key: str) -> list[tuple[str, list[str]]]:
+    """(interest_name, distinct non-blank queries) per interest of `layer_key`, in order; interests without a
+    query are dropped."""
+    layer = record.get(layer_key)
+    groups = []
+    for interest in layer if isinstance(layer, list) else []:
+        if isinstance(interest, dict) and (queries := clean_queries(interest.get("predicted_queries"))):
+            name = interest.get("interest_name")
+            groups.append((name if isinstance(name, str) else "", queries))
+    return groups
 
 
 def build_no_valid_queries_reason(rejection_reasons: set[str]) -> str:
@@ -714,10 +734,11 @@ def evaluate(
     return summary
 
 
-def greedy_query_selection(hits: list[frozenset], count: int) -> list[int]:
-    """Indices of up to `count` queries by greedy maximum coverage: each step takes the query that hits the most
-    target actions not hit yet; ties, and the rest of the budget once no query adds a hit, go to the earliest query
-    (interest confidence order). Greedy steps are sequential, so a smaller count gives a prefix of a larger one."""
+def greedy_max_coverage(hits: list[frozenset], count: int) -> list[int]:
+    """Indices of up to `count` candidates (queries or interests) by greedy maximum coverage: each step takes the
+    candidate that hits the most target actions not hit yet; ties, and the rest of the budget once no candidate adds
+    a hit, go to the earliest one (interest confidence order). Greedy steps are sequential, so a smaller count gives
+    a prefix of a larger one."""
     chosen: list[int] = []
     covered: set = set()
     remaining = list(range(len(hits)))
@@ -738,10 +759,13 @@ def evaluate_oracle(
     device: Any,
     config: EvaluationConfig,
 ) -> dict[str, dict[str, Any]]:
-    """Oracle strategies (ORACLE_QUERY_COUNTS keys in `paths`): per user, the 10 / 30 distinct ORACLE_POOL_KEY
-    queries that best cover the target actions at recall@ORACLE_SELECTION_TOP_K (greedy maximum coverage, using
-    the ground truth, so a ceiling rather than a deployable selection), then evaluated at every top_k like
-    evaluate(). One pass and one retrieval of the pool serve all of them."""
+    """Oracle strategies (ORACLE_KEYS in `paths`), chosen per user from ORACLE_POOL_KEY by greedy maximum coverage
+    of the target actions at recall@ORACLE_SELECTION_TOP_K (using the ground truth, so a ceiling rather than a
+    deployable selection), then evaluated at every top_k like evaluate():
+    - interest oracles: the TOP_INTERESTS interests whose first 1 / 3 queries (together) best cover the targets,
+      keeping those first 1 / 3 queries, i.e. layer3_top10 / layer3_top30 with an oracle interest ranking;
+    - query oracles: the 10 / 30 distinct queries that best cover the targets, regardless of their interest.
+    One pass and one retrieval of the pool serve all of them."""
     keys = list(paths)
     totals = {key: {top_k: MetricTotals() for top_k in config.top_ks} for key in keys}
     query_counts = Counter()
@@ -764,26 +788,39 @@ def evaluate_oracle(
             skip_user_ids.setdefault(reason, []).append(record.get("user_id"))
             continue
 
-        seen: set[str] = set()
+        groups = interest_query_groups(record, ORACLE_POOL_KEY)
+        position: dict[str, int] = {}
         distinct = []  # first (highest-ranked interest) occurrence of each query, in pool order
-        for name, query in query_specs:
-            if query not in seen:
-                seen.add(query)
-                distinct.append((name, query))
+        for name, queries in groups:
+            for query in queries:
+                if query not in position:
+                    position[query] = len(distinct)
+                    distinct.append((name, query))
         retrieved_ids = retrieve_queries(distinct, search_index, tokenizer, model, device, retrieval_config)
         selection_hits = [
             frozenset(ids[:ORACLE_SELECTION_TOP_K]) & target_action_ids for ids in retrieved_ids
         ]
-        ranked = greedy_query_selection(selection_hits, max(ORACLE_QUERY_COUNTS[key] for key in keys))
         for key in keys:
-            chosen = ranked[: ORACLE_QUERY_COUNTS[key]]
+            if key in QUERY_ORACLE_COUNTS:
+                chosen = greedy_max_coverage(selection_hits, QUERY_ORACLE_COUNTS[key])
+                chosen_specs = [distinct[index] for index in chosen]
+            else:
+                per_interest = INTEREST_ORACLE_QUERIES_PER_INTEREST[key]
+                interest_hits = [
+                    frozenset().union(*(selection_hits[position[query]] for query in queries[:per_interest]))
+                    for _, queries in groups
+                ]
+                chosen = greedy_max_coverage(interest_hits, TOP_INTERESTS)
+                chosen_specs = [
+                    (groups[index][0], query) for index in chosen for query in groups[index][1][:per_interest]
+                ]
             metrics = calculate_user_metrics(
-                target_action_ids, [retrieved_ids[index] for index in chosen], config.top_ks
+                target_action_ids, [retrieved_ids[position[query]] for _, query in chosen_specs], config.top_ks
             )
             for top_k, values in totals[key].items():
-                values.update(metrics[str(top_k)], len(target_action_ids), len(chosen))
-            query_counts[key] += len(chosen)
-            interest_name_counts[key] += count_interest_names([distinct[index] for index in chosen])
+                values.update(metrics[str(top_k)], len(target_action_ids), len(chosen_specs))
+            query_counts[key] += len(chosen_specs)
+            interest_name_counts[key] += count_interest_names(chosen_specs)
 
         user_count += 1
         progress.set_postfix(evaluated=user_count, skipped=skipped_user_count, refresh=True)
@@ -800,8 +837,13 @@ def evaluate_oracle(
             "target": config.target,
             "layer_key": key,
             "selection": (
-                f"greedy maximum coverage of the {config.target} actions at recall@{ORACLE_SELECTION_TOP_K} "
-                f"over the distinct {ORACLE_POOL_KEY} queries (oracle)"
+                f"greedy maximum coverage of the {config.target} actions at recall@{ORACLE_SELECTION_TOP_K} over "
+                + (
+                    f"the distinct {ORACLE_POOL_KEY} queries, keeping {QUERY_ORACLE_COUNTS[key]} (query oracle)"
+                    if key in QUERY_ORACLE_COUNTS
+                    else f"the {ORACLE_POOL_KEY} interests, keeping {TOP_INTERESTS} with their first "
+                    f"{INTEREST_ORACLE_QUERIES_PER_INTEREST[key]} queries (interest oracle)"
+                )
             ),
             "user_count": user_count,
             "query_count": query_counts[key],
@@ -837,8 +879,9 @@ def parse_args() -> argparse.Namespace:
         type=Path,
         help=(
             "run_inference.py layer3_postprocessing.jsonl: build --eval_data from "
-            "it and the dataset behaviors, then evaluate layer3_top10, layer3_random10, layer3_oracle10, "
-            "layer3_top30, layer3_random30, layer3_oracle30 and layer3_all"
+            "it and the dataset behaviors, then evaluate layer3_random10, layer3_random30, layer3_top10, "
+            "layer3_top30, layer3_interest_oracle10, layer3_interest_oracle30, layer3_query_oracle10, "
+            "layer3_query_oracle30 and layer3_all"
         ),
     )
     parser.add_argument(
@@ -879,8 +922,8 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help=(
             "Record key(s) containing predicted_queries, evaluated one after another "
-            "(default: layer3, or the seven layer3_* strategies with --layer3); layer3_oracle10 / "
-            f"layer3_oracle30 select from {ORACLE_POOL_KEY} with the ground truth"
+            "(default: layer3, or the nine layer3_* strategies with --layer3); "
+            f"{', '.join(ORACLE_KEYS)} select from {ORACLE_POOL_KEY} with the ground truth"
         ),
     )
     parser.add_argument(
@@ -1088,11 +1131,11 @@ def main() -> int:
             )
 
             output_path.parent.mkdir(parents=True, exist_ok=True)
-            if layer_key in ORACLE_QUERY_COUNTS:
+            if layer_key in ORACLE_KEYS:
                 # One pass (one retrieval of the pool) for every requested oracle strategy.
                 summaries.update(evaluate_oracle(
                     args.eval_data,
-                    {key: value for key, value in paths.items() if key in ORACLE_QUERY_COUNTS},
+                    {key: value for key, value in paths.items() if key in ORACLE_KEYS},
                     search_index,
                     tokenizer,
                     model,
@@ -1122,9 +1165,11 @@ def main() -> int:
     return 0
 
 
-STRATEGY_NAMES = {"layer3_top10": "Confidence_score_top10", "layer3_random10": "Random10",
-                  "layer3_oracle10": "Oracle10", "layer3_top30": "Confidence_score_top30",
-                  "layer3_random30": "Random30", "layer3_oracle30": "Oracle30", "layer3_all": "All"}
+STRATEGY_NAMES = {"layer3_random10": "Random_10", "layer3_random30": "Random_30",
+                  "layer3_top10": "Confidence_Score_Top_10", "layer3_top30": "Confidence_Score_Top_30",
+                  "layer3_interest_oracle10": "Interest_Oracle_10", "layer3_interest_oracle30": "Interest_Oracle_30",
+                  "layer3_query_oracle10": "Query_Oracle_10", "layer3_query_oracle30": "Query_Oracle_30",
+                  "layer3_all": "All"}
 
 
 def format_strategy_table(summaries: dict[str, dict[str, Any]], top_ks: list[int]) -> str:
