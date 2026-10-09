@@ -1,4 +1,4 @@
-"""Graft the official Qwen3.5 MTP head (the mtp.* tensors) into an SFT checkpoint saved without it.
+"""Merge the official Qwen3.5 MTP head (the mtp.* tensors) into an SFT checkpoint saved without it.
 
 Only the bytes of the mtp.* tensors are read from the official model: from a local directory, or with HTTP range
 requests from a Hugging Face repo (~240 MB for Qwen3.5-4B instead of the ~9 GB shards). They are copied verbatim, so
@@ -186,7 +186,7 @@ def main() -> None:
     index["weight_map"].update(dict.fromkeys(tensors, MTP_FILE))
     (args.output_dir / INDEX).write_text(json.dumps(index, indent=2) + "\n", encoding="utf-8")
 
-    print(f"Grafted {len(tensors)} mtp.* tensors ({mtp_bytes / 2**20:.0f} MiB) from {args.mtp_source} into "
+    print(f"Merged {len(tensors)} mtp.* tensors ({mtp_bytes / 2**20:.0f} MiB) from {args.mtp_source} into "
           f"{args.output_dir} ({'copied' if args.copy else 'symlinked'} SFT files from {checkpoint}); "
           f"mtp config: {({key: sft_text.get(key) for key in MTP_CONFIG_KEYS})}")
     for name, (dtype, shape, _) in tensors.items():

@@ -49,7 +49,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--num_speculative_tokens", type=int, default=0,
                         help="MTP speculative decoding with this many draft tokens per step (0 = off); the checkpoint "
-                             "needs the mtp.* weights (see official_mtp_run_inference.py)")
+                             "needs the mtp.* weights (see merge_official_mtp.py)")
     parser.add_argument("--benchmark", action="store_true",
                         help="Speed benchmark: one engine on the first visible GPU, Layer-3 tasks in separate rounds, "
                              "and speed_summary.json with per-task / per-layer / end-to-end timings and tokens/s")
