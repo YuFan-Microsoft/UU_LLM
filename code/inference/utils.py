@@ -20,9 +20,10 @@ MAX_SIGNAL_ACTIONS = 200        # max_signal_actions (production --max-user-acti
 MAX_ACTION_CHARS = 128          # data_reader.clean_signals
 MIN_VALID_DATE = "2025-01-01"   # data_reader.MIN_VALID_DATE
 
-MAX_MODEL_LEN = 20480           # the V1 SFT rows and the trainer's rollout eval use 20,480 tokens
-MAX_TOKENS = 8192
-MIN_OUTPUT_TOKENS = 4096        # prompts are trimmed until this many tokens are left for the answer
+# SFT / rollout eval use 20,480 tokens; Qwen3.5 has a native 262,144-token context, so inference can use more.
+MAX_MODEL_LEN = 32768
+MAX_TOKENS = 10240
+MIN_OUTPUT_TOKENS = 8192        # prompts are trimmed until this many tokens are left for the answer
 PROMPT_BUDGET = MAX_MODEL_LEN - MIN_OUTPUT_TOKENS
 
 

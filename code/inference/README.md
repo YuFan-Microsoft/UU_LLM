@@ -72,8 +72,9 @@ are the settings of the run the SFT data comes from (the V1 L1 inputs have exact
 signals; maiprofilev3dev's own defaults add Copilot / LinkedIn and allow 1000). The user message is
 `prompt_l1.md + "\nInput:\n" + {"columns":["idx","source","action","intent"],"days":{date:[[idx,...],...]}}` with
 signals sorted by date and numbered from 0, exactly as the SFT data. Every behavior should carry an `intent` hint
-(the model was trained with one). Prompts are trimmed to leave 4096 of the 20480 tokens (the V1 SFT length) for the
-answer: L1 drops the lowest-priority / oldest signals.
+(the model was trained with one). Prompts are trimmed to leave 8192 of the 32768 context tokens for the answer
+(at most 10240 answer tokens; the V1 SFT length is 20480, within Qwen3.5's native 262144-token context): L1 drops
+the lowest-priority / oldest signals.
 
 The answer becomes the `layer1_postprocessing` record exactly as maiprofilev3dev builds it: interests and topics
 (names, topic `source`) are kept as the model wrote them, evidence indices are rebuilt into evidence objects
