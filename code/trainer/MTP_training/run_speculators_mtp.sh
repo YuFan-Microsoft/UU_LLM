@@ -96,7 +96,9 @@ if has_stage train; then
 
     log "train: vLLM hidden-state server on GPUs $VLLM_GPUS (layer $NUM_LAYERS), log $WORK_DIR/vllm_hidden_states.log"
     mkdir -p "$HIDDEN_STATES_PATH"
-    CUDA_VISIBLE_DEVICES=$VLLM_GPUS "$VLLM_PYTHON" "$SPECULATORS_REPO/scripts/launch_vllm.py" "$VERIFIER" \
+    # vllm_patches/sitecustomize.py fixes vLLM 0.28's KeyError for requests aborted before scheduling (epoch ends).
+    CUDA_VISIBLE_DEVICES=$VLLM_GPUS PYTHONPATH="$SCRIPT_DIR/vllm_patches${PYTHONPATH:+:$PYTHONPATH}" \
+    "$VLLM_PYTHON" "$SPECULATORS_REPO/scripts/launch_vllm.py" "$VERIFIER" \
         --target-layer-ids "$NUM_LAYERS" --hidden-states-path "$HIDDEN_STATES_PATH" -- \
         --port "$VLLM_PORT" --data-parallel-size "$(count "$VLLM_GPUS")" --max-model-len "$SEQ_LEN" \
         --gpu-memory-utilization 0.9 --hf-overrides "$QWEN3_5_OVERRIDES" \

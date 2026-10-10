@@ -1,16 +1,27 @@
-"""Speculators MTP training entry point with a memory-efficient loss for long Qwen3.5 sequences.
+"""Speculators MTP training entry point for long Qwen3.5 sequences, aligned with vLLM's MTP inputs.
 
-Runs `python -m speculators.train` after replacing MTPDraftModel.forward. The upstream forward applies lm_head to every
-position of the packed row and keeps [total_seq_len, vocab] logits per step for the backward pass (Qwen3.5 has a
-248,320-token vocabulary, so a 32K row needs > 100 GB over 3 steps). This forward is otherwise identical (same
-recursion, positions, causal mask and step weights) but scores only the supervised positions, in chunks whose logits
-are recomputed in the backward pass. It also logs per-step top-1 accuracy (acc_step_k) and the share of positions
-whose drafts 0..k are all correct (cond_acc_step_k), the offline proxy for vLLM's per-position acceptance.
+Runs `python -m speculators.train` after replacing MTPDraftModel.forward. Two changes from upstream:
+
+1. Verifier final norm. vLLM's MTP drafter gets the target model's output after the final norm (`self.norm(hidden,
+   residual)` in Qwen3NextModel.forward), but the `extract_hidden_states` path Speculators trains on captures layer
+   num_hidden_layers as `hidden + residual`, before that norm, and the upstream MTP model (unlike Eagle3 / DFlash)
+   has no frozen verifier_norm. This forward applies the verifier's frozen final RMSNorm (Qwen3.5 `x * (1 + w)`)
+   to the step-0 hidden states, so training sees what vLLM feeds the head. Its weight is cached outside the module
+   parameters, so it is neither trained nor saved.
+2. Memory. The upstream forward applies lm_head to every position of the packed row and keeps [total_seq_len, vocab]
+   logits per step for the backward pass (Qwen3.5 has a 248,320-token vocabulary, so a 32K row needs > 100 GB over
+   3 steps). This one scores only the supervised positions, in chunks whose logits are recomputed in the backward.
+
+The recursion, positions, causal mask and step weights are unchanged. It also logs per-step top-1 accuracy
+(acc_step_k) and the share of positions whose drafts 0..k are all correct (cond_acc_step_k), the offline proxy for
+vLLM's per-position acceptance. Trainer.train_epoch / val_epoch free the CUDA cache first (see
+release_cached_memory_before).
 
 Usage: torchrun --standalone --nproc_per_node N train_mtp.py <speculators.train arguments>
 Env: MTP_LOSS_CHUNK (default 4096) rows per lm_head chunk.
 """
 
+import functools
 import inspect
 import os
 from typing import Any
@@ -20,6 +31,7 @@ from torch import nn
 from torch.utils.checkpoint import checkpoint
 
 import speculators.models.mtp.core as mtp_core
+from speculators.utils.loading import load_model_layers
 
 # Lines of the upstream forward this replacement mirrors (speculators commit pinned in requirements_speculators.txt).
 UPSTREAM_MARKERS = (
@@ -37,6 +49,29 @@ def check_upstream() -> None:
     if missing:
         raise RuntimeError(f"speculators MTPDraftModel.forward changed ({missing} not found); update train_mtp.py "
                            "or install the commit in requirements_speculators.txt")
+    if "verifier_norm" in source:
+        raise RuntimeError("speculators MTP now has its own verifier_norm; drop verifier_final_norm from train_mtp.py "
+                           "to avoid normalizing twice")
+
+
+def verifier_final_norm(model: nn.Module, hidden_states: torch.Tensor) -> torch.Tensor:
+    """The verifier's final RMSNorm (Qwen3.5 convention x * (1 + w)), as vLLM applies it before the MTP drafter."""
+    model_type = model.config.transformer_layer_config.model_type
+    if model_type not in mtp_core._QWEN3_5_MODEL_TYPES:  # noqa: SLF001
+        raise ValueError(f"verifier final norm is implemented for Qwen3.5 only, got {model_type!r}")
+    weight = model.__dict__.get("_verifier_final_norm_weight")
+    if weight is None or weight.device != hidden_states.device:
+        verifier = model.config.speculators_config.verifier.name_or_path
+        weight = load_model_layers(["model.norm.weight"], verifier)["model.norm.weight"]
+        weight = weight.float().to(hidden_states.device)
+        if weight.shape != hidden_states.shape[-1:]:
+            raise ValueError(f"verifier final norm weight {tuple(weight.shape)} does not match hidden size "
+                             f"{hidden_states.shape[-1]}")
+        model.__dict__["_verifier_final_norm_weight"] = weight  # plain attribute: not a parameter, not saved
+    eps = model.config.transformer_layer_config.rms_norm_eps
+    values = hidden_states.float()
+    values = values * torch.rsqrt(values.pow(2).mean(-1, keepdim=True) + eps)
+    return (values * (1.0 + weight)).type_as(hidden_states)
 
 
 def chunked_lm_head_ce(lm_head: nn.Module, hidden: torch.Tensor, targets: torch.Tensor):
@@ -95,7 +130,7 @@ def forward(
     )
 
     all_correct = torch.ones(batch_size, valid_len, dtype=torch.bool, device=device)
-    current_hidden = hidden_states
+    current_hidden = verifier_final_norm(self, hidden_states)
     for step in range(effective_steps):
         step_hidden = current_hidden[:, :valid_len]
         step_embeds = self.embed_tokens(input_ids[:, step + 1:step + 1 + valid_len])
@@ -139,13 +174,28 @@ def forward(
     return [], total_loss, metrics
 
 
+def release_cached_memory_before(method):
+    """Free the CUDA caching allocator before an epoch. Each epoch's train / validation DataLoader starts workers that
+    create a CUDA context on this GPU (speculators.train.dataloader._worker_init_fn); with the cache still holding the
+    previous phase's memory, validation after the first epoch ran out of memory."""
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+        return method(self, *args, **kwargs)
+    return wrapper
+
+
 def main() -> None:
     check_upstream()
     mtp_core.MTPDraftModel.forward = forward
 
     from speculators.train.cli import main as train_main
     from speculators.train.config import TrainConfig
+    from speculators.train.trainer import Trainer
 
+    Trainer.train_epoch = release_cached_memory_before(Trainer.train_epoch)
+    Trainer.val_epoch = release_cached_memory_before(Trainer.val_epoch)
     train_main(TrainConfig.resolve())
 
 

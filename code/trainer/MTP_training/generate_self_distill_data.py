@@ -6,8 +6,9 @@ and per-example token budget are the same as SFT/evaluate_user_profile_vllm.py; 
 over data-parallel vLLM engines (one process per --tensor_parallel_size GPUs, engine i seeded with --seed + i).
 
 Each kept generation becomes one speculators-format row: input_ids = prompt + generated tokens (ending with EOS) and
-loss_mask = 0 on the prompt, 1 on the generated tokens. By default only complete (finish_reason == "stop"),
-JSON-valid answers are kept (user_profile_rules.score_example), matching what production accepts.
+loss_mask = 0 on the prompt, 1 on the generated tokens. By default (--keep rule_pass) only complete
+(finish_reason == "stop") answers without a <think> token that pass every rule of user_profile_rules.score_example
+are kept, matching what production accepts.
 
 Run in the vLLM environment (requirements_inference.txt of SFT). Output: <output_dir>/self_distill.jsonl and
 <output_dir>/self_distill_summary.json.
@@ -51,8 +52,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_p", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=-1, help="<= 0 leaves top-k disabled")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--keep_invalid", action="store_true",
-                        help="Also keep truncated or JSON-invalid generations")
+    parser.add_argument("--keep", choices=["rule_pass", "json_valid", "all"], default="rule_pass",
+                        help="Generations to keep: complete, non-thinking answers that pass every user_profile_rules "
+                             "rule (default) or are JSON-valid, or every generation")
     parser.add_argument("--num_gpus", type=int, default=-1, help="GPUs to use; <= 0 uses all visible GPUs")
     parser.add_argument("--tensor_parallel_size", type=int, default=1)
     parser.add_argument("--gpu_memory_utilization", type=float, default=0.9)
@@ -73,6 +75,9 @@ def run_engine(engine_rank: int, args: argparse.Namespace, shard: list[tuple[int
     tag = f"[engine {engine_rank} | GPU {os.environ.get('CUDA_VISIBLE_DEVICES')}]"
     tokenizer = AutoProcessor.from_pretrained(args.checkpoint, trust_remote_code=True).tokenizer
     eos_id = tokenizer.eos_token_id
+    think_id = tokenizer.convert_tokens_to_ids("<think>")
+    if think_id is None or think_id == tokenizer.unk_token_id:
+        think_id = None
 
     pending, skipped = [], 0
     for order, example in shard:
@@ -121,10 +126,15 @@ def run_engine(engine_rank: int, args: argparse.Namespace, shard: list[tuple[int
                 counts["generations"] += 1
                 complete = completion.finish_reason == "stop"
                 text = tokenizer.decode(token_ids, skip_special_tokens=True)
-                json_valid = user_profile_rules.score_example(example["messages"], text)["json_valid"]
+                score = user_profile_rules.score_example(example["messages"], text)
+                thinking = think_id is not None and think_id in token_ids  # must not think: enable_thinking=False
                 counts["truncated"] += not complete
-                counts["json_invalid"] += complete and not json_valid
-                if not args.keep_invalid and not (complete and json_valid):
+                counts["thinking"] += complete and thinking
+                counts["json_invalid"] += complete and not thinking and not score["json_valid"]
+                counts["rule_fail"] += complete and not thinking and score["json_valid"] and not score["rule_pass"]
+                quality_ok = complete and not thinking and {
+                    "rule_pass": score["rule_pass"], "json_valid": score["json_valid"], "all": True}[args.keep]
+                if args.keep != "all" and not quality_ok:
                     continue
                 if complete and (not token_ids or token_ids[-1] != eos_id):
                     token_ids.append(eos_id)  # the SFT labels end with EOS; keep the end of the answer learnable
@@ -229,7 +239,7 @@ def main() -> None:
         "samples_per_prompt": args.samples_per_prompt,
         "sampling": {"temperature": args.temperature, "top_p": args.top_p, "top_k": args.top_k, "seed": args.seed,
                      "max_model_len": args.max_model_len, "max_tokens": args.max_tokens, "enable_thinking": False},
-        "keep_invalid": args.keep_invalid,
+        "keep": args.keep,
         "stats": dict(counts),
         "rows_per_config": dict(per_config),
         "supervised_tokens": sum(sum(row["loss_mask"]) for row in rows),

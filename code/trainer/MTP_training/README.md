@@ -15,9 +15,10 @@ is unrolled recursively over several draft steps, the same way vLLM reuses it at
 |---|---|---|
 | `run_speculators_mtp.sh` | — | End-to-end pipeline: generate → prepare → train → stitch → check |
 | `generate_self_distill_data.py` | vLLM | The SFT model answers the SFT train prompts (on-policy data); writes Speculators-format rows (`input_ids` + `loss_mask`) |
-| `train_mtp.py` | Speculators | Entry point of `speculators.train` with a memory-efficient MTP forward for 32K sequences (see below) |
+| `train_mtp.py` | Speculators | Entry point of `speculators.train` with an MTP forward aligned with vLLM's inputs and memory-efficient for 32K sequences (see below) |
 | `check_mtp_weights.py` | either (needs torch) | Pre-deployment check: all 15 `mtp.*` tensors present, right shape, finite, not all zero, and changed vs the official head |
 | `requirements_speculators.txt` | — | Pins the Speculators commit that `train_mtp.py` patches |
+| `vllm_patches/sitecustomize.py` | vLLM | Runtime fix for a vLLM 0.28 crash in the hidden-state connector (see Notes); put on `PYTHONPATH` of the vLLM server only |
 
 ## Environments
 
@@ -50,7 +51,7 @@ sh run_speculators_mtp.sh
 
 | Stage | What it does |
 |---|---|
-| generate | vLLM on all GPUs answers `SAMPLES_PER_CONFIG` (default 2000) train prompts per config; keeps only complete, JSON-valid answers |
+| generate | vLLM on all GPUs answers `SAMPLES_PER_CONFIG` (default 2000) train prompts per config; keeps only complete answers without `<think>` that pass every `user_profile_rules` rule (`--keep rule_pass`; `json_valid` / `all` are looser) |
 | prepare | `speculators prepare-data` with `--seq-length 32768` (longer rows are cut from the end, so it must cover whole samples) |
 | train | vLLM extracts last-layer hidden states online on the first half of the GPUs (`VLLM_GPUS`); torchrun trains on the rest (`TRAIN_GPUS`); vLLM is stopped afterwards |
 | stitch | `speculators stitch-mtp`: copies VERIFIER and writes the `mtp.*` of `checkpoint_best` (lowest validation loss) into the copy |
@@ -68,15 +69,29 @@ Main settings (environment variables):
 | `VLLM_GPUS` / `TRAIN_GPUS` | first half / the rest | Hidden-state extraction is a prefill of long samples, so it gets half of the GPUs by default |
 | `HIDDEN_STATES_PATH` | `/tmp/hidden_states_mtp` | Written by vLLM and read by the trainers, so **both must run on the same machine**; files are deleted after use |
 
-## Why `train_mtp.py` (memory at 32K tokens)
+## Why `train_mtp.py`
 
-The upstream MTP forward applies `lm_head` to every position of the packed row (`total_seq_len` positions) and keeps
-[32768, 248320] logits per step for the backward pass (cross entropy is also upcast to fp32 under autocast), far beyond
-80 GB over 3 steps. `train_mtp.py` replaces `MTPDraftModel.forward` with an equivalent implementation: the recursion,
-positions, causal mask and step weights are unchanged, but `lm_head` + cross entropy are computed **only at
-loss_mask = 1 positions**, in chunks (`MTP_LOSS_CHUNK`, default 4096 rows) whose logits are recomputed in the backward
-pass. On CPU with a scaled-down Qwen3.5 config it gives the same loss as upstream and gradients of all 15 parameters
-within 1e-6 relative error.
+It replaces `MTPDraftModel.forward` with an implementation that keeps the upstream recursion, positions, causal mask and
+step weights, with two changes.
+
+**1. Verifier final norm (train / serve alignment).** At inference vLLM feeds the MTP head the target model's output
+**after** the final norm (`self.norm(hidden, residual)` in `Qwen3NextModel.forward`, which Qwen3.5 reuses). The
+`extract_hidden_states` path that Speculators trains on captures layer `num_hidden_layers` as `hidden + residual`,
+**before** that norm, and the upstream MTP model has no frozen `verifier_norm` (Eagle3 and DFlash have one), so upstream
+Speculators trains the head on a different input than vLLM gives it. `train_mtp.py` applies the verifier's frozen final
+RMSNorm (Qwen3.5 convention `x * (1 + w)`, weight read from the verifier checkpoint) to the step-0 hidden states. The
+weight is not a parameter, so it is neither trained nor saved. The mismatch is moderate rather than catastrophic: for
+Qwen3.5-4B the final-norm gain `1 + w` has median 3.27 and std 0.32 (range 0.71-4.70), and the MTP head's own
+`pre_fc_norm_hidden` removes the overall scale, leaving roughly a 10% per-channel rescaling with a few outlier
+channels. If a later Speculators version adds a `verifier_norm` to MTP, `train_mtp.py` refuses to start so the norm
+is not applied twice.
+
+**2. Memory at 32K tokens.** The upstream forward applies `lm_head` to every position of the packed row
+(`total_seq_len` positions) and keeps [32768, 248320] logits per step for the backward pass (cross entropy is also
+upcast to fp32 under autocast), far beyond 80 GB over several steps. `train_mtp.py` computes `lm_head` + cross entropy
+**only at loss_mask = 1 positions**, in chunks (`MTP_LOSS_CHUNK`, default 4096 rows) whose logits are recomputed in the
+backward pass. Without the final norm, it matches upstream on CPU with a scaled-down Qwen3.5 config (same loss,
+gradients of all 15 parameters within 1e-6 relative error).
 
 It also logs two offline metrics:
 - `acc_step_k`: top-1 accuracy of the draft at step k;
@@ -105,6 +120,17 @@ metrics to catch a bad weight merge.
 - Re-check the acceptance rate when serving quantized (e.g. FP8): there are community reports of MTP acceptance dropping
   to 0% after quantization ([vLLM #36331](https://github.com/vllm-project/vllm/issues/36331)).
 - The vLLM hidden-state server gets `--hf-overrides` with `Qwen3_5ForConditionalGeneration`, like `run_inference.py`.
+- **vLLM 0.28 crash at epoch boundaries.** When an epoch ends, Speculators aborts queued hidden-state requests;
+  `ExampleHiddenStatesConnector.request_finished` then does `self._request_filenames.pop(req_id)` for requests that were
+  never scheduled and the engine dies with `KeyError: 'cmpl-...'`. `run_speculators_mtp.sh` starts the vLLM server with
+  `vllm_patches/` on `PYTHONPATH`; its `sitecustomize.py` installs an import hook (so it also reaches the EngineCore
+  subprocesses) that makes the method return `(False, None)` for such requests. No change to the installed vLLM is
+  needed; an existing `sitecustomize` is still loaded.
+- **OOM at validation.** Every epoch's train / validation DataLoader starts workers that create a CUDA context on the
+  GPU (Speculators' `_worker_init_fn`); with the caching allocator still holding the previous phase's memory, the first
+  validation ran out of memory. `train_mtp.py` calls `torch.cuda.empty_cache()` before `Trainer.train_epoch` and
+  `Trainer.val_epoch`.
+- Training resumes from the latest checkpoint in `$WORK_DIR/checkpoints` when rerun (`STAGES="train stitch check"`).
 
 ## Background: community results
 
