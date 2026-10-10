@@ -1,0 +1,4 @@
+# Speculators environment for MTP training (prepare-data, train_mtp.py, stitch-mtp). Keep it separate from the vLLM
+# environment (SFT/requirements_inference.txt), as the Speculators docs recommend.
+# train_mtp.py patches MTPDraftModel.forward of this exact commit; update both together.
+speculators @ git+https://github.com/vllm-project/speculators.git@55ebbd5b9b49e9bd223f47949c986aa4abfffbc3
