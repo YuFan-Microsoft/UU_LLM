@@ -11,17 +11,22 @@ MAX_LEN=${3:-32768}
 GPU_UTIL=${4:-0.9}
 SERVED_NAME=${5:-"qwen3.5-4b-profile"}
 SPEC_TOKENS=${6:-2}           # 0 disables MTP speculative decoding
+MODEL_ARG=${7:-}              # model directory; overrides QWEN35_MODEL_PATH and the defaults below
 
 # --- 2. Model Path Resolution ---
-# Priority: QWEN35_MODEL_PATH > ${_ModelDataPath_}/model > DEFAULT_MODEL_PATH
+# Priority: 7th argument > QWEN35_MODEL_PATH > ${_ModelDataPath_}/model > DEFAULT_MODEL_PATH
 DEFAULT_MODEL_PATH="/yufan/MAI_Profile/checkpoints/unified_slm/Cur_SOTA_epoch_0_step_9000_ppl_1.2713_official_mtp"
-if [ -n "${_ModelDataPath_}" ]; then
+if [ -n "${_ModelDataPath_:-}" ]; then
   default_model="${_ModelDataPath_}/model"
 else
   default_model="${DEFAULT_MODEL_PATH}"
 fi
 
-model="${QWEN35_MODEL_PATH:-${default_model}}"
+if [ -n "$MODEL_ARG" ]; then
+  model="$MODEL_ARG"
+else
+  model="${QWEN35_MODEL_PATH:-${default_model}}"
+fi
 if [ ! -d "$model" ]; then
   echo "Model directory not found: $model" >&2
   exit 1
