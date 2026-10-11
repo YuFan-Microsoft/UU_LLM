@@ -27,8 +27,8 @@ L34_STAGES = [task.stage for task in layer3.TASKS + layer4.TASKS]
 PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL, L3_DONE, L3_TOTAL, L4_DONE, L4_TOTAL = range(FIELDS := 9)
 PHASES = ["loading", "layer1", "layer2", "layer3", "layer4", "done"]
 REFRESH_SECONDS = 2
-# vLLM engine settings. "original" is the setting this script always used; "best" / "second_best" mirror
-# code/prod_deployment/{best,second_best}_qwen35_prod_server.sh (keep them in sync). None = vLLM's default (not passed).
+# vLLM engine settings. "original" is the setting this script always used; "best" mirrors
+# code/prod_deployment/best_qwen35_prod_server.sh (keep them in sync). None = vLLM's default (not passed).
 ENGINE_PRESETS = {
     "original": dict(gpu_memory_utilization=0.9, max_num_seqs=256, max_num_batched_tokens=32768,
                      kv_cache_dtype="auto", mamba_ssm_cache_dtype="auto", attention_backend=None,
@@ -36,9 +36,6 @@ ENGINE_PRESETS = {
     "best": dict(gpu_memory_utilization=0.9, max_num_seqs=768, max_num_batched_tokens=16384,
                  kv_cache_dtype="fp8", mamba_ssm_cache_dtype="bfloat16", attention_backend=None,
                  language_model_only=True, async_scheduling=True, num_speculative_tokens=0),
-    "second_best": dict(gpu_memory_utilization=0.9, max_num_seqs=768, max_num_batched_tokens=8192,
-                        kv_cache_dtype="auto", mamba_ssm_cache_dtype="bfloat16", attention_backend="TRITON_ATTN",
-                        language_model_only=True, async_scheduling=True, num_speculative_tokens=3),
 }
 
 
@@ -58,8 +55,8 @@ def parse_args() -> argparse.Namespace:
     engine = parser.add_argument_group(
         "vLLM engine", "Defaults come from --engine_preset; any flag given explicitly overrides the preset")
     engine.add_argument("--engine_preset", choices=list(ENGINE_PRESETS), default="original",
-                        help="original: the previous fixed setting; best / second_best: the settings of "
-                             "code/prod_deployment/{best,second_best}_qwen35_prod_server.sh")
+                        help="original: the previous fixed setting; best: the setting of "
+                             "code/prod_deployment/best_qwen35_prod_server.sh")
     engine.add_argument("--num_speculative_tokens", type=int,
                         help="MTP speculative decoding with this many draft tokens per step (0 = off); the checkpoint "
                              "needs the mtp.* weights (see merge_official_mtp.py)")

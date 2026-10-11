@@ -182,23 +182,22 @@ derived from (stage, user, window, attempt), so results do not depend on shardin
 `--engine_preset` picks the engine setting; any engine flag given explicitly overrides the preset value. The
 resolved setting is written to `inference_summary.json` under `engine`.
 
-| Flag | `original` (default) | `best` | `second_best` |
-|---|---|---|---|
-| `--gpu_memory_utilization` | 0.9 | 0.9 | 0.9 |
-| `--max_num_seqs` | 256 | 768 | 768 |
-| `--max_num_batched_tokens` | 32768 | 16384 | 8192 |
-| `--kv_cache_dtype` | auto (bf16) | fp8 | auto (bf16) |
-| `--mamba_ssm_cache_dtype` (Gated DeltaNet state) | auto | bfloat16 | bfloat16 |
-| `--attention_backend` | vLLM's choice | vLLM's choice | TRITON_ATTN |
-| `--language_model_only` (skip the vision encoder) | no (images / videos disabled per prompt) | yes | yes |
-| `--async_scheduling` | vLLM's default | yes | yes |
-| `--num_speculative_tokens` (MTP) | 0 | 0 | 3 |
+| Flag | `original` (default) | `best` |
+|---|---|---|
+| `--gpu_memory_utilization` | 0.9 | 0.9 |
+| `--max_num_seqs` | 256 | 768 |
+| `--max_num_batched_tokens` | 32768 | 16384 |
+| `--kv_cache_dtype` | auto (bf16) | fp8 |
+| `--mamba_ssm_cache_dtype` (Gated DeltaNet state) | auto | bfloat16 |
+| `--attention_backend` | vLLM's choice | vLLM's choice |
+| `--language_model_only` (skip the vision encoder) | no (images / videos disabled per prompt) | yes |
+| `--async_scheduling` | vLLM's default | yes |
+| `--num_speculative_tokens` (MTP) | 0 | 0 |
 
-`original` is the setting this script always used, so runs without `--engine_preset` are unchanged. `best` and
-`second_best` are the measured serving settings of `code/prod_deployment/best_qwen35_prod_server.sh` and
-`second_best_qwen35_prod_server.sh`; keep `ENGINE_PRESETS` in `run_inference.py` in sync with them.
-`second_best` needs a checkpoint with `mtp.*` weights. Example:
-`--engine_preset best --max_num_seqs 512` uses `best` with 512 sequences.
+`original` is the setting this script always used, so runs without `--engine_preset` are unchanged. `best` is the
+measured serving setting of `code/prod_deployment/best_qwen35_prod_server.sh`; keep `ENGINE_PRESETS` in
+`run_inference.py` in sync with it. Example: `--engine_preset best --max_num_seqs 512` uses `best` with 512
+sequences.
 
 ## MTP speculative decoding
 
