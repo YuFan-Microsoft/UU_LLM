@@ -1,5 +1,5 @@
 #!/bin/sh
-# POSIX sh: runs with `sh`, `bash` or `./qwen35_prod_server.sh`.
+# POSIX sh: runs with `sh`, `bash` or `./origin_qwen35_prod_server.sh`.
 # Serve the SFT Qwen3.5-4B user-profile model with official MTP speculative decoding.
 # Config mirrors code/inference/run_inference.py: bf16 + text-only + MTP (built-in head, no separate draft model).
 set -xe
