@@ -12,26 +12,34 @@ import multiprocessing.connection
 import os
 from pathlib import Path
 import shutil
-import time
 
 import layer1
 import layer2
 import layer3
 import layer4
 from task import UserProfile
-from utils import (MAX_MODEL_LEN, SPEC_FIELDS, SPEC_PER_POS, SPEED_FIELDS, add_lists, build_grid, build_prompt_ids,
-                   build_windows, dumps, generate, load_users, new_item, read_rows, spec_counters, spec_summary,
-                   visible_gpus)
+from utils import (MAX_MODEL_LEN, SPEC_FIELDS, SPEC_PER_POS, build_grid, build_prompt_ids, build_windows, dumps,
+                   generate, load_users, new_item, read_rows, spec_counters, spec_summary, visible_gpus)
 
 LAYERS = ["layer1_postprocessing", "layer2_postmerge"]  # written for every window
 L34_STAGES = [task.stage for task in layer3.TASKS + layer4.TASKS]
-SPEED_STAGES = ["l1", "l2"] + L34_STAGES
-SPEED_LAYERS = {"L1": ["l1"], "L2": ["l2"], "L3": [task.stage for task in layer3.TASKS],
-                "L4": [task.stage for task in layer4.TASKS]}
 # Per-engine progress in a shared array: phase and the requests done / total of each layer.
 PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL, L3_DONE, L3_TOTAL, L4_DONE, L4_TOTAL = range(FIELDS := 9)
 PHASES = ["loading", "layer1", "layer2", "layer3", "layer4", "done"]
 REFRESH_SECONDS = 2
+# vLLM engine settings. "original" is the setting this script always used; "best" / "second_best" mirror
+# code/prod_deployment/{best,second_best}_qwen35_prod_server.sh (keep them in sync). None = vLLM's default (not passed).
+ENGINE_PRESETS = {
+    "original": dict(gpu_memory_utilization=0.9, max_num_seqs=256, max_num_batched_tokens=32768,
+                     kv_cache_dtype="auto", mamba_ssm_cache_dtype="auto", attention_backend=None,
+                     language_model_only=False, async_scheduling=None, num_speculative_tokens=0),
+    "best": dict(gpu_memory_utilization=0.9, max_num_seqs=768, max_num_batched_tokens=16384,
+                 kv_cache_dtype="fp8", mamba_ssm_cache_dtype="bfloat16", attention_backend=None,
+                 language_model_only=True, async_scheduling=True, num_speculative_tokens=0),
+    "second_best": dict(gpu_memory_utilization=0.9, max_num_seqs=768, max_num_batched_tokens=8192,
+                        kv_cache_dtype="auto", mamba_ssm_cache_dtype="bfloat16", attention_backend="TRITON_ATTN",
+                        language_model_only=True, async_scheduling=True, num_speculative_tokens=3),
+}
 
 
 def parse_args() -> argparse.Namespace:
@@ -47,22 +55,51 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--top_p", type=float, default=0.8)
     parser.add_argument("--max_retries", type=int, default=2, help="Regenerations of an invalid answer")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--num_speculative_tokens", type=int, default=0,
+    engine = parser.add_argument_group(
+        "vLLM engine", "Defaults come from --engine_preset; any flag given explicitly overrides the preset")
+    engine.add_argument("--engine_preset", choices=list(ENGINE_PRESETS), default="original",
+                        help="original: the previous fixed setting; best / second_best: the settings of "
+                             "code/prod_deployment/{best,second_best}_qwen35_prod_server.sh")
+    engine.add_argument("--num_speculative_tokens", type=int,
                         help="MTP speculative decoding with this many draft tokens per step (0 = off); the checkpoint "
                              "needs the mtp.* weights (see merge_official_mtp.py)")
-    parser.add_argument("--benchmark", action="store_true",
-                        help="Speed benchmark: one engine on the first visible GPU, Layer-3 tasks in separate rounds, "
-                             "and speed_summary.json with per-task / per-layer / end-to-end timings and tokens/s")
-    return parser.parse_args()
+    engine.add_argument("--gpu_memory_utilization", type=float)
+    engine.add_argument("--max_num_seqs", type=int)
+    engine.add_argument("--max_num_batched_tokens", type=int)
+    engine.add_argument("--kv_cache_dtype", help="auto, fp8, ...")
+    engine.add_argument("--mamba_ssm_cache_dtype", help="auto, bfloat16, float32, ... (Gated DeltaNet state)")
+    engine.add_argument("--attention_backend", help="e.g. TRITON_ATTN; unset = vLLM's choice")
+    engine.add_argument("--language_model_only", action=argparse.BooleanOptionalAction,
+                        help="Skip the vision encoder (otherwise images / videos are only disabled per prompt)")
+    engine.add_argument("--async_scheduling", action=argparse.BooleanOptionalAction)
+    args = parser.parse_args()
+    for key, value in ENGINE_PRESETS[args.engine_preset].items():
+        if getattr(args, key) is None:
+            setattr(args, key, value)
+    return args
+
+
+def engine_kwargs(args: argparse.Namespace) -> dict:
+    """vLLM LLM(...) arguments of the resolved engine setting (preset + explicit flags)."""
+    kwargs = dict(gpu_memory_utilization=args.gpu_memory_utilization, max_num_seqs=args.max_num_seqs,
+                  max_num_batched_tokens=args.max_num_batched_tokens, kv_cache_dtype=args.kv_cache_dtype,
+                  mamba_ssm_cache_dtype=args.mamba_ssm_cache_dtype)
+    if args.language_model_only:
+        kwargs["language_model_only"] = True
+    else:
+        kwargs["limit_mm_per_prompt"] = {"image": 0, "video": 0}
+    if args.attention_backend:
+        kwargs["attention_backend"] = args.attention_backend
+    if args.async_scheduling is not None:
+        kwargs["async_scheduling"] = args.async_scheduling
+    return kwargs
 
 
 def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows: list, dates: list[str],
                shard_path: Path, progress) -> None:
     """One vLLM engine on one GPU: Layer 1 for all windows of its users, then Layer 2 window by window, because
     each user's Layer 2 needs their snapshot from the previous window, then Layer 3 and Layer 4 on each user's final
-    snapshot (all on the last window, like the production run). Reports progress in `progress` (see PHASE).
-    With --benchmark, also times each layer (model loaded, as in serving) and counts tokens per task (one "speed"
-    row)."""
+    snapshot (all on the last window, like the production run). Reports progress in `progress` (see PHASE)."""
     if args.num_speculative_tokens:
         # Stats stay on for the MTP counters (llm.get_metrics()); stop vLLM from also logging them every 10 s.
         os.environ.setdefault("VLLM_LOG_STATS_INTERVAL", str(10**9))
@@ -97,15 +134,10 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
     speculative = args.num_speculative_tokens > 0
     spec_config = {"method": "mtp", "num_speculative_tokens": args.num_speculative_tokens} if speculative else None
     llm = LLM(model=args.checkpoint, hf_overrides={"architectures": ["Qwen3_5ForConditionalGeneration"]},
-              dtype="bfloat16", gpu_memory_utilization=0.9, max_model_len=MAX_MODEL_LEN, max_num_seqs=256,
-              max_num_batched_tokens=32768, seed=args.seed + rank, trust_remote_code=True,
-              limit_mm_per_prompt={"image": 0, "video": 0}, speculative_config=spec_config,
-              disable_log_stats=not speculative)  # the MTP acceptance counters need stats
-    sampling = dict(temperature=args.temperature, top_p=args.top_p, max_retries=args.max_retries, seed=args.seed,
-                    speculative=speculative)
-    speed = {} if args.benchmark else None  # per task: utils.SPEED_FIELDS
-    sampling["stats"] = speed
-    layer_seconds = {}
+              dtype="bfloat16", max_model_len=MAX_MODEL_LEN, seed=args.seed + rank, trust_remote_code=True,
+              speculative_config=spec_config, disable_log_stats=not speculative,  # the MTP counters need stats
+              **engine_kwargs(args))
+    sampling = dict(temperature=args.temperature, top_p=args.top_p, max_retries=args.max_retries, seed=args.seed)
 
     def encode(content: str) -> list[int]:
         return build_prompt_ids(tokenizer, [{"role": "user", "content": content}])
@@ -115,7 +147,6 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
             shard.write(dumps(row) + "\n")
 
         # Layer 1: all windows at once (they are independent).
-        layer_started = time.perf_counter()
         progress[base + PHASE], progress[base + L1_TOTAL] = 1, len(windows)
         l1_items = []
         for user_id, date_str, signals in windows:
@@ -132,7 +163,6 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
             emit(kind="call", stage="l1", user_id=item["user_id"], date=item["date"], attempts=item["attempts"],
                  valid=item["output"] is not None, signals_dropped=item["dropped"],
                  interests=len(record["interests"]), text=item["text"])
-        layer_seconds["L1"] = time.perf_counter() - layer_started
         # Every user-window with Layer-1 interests after the user's first one is one Layer-2 call (the first starts
         # the snapshot without a call); exact unless a snapshot decays to nothing, corrected after Layer 2.
         with_interests = Counter(user_id for (user_id, _), record in deltas.items() if record["interests"])
@@ -140,7 +170,6 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
         progress[base + PHASE] = 2
 
         # Layer 2: window by window, carrying each user's snapshot.
-        layer_started = time.perf_counter()
         snapshots, l2_done = {}, 0
         for date_str in dates:
             plans = {}
@@ -174,7 +203,6 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
                     snapshots[user_id] = {**snapshot, "_carried_forward": True}
                     emit(kind="record", layer="layer2_postmerge", date=date_str, record=snapshots[user_id])
         progress[base + L2_TOTAL] = l2_done
-        layer_seconds["L2"] = time.perf_counter() - layer_started
 
         def round_runner(done_field: int, total_field: int):
             """Generates one round of a layer's requests; the layer's total grows by each round's size."""
@@ -189,17 +217,11 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
             return run_round
 
         # Layers 3 and 4 on each user's final snapshot (carried forward if idle at the end).
-        layer_started = time.perf_counter()
         profiles = [UserProfile(user_id, snapshot, dates[-1]) for user_id, snapshot in snapshots.items()]
         progress[base + PHASE] = 3
-        layer3.run(profiles, encode, round_runner(L3_DONE, L3_TOTAL), emit, split_rounds=args.benchmark)
-        layer_seconds["L3"] = time.perf_counter() - layer_started
-        layer_started = time.perf_counter()
+        layer3.run(profiles, encode, round_runner(L3_DONE, L3_TOTAL), emit)
         progress[base + PHASE] = 4
         layer4.run(profiles, encode, round_runner(L4_DONE, L4_TOTAL), emit)
-        layer_seconds["L4"] = time.perf_counter() - layer_started
-        if args.benchmark:
-            emit(kind="speed", rank=rank, layer_seconds=layer_seconds, stages=speed)
         if speculative:
             emit(kind="spec", rank=rank, **spec_counters(llm))
     progress[base + PHASE] = 5
@@ -249,9 +271,8 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
 
 
 def run_engines(args: argparse.Namespace, windows: list, user_ids: list[str], dates: list[str]) -> list[dict]:
-    """One spawned process per visible GPU (only the first one with --benchmark); users are dealt round-robin so each
-    user stays on one engine."""
-    gpus = visible_gpus()[:1] if args.benchmark else visible_gpus()
+    """One spawned process per visible GPU; users are dealt round-robin so each user stays on one engine."""
+    gpus = visible_gpus()
     shard_dir = args.output_dir / "shards"
     shard_dir.mkdir(parents=True, exist_ok=True)
     context = mp.get_context("spawn")
@@ -284,81 +305,6 @@ def call_stats(calls: list[dict]) -> dict:
         "valid_ratio": sum(c["valid"] for c in calls) / len(calls) if calls else None,
         "attempts": dict(Counter(c["attempts"] for c in calls)),
     }
-
-
-def ratio(numerator: float, denominator: float) -> float | None:
-    return numerator / denominator if denominator else None
-
-
-def speed_metrics(values: dict, seconds: float) -> dict:
-    """Token counts of one task / layer (utils.SPEED_FIELDS) and their rates over `seconds`, plus the MTP acceptance
-    (utils.spec_summary) with --num_speculative_tokens."""
-    speculative = spec_summary(values)
-    return {
-        **{key: values[key] for key in SPEED_FIELDS if key != "gen_seconds" and key not in SPEC_FIELDS},
-        "retry_ratio": ratio(values["retried_requests"], values["requests"]),
-        "retry_gen_tokens_ratio": ratio(values["retry_gen_tokens"], values["gen_tokens"]),
-        "seconds": seconds,
-        "gen_tokens_per_s": ratio(values["gen_tokens"], seconds),
-        "total_tokens_per_s": ratio(values["prompt_tokens"] + values["gen_tokens"], seconds),
-        "requests_per_s": ratio(values["requests"], seconds),
-        "seconds_per_request": ratio(seconds, values["requests"]),
-        "avg_prompt_tokens": ratio(values["prompt_tokens"], values["attempts"]),
-        "avg_gen_tokens": ratio(values["gen_tokens"], values["attempts"]),
-        **({"speculative": speculative} if speculative else {}),
-    }
-
-
-def speed_summary(speed: dict, users: int) -> dict:
-    """--benchmark timings of the one engine's "speed" row, with the model already loaded as in serving: per task
-    (generation time of its rounds), per layer (wall time: generation plus prompt building and postprocessing), end
-    to end (Layers 1-4) and per user."""
-    def merged(stages: list[str]) -> dict:
-        values = {**dict.fromkeys(SPEED_FIELDS, 0), SPEC_PER_POS: []}
-        for stage in stages:
-            for key in SPEED_FIELDS:
-                values[key] += speed["stages"].get(stage, {}).get(key, 0)
-            values[SPEC_PER_POS] = add_lists(values[SPEC_PER_POS], speed["stages"].get(stage, {}).get(SPEC_PER_POS, []))
-        return values
-
-    tasks = {stage: speed_metrics(values, values["gen_seconds"])
-             for stage in SPEED_STAGES if (values := merged([stage]))["requests"]}
-    layers = {}
-    for layer, stages in SPEED_LAYERS.items():
-        layers[layer] = speed_metrics(merged(stages), speed["layer_seconds"].get(layer, 0.0))
-    total, seconds = merged(SPEED_STAGES), sum(speed["layer_seconds"].values())
-    end_to_end = {**speed_metrics(total, seconds), "users": users, "users_per_s": ratio(users, seconds)}
-    per_user = {
-        "seconds": ratio(seconds, users),
-        "requests": ratio(total["requests"], users),
-        "prompt_tokens": ratio(total["prompt_tokens"], users),
-        "gen_tokens": ratio(total["gen_tokens"], users),
-    }
-    return {"tasks": tasks, "layers": layers, "end_to_end": end_to_end, "per_user": per_user}
-
-
-def format_speed_table(summary: dict) -> str:
-    rows = [*summary["tasks"].items(), *summary["layers"].items(), ("end to end", summary["end_to_end"])]
-    speculative = any("speculative" in values for _, values in rows)
-    header = (f"{'':<26}{'requests':>9}{'retried':>9}{'retry %':>9}{'avg prompt':>12}{'avg gen':>9}{'seconds':>10}"
-              f"{'gen tok/s':>11}{'total tok/s':>12}{'s/request':>11}" + (f"{'accept %':>10}{'accept len':>12}"
-                                                                         if speculative else ""))
-    lines = [header]
-    for name, values in rows:
-        spec = values.get("speculative")
-        lines.append(f"{name:<26}{values['requests']:>9,}{values['retried_requests']:>9,}"
-                     f"{100 * (values['retry_ratio'] or 0):>8.1f}%{values['avg_prompt_tokens'] or 0:>12,.0f}"
-                     f"{values['avg_gen_tokens'] or 0:>9,.0f}{values['seconds']:>10.1f}{values['gen_tokens_per_s'] or 0:>11.1f}"
-                     f"{values['total_tokens_per_s'] or 0:>12.1f}{values['seconds_per_request'] or 0:>11.3f}"
-                     + (f"{100 * spec['acceptance_rate']:>9.1f}%{spec['mean_acceptance_length']:>12.2f}" if spec
-                        else f"{'-':>10}{'-':>12}" if speculative else ""))
-    e2e, per_user = summary["end_to_end"], summary["per_user"]
-    lines += [
-        f"end to end: {e2e['seconds']:.1f}s for {e2e['users']} users, {e2e['users_per_s'] or 0:.2f} users/s",
-        f"per user: {per_user['seconds'] or 0:.2f}s, {per_user['requests'] or 0:.1f} requests, "
-        f"{per_user['prompt_tokens'] or 0:,.0f} prompt tokens, {per_user['gen_tokens'] or 0:,.0f} gen tokens",
-    ]
-    return "\n".join(lines)
 
 
 def keep_raw(rows, raw):
@@ -437,6 +383,8 @@ def main() -> None:
     hyper = [r for (layer, _), records in files.items() if layer == "layer4_hyper_commercial_interest" for r in records]
     summary = {
         "args": {key: str(value) for key, value in vars(args).items()},
+        "engine": {"preset": args.engine_preset, "num_speculative_tokens": args.num_speculative_tokens,
+                   **engine_kwargs(args)},
         "grid": {"start": str(grid[0][0]), "end": str(grid[-1][1]), "windows": len(grid)},
         "users": len(user_ids),
         "l1": call_stats([c for c in calls if c["stage"] == "l1"]),
@@ -452,7 +400,7 @@ def main() -> None:
         "hyper_failures": sum(bool(r.get("_failed")) for r in hyper),
     }
     if args.num_speculative_tokens:
-        # Whole run over all engines (retries included); --benchmark also splits it per task / layer.
+        # Whole run over all engines (retries included).
         spec_rows = [row for row in rows if row["kind"] == "spec"]
         totals = {key: sum(row[key] for row in spec_rows) for key in SPEC_FIELDS}
         totals[SPEC_PER_POS] = [sum(n) for n in zip(*(row[SPEC_PER_POS] for row in spec_rows))]
@@ -460,11 +408,6 @@ def main() -> None:
                                            **(spec_summary(totals) or {})}
     (args.output_dir / "inference_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
-
-    if args.benchmark:
-        speed = speed_summary(next(row for row in rows if row["kind"] == "speed"), len(user_ids))
-        (args.output_dir / "speed_summary.json").write_text(json.dumps(speed, indent=2) + "\n", encoding="utf-8")
-        print(format_speed_table(speed), flush=True)
 
 
 if __name__ == "__main__":

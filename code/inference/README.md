@@ -8,7 +8,7 @@
 | `layer3.py` | Layer 3: `Persona` and `Commercial` task classes, `postprocess` (= `layer3_postprocessing`) and `run` (one round of calls) |
 | `layer4.py` | Layer 4: `Biography`, `CommercialPreference`, `MissionDiscovery` and `MissionEnhancement` task classes (payloads, answer checks, records, mission rendering / validation), `postprocess` (= `layer4_postprocessing`) and `run` (four rounds of calls) |
 | `task.py` | `Task` base class (prompt, answer key check, trimmed request, record) and `UserProfile` (one user's final snapshot and its Layer-3 / Layer-4 records) |
-| `utils.py` | Input loading and cleaning, weekly windows, signal dedupe / cap, query language, L1 / L2 answer key checks, `generate()` with retries, speed / MTP acceptance counters |
+| `utils.py` | Input loading and cleaning, weekly windows, signal dedupe / cap, query language, L1 / L2 answer key checks, `generate()` with retries, MTP acceptance counters |
 | `merge_official_mtp.py` | Adds the official Qwen3.5 MTP head (`mtp.*`) to an SFT checkpoint saved without it (see [MTP speculative decoding](#mtp-speculative-decoding)) |
 | `prompts/` | The eight task prompts (`prompt_l1.md` ... `prompt_l4_hyper_mission_enhancement.md`), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V1 SFT configs) |
 
@@ -35,8 +35,8 @@ python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir>
 python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir> --max_users 20
 # Or local JSONL files with the same rows
 python run_inference.py --checkpoint <ckpt_dir> --input users.jsonl --output_dir <out_dir>
-# Speed benchmark on one GPU (see "Speed benchmark"); keep the same users across runs to compare
-python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir> --max_users 200 --benchmark
+# Serving settings of code/prod_deployment (see "vLLM engine settings"); the default is the original setting
+python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir> --engine_preset best
 ```
 
 After every engine has loaded its model (vLLM logs as usual), progress is shown as four tqdm bars over all engines
@@ -177,32 +177,28 @@ fail the official validation) are regenerated up to `--max_retries` (2) times. E
 derived from (stage, user, window, attempt), so results do not depend on sharding. Other arguments:
 `--window_days` (7), `--grid_start_date`, `--seed`.
 
-## Speed benchmark
+## vLLM engine settings
 
-`--benchmark` measures speed; without it nothing is timed and runs are unchanged. It uses one engine on the first
-visible GPU (the engines are independent data-parallel copies, so one GPU's throughput scales to N GPUs) and runs
-the two Layer-3 tasks in separate rounds so that each task is timed exactly (with the same per-request seeds). As in
-serving, the model is assumed to be loaded already: model loading, data loading and output writing are not timed.
-It writes `<out_dir>/speed_summary.json` and prints a table:
+`--engine_preset` picks the engine setting; any engine flag given explicitly overrides the preset value. The
+resolved setting is written to `inference_summary.json` under `engine`.
 
-- `tasks` (`l1`, `l2`, `l3_persona`, `l3_commercial`, `l4_biography`, `l4_commercial_preference`,
-  `l4_mission_discovery`, `l4_mission_enhancement`): `requests` (first attempts), `retried_requests` (requests
-  regenerated at least once because the answer was invalid), `retry_ratio` (`retried_requests / requests`),
-  `attempts` (with retries), prompt / generated tokens (retries also counted apart as `retry_*`;
-  `retry_gen_tokens_ratio` is the share of generated tokens spent on retries), `seconds` (wall time of the task's
-  `llm.generate` calls), `gen_tokens_per_s`, `total_tokens_per_s` (prompt + generated), `requests_per_s`,
-  `seconds_per_request` (round time / requests, since requests run batched), average prompt / generated tokens per
-  attempt.
-- `layers` (`L1`-`L4`): the same over the layer's tasks, with `seconds` the layer's wall time (generation plus prompt
-  building and postprocessing).
-- `end_to_end`: the same over Layers 1-4 (`seconds` is their sum), plus `users` and `users_per_s`.
-- `per_user`: seconds per user (end-to-end time / users, since users run batched), requests and prompt / generated
-  tokens per user.
+| Flag | `original` (default) | `best` | `second_best` |
+|---|---|---|---|
+| `--gpu_memory_utilization` | 0.9 | 0.9 | 0.9 |
+| `--max_num_seqs` | 256 | 768 | 768 |
+| `--max_num_batched_tokens` | 32768 | 16384 | 8192 |
+| `--kv_cache_dtype` | auto (bf16) | fp8 | auto (bf16) |
+| `--mamba_ssm_cache_dtype` (Gated DeltaNet state) | auto | bfloat16 | bfloat16 |
+| `--attention_backend` | vLLM's choice | vLLM's choice | TRITON_ATTN |
+| `--language_model_only` (skip the vision encoder) | no (images / videos disabled per prompt) | yes | yes |
+| `--async_scheduling` | vLLM's default | yes | yes |
+| `--num_speculative_tokens` (MTP) | 0 | 0 | 3 |
 
-Prompt tokens also count prefix-cache hits, so `gen_tokens_per_s` is the better decode-speed measure.
-
-With `--num_speculative_tokens`, every task / layer / end-to-end entry also has `speculative` (see below) and the
-table gains `accept %` and `accept len` columns.
+`original` is the setting this script always used, so runs without `--engine_preset` are unchanged. `best` and
+`second_best` are the measured serving settings of `code/prod_deployment/best_qwen35_prod_server.sh` and
+`second_best_qwen35_prod_server.sh`; keep `ENGINE_PRESETS` in `run_inference.py` in sync with them.
+`second_best` needs a checkpoint with `mtp.*` weights. Example:
+`--engine_preset best --max_num_seqs 512` uses `best` with 512 sequences.
 
 ## MTP speculative decoding
 
@@ -218,10 +214,8 @@ so first merge the official head (trained against the original Qwen3.5-4B, not t
 # mtp.* bytes), or a Hugging Face repo id such as Qwen/Qwen3.5-4B (fetches only the mtp.* bytes, ~240 MB, with HTTP
 # range requests)
 python merge_official_mtp.py --checkpoint <ckpt_dir> --output_dir <ckpt_dir>_mtp
-# Baseline vs MTP on the same users
-python run_inference.py --checkpoint <ckpt_dir> --output_dir <out>/base --max_users 200 --benchmark
-python run_inference.py --checkpoint <ckpt_dir>_mtp --output_dir <out>/mtp2 --max_users 200 --benchmark \
-    --num_speculative_tokens 2
+# Run with MTP
+python run_inference.py --checkpoint <ckpt_dir>_mtp --output_dir <out>/mtp2 --num_speculative_tokens 2
 ```
 
 `merge_official_mtp.py` symlinks the SFT files (`--copy` to copy), copies the 15 `mtp.*` tensors byte for byte (no torch
@@ -235,9 +229,8 @@ with `VLLM_LOG_STATS_INTERVAL`, unless you set it), retries included:
 `drafts` (verify steps with a draft), `draft_tokens` (proposed), `accepted_tokens`, `acceptance_rate`
 (accepted / proposed), `mean_acceptance_length` (tokens emitted per verify step, `1 + accepted / drafts`; the ideal
 speed-up) and `acceptance_rate_per_pos` (share of drafts whose i-th token was accepted). The whole run's totals are in
-`inference_summary.json` under `speculative_decoding`; `--benchmark` also splits them per task and layer in
-`speed_summary.json`. Compare `gen_tokens_per_s` against a run without MTP: under large batches the drafts take
-batch / KV-cache capacity, so a good acceptance does not always mean higher throughput.
+`inference_summary.json` under `speculative_decoding`. Under large batches the drafts take batch / KV-cache
+capacity, so a good acceptance does not always mean higher throughput.
 
 ## Outputs
 

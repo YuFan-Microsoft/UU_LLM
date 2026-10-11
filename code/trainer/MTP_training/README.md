@@ -105,13 +105,14 @@ If a Speculators upgrade changes the MTP forward, `train_mtp.py` fails at startu
 Run held-out users with the official head (`VERIFIER`) and with the finetuned result:
 
 ```bash
-python code/inference/run_inference.py --checkpoint <ckpt> --output_dir <out> --max_users 200 --benchmark \
-    --num_speculative_tokens k          # k = 1 ... 5; plus one baseline run without MTP
+python code/inference/run_inference.py --checkpoint <ckpt> --output_dir <out> --max_users 200 \
+    --num_speculative_tokens k          # k = 1 ... 5
 ```
 
-Compare `mean_acceptance_length`, `acceptance_rate_per_pos` and `gen_tokens_per_s`, using the production sampling
-parameters and concurrency. Speculative decoding is lossless in theory, but still spot-check JSON validity and the task
-metrics to catch a bad weight merge.
+Compare `mean_acceptance_length` and `acceptance_rate_per_pos` (under `speculative_decoding` in
+`inference_summary.json`), using the production sampling parameters. Measure throughput on the serving setup
+(`code/prod_deployment`, vLLM `/metrics`) with and without MTP. Speculative decoding is lossless in theory, but still
+spot-check JSON validity and the task metrics to catch a bad weight merge.
 
 ## Notes
 
