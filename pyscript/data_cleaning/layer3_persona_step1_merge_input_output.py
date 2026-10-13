@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Merge GPT-5.4 Layer 3 persona batch inputs and outputs into one JSONL row per request.
+"""Merge Layer 3 persona requests and responses into one JSONL row per request.
 
-Source files (RawData/l3_persona/offset_<n>/runs/) use the same Batch API layout as
-layer3_commercial_step1_merge_input_output.py; only the user message differs:
+Sources (--inputs ProcessData/layer3_persona.jsonl, or --runs-dir RawData/l3_persona/offset_<n>/runs/
+Batch API files) use the same layouts as layer3_commercial_step1_merge_input_output.py; only the user
+message differs:
     "User ID: <id>\\nDate: <yyyymmdd>\\n\\nFacts:\\n<facts JSON>\\n\\nActive Interests:\\n<interests JSON>"
 (built by MAIProfile_Official/modules/layer3_persona.py).
 
