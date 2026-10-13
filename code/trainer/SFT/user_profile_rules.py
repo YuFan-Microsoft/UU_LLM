@@ -259,9 +259,11 @@ def check_layer1(payload, output):
 
 L2_DECISION_KEYS = {
     "merge": {"action", "delta_interest_name", "snapshot_interest_name", "merged_interest_name",
-              "merged_actual_activity", "merged_inferred_intent", "temporal"},
-    "add": {"action", "delta_interest_name", "actual_activity", "inferred_intent", "temporal"},
+              "merged_actual_activity", "merged_inferred_intent"},
+    "add": {"action", "delta_interest_name", "actual_activity", "inferred_intent"},
 }
+# V2 data has no `temporal`; V1 outputs still carry it, so it is accepted when valid.
+L2_OPTIONAL_KEY = "temporal"
 L2_TEXT_KEYS = {
     "merge": ("merged_interest_name", "merged_actual_activity", "merged_inferred_intent"),
     "add": ("delta_interest_name", "actual_activity", "inferred_intent"),
@@ -269,26 +271,24 @@ L2_TEXT_KEYS = {
 L2_TEMPORALS = {"Ephemeral", "ShortTerm", "LongTerm", "Persistent"}
 L2_NON_LATIN_LETTER = re.compile(r"[^\W\d_A-Za-z\u00C0-\u024F]")
 L2_UMBRELLA_NAMES = {
-    "technology", "tech", "travel", "shopping", "online shopping", "general shopping", "general online shopping",
-    "general retail shopping", "general shopping deals", "entertainment", "news", "general news", "world news",
-    "current events", "sports", "health", "lifestyle", "finance", "business", "food", "culture", "society",
-    "hobbies", "science", "education", "media", "leisure", "miscellaneous", "general interest",
-    "general interests", "web browsing", "internet browsing", "online browsing",
+    "miscellaneous", "general interest", "general interests", "web browsing", "internet browsing", "online browsing",
+    "general shopping", "general online shopping", "general retail shopping", "general shopping deals", "general news",
 }
-L2_UMBRELLA_PATTERN = re.compile(r"\S\s+ecosystem\b")  # "<brand> ecosystem"
 
 
 def is_umbrella(name):
-    normalized = normalize_name(name)
-    return normalized in L2_UMBRELLA_NAMES or bool(L2_UMBRELLA_PATTERN.search(normalized))
+    return normalize_name(name) in L2_UMBRELLA_NAMES
+
+
+def l2_expected_keys(decision, action):
+    return L2_DECISION_KEYS[action] | ({L2_OPTIONAL_KEY} if L2_OPTIONAL_KEY in decision else set())
 
 
 def check_layer2_decision_fields(decision, action, violations):
     """Field-level checks for one decision with a valid action."""
-    if set(decision) != L2_DECISION_KEYS[action]:
+    if set(decision) != l2_expected_keys(decision, action):
         violations.add("unexpected_keys")
-    temporal = decision.get("temporal")
-    if not isinstance(temporal, str) or temporal not in L2_TEMPORALS:
+    if L2_OPTIONAL_KEY in decision and decision[L2_OPTIONAL_KEY] not in L2_TEMPORALS:
         violations.add("invalid_temporal")
     if not all(has_text(decision.get(key)) for key in L2_DECISION_KEYS[action]):
         violations.add("empty_text")
@@ -297,11 +297,11 @@ def check_layer2_decision_fields(decision, action, violations):
 
 
 def layer2_keys_valid(output):
-    """JSON-valid: exactly {"decisions": [...]}, every decision with a valid action and exactly that action's keys,
-    all of them strings."""
+    """JSON-valid: exactly {"decisions": [...]}, every decision with a valid action and exactly that action's keys
+    (plus an optional `temporal`), all of them strings."""
     return matches(output, {"decisions": ListOf(lambda decision: (
         isinstance(decision, dict) and one_of(decision.get("action"), L2_DECISION_KEYS)
-        and matches(decision, dict.fromkeys(L2_DECISION_KEYS[decision["action"]], str))))})
+        and matches(decision, dict.fromkeys(l2_expected_keys(decision, decision["action"]), str))))})
 
 
 def check_layer2(payload, output):
@@ -346,6 +346,8 @@ def check_layer2(payload, output):
             if snapshot_name not in snapshot_names:
                 violations.add("unknown_snapshot_name")
             merged_names_by_snapshot[normalize_name(snapshot_name)].add(result_name)
+            if normalize_name(delta_name) == normalize_name(snapshot_name) != result_name:
+                violations.add("same_name_merge_renamed")
         else:
             result_name = normalize_name(delta_name)
             if result_name in snapshot_normalized:
@@ -360,9 +362,7 @@ def check_layer2(payload, output):
     if any(count > 1 for count in decision_count_by_delta.values()):
         violations.add("delta_decided_twice")
 
-    # The resulting profile must not contain conflicting or duplicate names.
-    if any(len(names) > 1 for names in merged_names_by_snapshot.values()):
-        violations.add("conflicting_merge_names")
+    # The resulting profile must not contain duplicate names.
     result_names = [name for names in merged_names_by_snapshot.values() for name in names] + added_names
     untouched_snapshot_names = snapshot_normalized - set(merged_names_by_snapshot)
     if any(name in untouched_snapshot_names for name in result_names):

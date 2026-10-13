@@ -1,21 +1,18 @@
 #!/usr/bin/env python3
-"""Clean the merged GPT-5.4 Layer 2 (merge + temporal) dataset (one JSONL line per user-day).
+"""Clean the merged Layer 2 (merge) dataset (one JSONL line per user-day).
 
-Input line format (GPT54_Inference_Results/step0_merge_l2/*.jsonl):
-    {"input":  {"user_id", "date",
-                "snapshot": [{"interest_name", "actual_activity", "topics": [str]}],
+Input line format (layer2_step0_merge_end2end_dataset.py output):
+    {"user_hash",
+     "input":  {"snapshot": [{"interest_name", "actual_activity", "topics": [str]}],
                 "delta":    [{"interest_name", "actual_activity", "topics": [str]}]},
-     "output": {"user_id", "date",
-                "decisions": [{"action": "merge", "delta_interest_name", "snapshot_interest_name",
-                               "merged_interest_name", "merged_actual_activity",
-                               "merged_inferred_intent", "reasoning", "temporal"}
+     "output": {"decisions": [{"action": "merge", "delta_interest_name", "snapshot_interest_name",
+                               "merged_interest_name", "merged_actual_activity", "merged_inferred_intent"}
                               | {"action": "add", "delta_interest_name", "actual_activity",
-                                 "inferred_intent", "reasoning", "temporal"}]}}
+                                 "inferred_intent"}]}}
 
 Any row that violates a rule is dropped. Kept rows are written as:
     {"user_hash", "snapshot", "delta", "decisions"}
-where user_hash = sha256(user_id)[:16], date is removed, and `reasoning` is
-removed from every decision (`temporal` is kept).
+Decisions carry no `temporal` and no `reasoning` (step0 already removed `reasoning`).
 
 Name references (delta_interest_name / snapshot_interest_name) must match the
 input exactly; name collisions are checked case- and punctuation-insensitively.
@@ -25,7 +22,6 @@ activity and intent sentences.
 
 import argparse
 from collections import Counter, defaultdict
-import hashlib
 import json
 import os
 from pathlib import Path
@@ -40,11 +36,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 import layer1_step2_language_detection as language  # noqa: E402
 
 
-TEMPORALS = {"Ephemeral", "ShortTerm", "LongTerm", "Persistent"}
 DECISION_KEYS = {
     "merge": {"action", "delta_interest_name", "snapshot_interest_name", "merged_interest_name",
-              "merged_actual_activity", "merged_inferred_intent", "reasoning", "temporal"},
-    "add": {"action", "delta_interest_name", "actual_activity", "inferred_intent", "reasoning", "temporal"},
+              "merged_actual_activity", "merged_inferred_intent"},
+    "add": {"action", "delta_interest_name", "actual_activity", "inferred_intent"},
 }
 TEXT_KEYS = {
     "merge": ("merged_interest_name", "merged_actual_activity", "merged_inferred_intent"),
@@ -54,26 +49,19 @@ SENTENCE_KEYS = {
     "merge": ("merged_actual_activity", "merged_inferred_intent"),
     "add": ("actual_activity", "inferred_intent"),
 }
-DROPPED_DECISION_KEYS = ("reasoning",)
 # Letters outside the Latin script (CJK, Cyrillic, Greek, Arabic, ...); symbols and accented Latin pass.
 NON_LATIN_LETTER = language.NON_LATIN_LETTER
-# Result names that are generic umbrellas (layer2_merge.md forbids e.g. Technology, Travel, Shopping,
-# Entertainment, Microsoft Ecosystem). Matched on the normalized full name.
+# Result names that are catch-all buckets rather than interests (broad but real interests such as Sports,
+# Travel or Online Shopping are allowed). Matched on the normalized full name.
 UMBRELLA_NAMES = {
-    "technology", "tech", "travel", "shopping", "online shopping", "general shopping", "general online shopping",
-    "general retail shopping", "general shopping deals", "entertainment", "news", "general news", "world news",
-    "current events", "sports", "health", "lifestyle", "finance", "business", "food", "culture", "society",
-    "hobbies", "science", "education", "media", "leisure", "miscellaneous", "general interest",
-    "general interests", "web browsing", "internet browsing", "online browsing",
+    "miscellaneous", "general interest", "general interests", "web browsing", "internet browsing", "online browsing",
+    "general shopping", "general online shopping", "general retail shopping", "general shopping deals", "general news",
 }
-UMBRELLA_PATTERN = re.compile(r"\S\s+ecosystem\b")  # "<brand> ecosystem"; not names starting with "Ecosystem"
 
 RULES = {
     # A. structure / reference integrity
-    "id_mismatch": "Output user_id/date differ from the input",
     "empty_delta": "Input has no delta interests or output has no decisions",
     "unexpected_keys": "Decision is not an object, has an unknown action, or its keys do not match the action",
-    "invalid_temporal": "Decision temporal is not Ephemeral/ShortTerm/LongTerm/Persistent",
     "empty_text": "A required decision field is empty or not a string",
     "duplicate_snapshot_name": "Input snapshot has two interests with the same normalized name",
     "duplicate_delta_name": "Input delta has two interests with the same normalized name",
@@ -82,7 +70,7 @@ RULES = {
     "delta_not_covered": "An input delta interest has no decision",
     "delta_decided_twice": "An input delta interest has more than one decision",
     # B. contradictory merge results
-    "conflicting_merge_names": "Several deltas merge into one snapshot interest with different merged names",
+    "same_name_merge_renamed": "A delta merged into the snapshot interest with its own name is renamed by the merge",
     "add_name_matches_snapshot": "An added interest has the same normalized name as a snapshot interest",
     "result_name_collides_snapshot": "A merged/added name equals an untouched snapshot interest's name",
     "duplicate_result_name": "Two resulting interests share the same normalized name",
@@ -90,7 +78,7 @@ RULES = {
     "non_latin_output_text": "A decision name/activity/intent contains non-Latin letters",
     "non_english_output": "fastText vote over activity/intent sentences is not English",
     # D. naming
-    "umbrella_name": "A merged/added name is a generic umbrella (see UMBRELLA_NAMES / '* Ecosystem')",
+    "umbrella_name": "A merged/added name is a catch-all bucket (see UMBRELLA_NAMES)",
 }
 
 
@@ -105,8 +93,7 @@ def has_text(value: Any) -> bool:
 
 
 def is_umbrella(name: str) -> bool:
-    normalized = normalize_name(name)
-    return normalized in UMBRELLA_NAMES or bool(UMBRELLA_PATTERN.search(normalized))
+    return normalize_name(name) in UMBRELLA_NAMES
 
 
 def result_name(decision: dict) -> str:
@@ -117,8 +104,6 @@ def structural_violations(record: dict) -> set[str]:
     """Rules A (reference integrity), B (contradictory results) and D (umbrella names)."""
     reasons: set[str] = set()
     source, target = record["input"], record["output"]
-    if source.get("user_id") != target.get("user_id") or source.get("date") != target.get("date"):
-        reasons.add("id_mismatch")
     snapshot, delta, decisions = source.get("snapshot") or [], source.get("delta") or [], target.get("decisions")
     if not isinstance(decisions, list):
         return reasons | {"unexpected_keys"}
@@ -144,9 +129,7 @@ def structural_violations(record: dict) -> set[str]:
             continue
         if set(decision) != DECISION_KEYS[action]:
             reasons.add("unexpected_keys")
-        if decision.get("temporal") not in TEMPORALS:
-            reasons.add("invalid_temporal")
-        if not all(has_text(decision.get(key)) for key in DECISION_KEYS[action] - {"reasoning"}):
+        if not all(has_text(decision.get(key)) for key in DECISION_KEYS[action]):
             reasons.add("empty_text")
 
         delta_name = decision.get("delta_interest_name")
@@ -161,6 +144,8 @@ def structural_violations(record: dict) -> set[str]:
             if snapshot_name not in snapshot_exact:
                 reasons.add("unknown_snapshot_name")
             merge_names_by_target[normalize_name(snapshot_name)].add(name)
+            if normalize_name(delta_name) == normalize_name(snapshot_name) != name:
+                reasons.add("same_name_merge_renamed")
         else:
             if name in set(snapshot_normalized):
                 reasons.add("add_name_matches_snapshot")
@@ -170,10 +155,8 @@ def structural_violations(record: dict) -> set[str]:
         reasons.add("delta_not_covered")
     if any(count > 1 for count in decided.values()):
         reasons.add("delta_decided_twice")
-    if any(len(names) > 1 for names in merge_names_by_target.values()):
-        reasons.add("conflicting_merge_names")
 
-    # One resulting interest per merge target plus one per add; untouched snapshot interests stay as-is.
+    # One resulting interest per distinct merged name plus one per add; untouched snapshot interests stay as-is.
     results = [name for names in merge_names_by_target.values() for name in names] + added_names
     untouched = {name for name in snapshot_normalized if name not in merge_names_by_target}
     if any(name in untouched for name in results):
@@ -201,17 +184,12 @@ def language_violations(decisions: list, model, t2s, s2t, args: argparse.Namespa
     return reasons
 
 
-def hash_user_id(user_id: str) -> str:
-    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16]
-
-
 def to_output_row(record: dict) -> dict:
     return {
-        "user_hash": hash_user_id(record["input"]["user_id"]),
+        "user_hash": record["user_hash"],
         "snapshot": record["input"]["snapshot"],
         "delta": record["input"]["delta"],
-        "decisions": [{k: v for k, v in decision.items() if k not in DROPPED_DECISION_KEYS}
-                      for decision in record["output"]["decisions"]],
+        "decisions": record["output"]["decisions"],
     }
 
 
