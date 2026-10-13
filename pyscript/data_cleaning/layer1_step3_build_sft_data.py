@@ -3,14 +3,15 @@
 Layer-1 step2 output.
 
 Each row becomes:
-    {"messages": [{"role": "user", "content": PROMPT + "\\nInput:\\n" + <signals JSON>},
+    {"messages": [{"role": "user", "content": PROMPT + "\\nInput:\\n" + <activity lines>},
                   {"role": "assistant", "content": <output JSON>}],
      "user_hash": ..., "locale": ...}
 
-Signals are sorted by date (oldest first, original order within a day),
-re-numbered 0..n-1 in that reading order, and written as a compact table
-grouped by date (DetailedSource is dropped):
-    {"columns":["idx","source","action","intent"],"days":{"YYYY-MM-DD":[[0,"Bing","...","..."],...]}}
+PROMPT is prompts/prompt_l1.md verbatim. Signals are sorted by date (oldest first,
+original order within a day), re-numbered 0..n-1 in that reading order, and written
+one minified JSON object per line (DetailedSource is dropped):
+    {"idx":0,"date":"YYYY-MM-DD","source":"Bing","action":"..."}
+    {"idx":1,"date":"YYYY-MM-DD","source":"MSN","action":"..."}
 Answer `evidence` indices are remapped to the new idx and sorted.
 
 The "\\nInput:\\n" marker and this input layout match what
@@ -31,32 +32,24 @@ import orjson
 from tqdm import tqdm
 
 
-PROMPT = """Build one current-window user-interest profile from indexed activities.
-
-The input groups activities by date under `days`; each row follows `columns`: [idx, source, action, intent], where `intent` is an upstream hint for that activity.
-
-Choose stable, recommendation-ready interests, group concrete supporting topics, and omit unrelated noise. For each topic, copy its contributing source names and reference supporting activities with their integer `idx` values. Write one factual `actual_activity` sentence and one concise `inferred_intent` for each interest. Write all text in English, even when the activities are in another language. Set `predicted_content_locale` to the dominant language code of the activities (e.g. en, de, ja, zh-Hans), or "mix" if no single language dominates.
-
-Return only minimized JSON:
-`{"predicted_content_locale":"...","interests":[{"interest_name":"...","topics":[{"topic":"...","source":["..."],"evidence":[0]}],"actual_activity":"...","inferred_intent":"..."}]}`
-"""
+PROMPT = (Path(__file__).resolve().parents[2] / "prompts" / "prompt_l1.md").read_text(encoding="utf-8")
 INPUT_MARKER = "\nInput:\n"
-INPUT_COLUMNS = ["idx", "source", "action", "intent"]
 
 
 def dumps(value) -> str:
     return orjson.dumps(value).decode("utf-8")
 
 
-def build_input(signals: list[dict]) -> tuple[dict, dict[int, int]]:
-    """Return the date-grouped input table and the old-idx -> new-idx mapping."""
+def build_input(signals: list[dict]) -> tuple[str, dict[int, int]]:
+    """Return the activity lines (one JSON object per line) and the old-idx -> new-idx mapping."""
     ordered = sorted(signals, key=lambda signal: (signal["Date"], signal["idx"]))
-    days: dict[str, list[list]] = {}
+    lines: list[str] = []
     remap: dict[int, int] = {}
     for new_idx, signal in enumerate(ordered):
         remap[signal["idx"]] = new_idx
-        days.setdefault(signal["Date"], []).append([new_idx, signal["Source"], signal["Action"], signal["intent"]])
-    return {"columns": INPUT_COLUMNS, "days": days}, remap
+        lines.append(dumps({"idx": new_idx, "date": signal["Date"], "source": signal["Source"],
+                            "action": signal["Action"]}))
+    return "\n".join(lines), remap
 
 
 def remap_interests(interests: list[dict], remap: dict[int, int]) -> list[dict]:
@@ -80,7 +73,7 @@ def build_example(record: dict) -> dict:
     }
     return {
         "messages": [
-            {"role": "user", "content": PROMPT + INPUT_MARKER + dumps(payload)},
+            {"role": "user", "content": PROMPT + INPUT_MARKER + payload},
             {"role": "assistant", "content": dumps(answer)},
         ],
         "user_hash": record["user_hash"],

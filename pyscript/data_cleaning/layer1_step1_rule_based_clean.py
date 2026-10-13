@@ -6,6 +6,8 @@ Input line format:
      "output": {"user_id", "date", ["predicted_content_locale"],
                 "interests": [{"interest_name", "topics": [{"topic", "source", "evidence"}],
                                "actual_activity", "inferred_intent"}]}}
+The GPT-5.6 merge (layer1_step0_merge_end2end_dataset.py) instead writes a top-level "user_hash"
+and an input of {"signals"} only; such rows keep that user_hash.
 
 Any row that violates a rule is dropped. Kept rows are written as:
     {"user_hash", "predicted_content_locale", "signals", "interests"}
@@ -14,7 +16,7 @@ predicted_content_locale defaults to "en".
 """
 
 import argparse
-from collections import Counter, defaultdict
+from collections import Counter
 import hashlib
 import json
 import os
@@ -30,23 +32,26 @@ INTEREST_KEYS = {"interest_name", "topics", "actual_activity", "inferred_intent"
 TOPIC_KEYS = {"topic", "source", "evidence"}
 NON_LATIN = re.compile(r"[^\x00-\x7F\u00C0-\u024F\u2019\u2013\u2014]")
 
-# Ordered by observed frequency on the full GPT-5.4 L1 dataset.
 RULES = {
+    # Structure / fields
+    "unexpected_keys": "Interest or topic has unexpected keys",
+    "empty_text": "Empty interest name, topic, actual_activity or inferred_intent, or no topics",
+    "invalid_evidence_format": "Topic evidence is not a list, is empty, or has non-integer values",
+    # Evidence / source consistency
+    "unknown_evidence_idx": "Topic evidence references an idx missing from the input signals",
+    "duplicate_evidence_id": "Duplicate idx within a topic evidence",
     "source_evidence_mismatch": "Topic source does not match the sources of its evidence signals",
+    "duplicate_topic_source": "Duplicate value within a topic source",
+    # Content
+    "too_many_interests": "Row has at least --interest-limit interests",
+    "non_english_interest_name": "Interest name contains non-Latin characters",
+    "duplicate_interest_name": "Duplicate interest name within a row",
+    "duplicate_topic_name": "Duplicate topic name within an interest",
+    # File-level deduplication
+    "identical_duplicate": "Identical input and output duplicate an earlier row",
     "normalized_duplicate_input": (
         "Same set of (Source, Action) signals as an earlier kept row, ignoring Date/idx/intent"
     ),
-    "too_many_interests": "Row has at least --interest-limit interests",
-    "conflicting_duplicate_input": "Same input signals with conflicting outputs (all copies dropped)",
-    "unexpected_keys": "Interest or topic has unexpected keys",
-    "non_english_interest_name": "Interest name contains non-Latin characters",
-    "duplicate_interest_name": "Duplicate interest name within a row",
-    "identical_duplicate": "Identical input and output duplicate an earlier row",
-    "empty_text": "Empty interest name, topic, actual_activity or inferred_intent, or no topics",
-    "duplicate_topic_source": "Duplicate value within a topic source",
-    "duplicate_topic_name": "Duplicate topic name within an interest",
-    "invalid_evidence": "Topic evidence is empty, non-integer, or references a missing idx",
-    "duplicate_evidence_id": "Duplicate idx within a topic evidence",
 }
 
 
@@ -119,9 +124,11 @@ def row_violations(record: dict, interest_limit: int) -> set[str]:
             topic_names.add(topic_name)
 
             evidence = topic.get("evidence")
-            if (not isinstance(evidence, list) or not evidence
-                    or not all(type(e) is int and e in signals for e in evidence)):
-                reasons.add("invalid_evidence")
+            if not isinstance(evidence, list) or not evidence or not all(type(e) is int for e in evidence):
+                reasons.add("invalid_evidence_format")
+                continue
+            if not all(e in signals for e in evidence):
+                reasons.add("unknown_evidence_idx")
                 continue
             if len(evidence) != len(set(evidence)):
                 reasons.add("duplicate_evidence_id")
@@ -140,33 +147,25 @@ def row_violations(record: dict, interest_limit: int) -> set[str]:
 def scan(input_path: Path, interest_limit: int) -> list[set[str]]:
     """Evaluate every row; returns the violation set per line (0-based)."""
     violations: list[set[str]] = []
-    input_hashes: list[bytes] = []
-    output_hashes: list[bytes] = []
     normalized_hashes: list[bytes] = []
+    seen_rows: set[tuple[bytes, bytes]] = set()
     with input_path.open("rb") as source:
         for line_number, line in enumerate(tqdm(source, desc=f"Scanning {input_path.name}", unit="rows"), 1):
             try:
                 record = orjson.loads(line)
             except orjson.JSONDecodeError as error:
                 raise ValueError(f"Line {line_number}: invalid JSON: {error}") from error
-            violations.append(row_violations(record, interest_limit))
+            reasons = row_violations(record, interest_limit)
             output = {k: v for k, v in record["output"].items() if k not in ("user_id", "date")}
-            input_hashes.append(digest(record["input"]["signals"]))
-            output_hashes.append(digest(output))
+            row_hash = (digest(record["input"]["signals"]), digest(output))
+            if row_hash in seen_rows:
+                reasons.add("identical_duplicate")
+            seen_rows.add(row_hash)
+            violations.append(reasons)
             normalized_hashes.append(normalized_input_digest(record["input"]["signals"]))
 
-    outputs_by_input: dict[bytes, set[bytes]] = defaultdict(set)
-    for input_hash, output_hash in zip(input_hashes, output_hashes):
-        outputs_by_input[input_hash].add(output_hash)
-    seen: set[bytes] = set()
-    for reasons, input_hash in zip(violations, input_hashes):
-        if len(outputs_by_input[input_hash]) > 1:
-            reasons.add("conflicting_duplicate_input")
-        elif input_hash in seen:
-            reasons.add("identical_duplicate")
-        seen.add(input_hash)
-
-    # Keep only the first otherwise-clean row per normalized input.
+    # Keep only the first otherwise-clean row per normalized input (this also resolves
+    # identical inputs with different outputs).
     kept_normalized: set[bytes] = set()
     for reasons, normalized_hash in zip(violations, normalized_hashes):
         if reasons:
@@ -183,7 +182,7 @@ def hash_user_id(user_id: str) -> str:
 
 def to_output_row(record: dict) -> dict:
     return {
-        "user_hash": hash_user_id(record["input"]["user_id"]),
+        "user_hash": record.get("user_hash") or hash_user_id(record["input"]["user_id"]),
         "predicted_content_locale": record["output"].get("predicted_content_locale") or "en",
         "signals": record["input"]["signals"],
         "interests": record["output"]["interests"],

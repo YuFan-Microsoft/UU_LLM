@@ -84,13 +84,31 @@ def parse_json_object(text):
     return value if isinstance(value, dict) else None
 
 
+def read_layer1_activities(text):
+    """Layer-1 input: one {"idx", "date", "source", "action"} JSON object per line. Returns the list or None."""
+    activities = []
+    for line in text.strip().split("\n"):
+        try:
+            activity = json.loads(line)
+        except json.JSONDecodeError:
+            return None
+        if not (isinstance(activity, dict) and "idx" in activity and "source" in activity and "action" in activity):
+            return None
+        activities.append(activity)
+    return activities or None
+
+
 def read_input(messages):
     """Return (stage, payload) from the user prompt; stage is "layer1", "layer2", a TASK_CHECKERS key or "unknown"."""
     user_content = next(m["content"] for m in reversed(messages) if m["role"] == "user")
     if INPUT_MARKER not in user_content:
         return "unknown", None
+    raw_input = user_content.split(INPUT_MARKER, 1)[1]
+    activities = read_layer1_activities(raw_input)
+    if activities is not None:
+        return "layer1", {"activities": activities}
     try:
-        payload = json.loads(user_content.split(INPUT_MARKER, 1)[1])
+        payload = json.loads(raw_input)
     except json.JSONDecodeError:
         return "unknown", None
     if not isinstance(payload, dict):
@@ -135,10 +153,11 @@ def check_layer1_topic(topic, source_by_idx, violations):
 
     # Every evidence idx must be an int that exists in the input.
     evidence = topic.get("evidence")
-    if not isinstance(evidence, list) or not evidence or not all(
-        type(idx) is int and idx in source_by_idx for idx in evidence
-    ):
-        violations.add("invalid_evidence")
+    if not isinstance(evidence, list) or not evidence or not all(type(idx) is int for idx in evidence):
+        violations.add("invalid_evidence_format")
+        return False
+    if not all(idx in source_by_idx for idx in evidence):
+        violations.add("unknown_evidence_idx")
         return False
     if len(evidence) != len(set(evidence)):
         violations.add("duplicate_evidence_id")
@@ -177,10 +196,14 @@ def check_layer1(payload, output):
     violations = set()
     stats = {"interests": 0, "topics": 0, "valid_topics": 0}
 
-    # Input table: columns = [idx, source, action, intent], rows grouped by date.
-    idx_col = payload["columns"].index("idx")
-    source_col = payload["columns"].index("source")
-    source_by_idx = {row[idx_col]: row[source_col] for rows in payload["days"].values() for row in rows}
+    # Input: one activity object per line ({"activities": [...]}), or the V1 table
+    # (columns include idx and source, rows grouped by date under days).
+    if "activities" in payload:
+        source_by_idx = {activity["idx"]: activity["source"] for activity in payload["activities"]}
+    else:
+        idx_col = payload["columns"].index("idx")
+        source_col = payload["columns"].index("source")
+        source_by_idx = {row[idx_col]: row[source_col] for rows in payload["days"].values() for row in rows}
 
     if set(output) != L1_TOP_KEYS or not has_text(output.get("predicted_content_locale")):
         violations.add("invalid_top_level")
