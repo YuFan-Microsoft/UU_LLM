@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
-"""Merge GPT-5.4 Layer 4 commercial preference batch inputs and outputs into one JSONL row per request.
+"""Merge Layer 4 commercial preference requests and responses into one JSONL row per request.
 
-Source layout (RawData/l4_commercial_preference/offset_<n>/runs/<run>/):
+Sources: --inputs ProcessData/layer4_commercial_preference.jsonl (GPT-5.6, layout of
+layer3_commercial_step1_merge_input_output.py), or --runs-dir RawData/l4_commercial_preference/offset_<n>/runs/
+(GPT-5.4 Batch API files):
     <region>/part-*.jsonl                  Batch API requests {"custom_id", "body": {"input": [system, user]}}
     responses/*.output.jsonl               Batch API results  {"custom_id", "response": {...}}
 The user message is built by MAIProfile_Official/modules/layer4_commercial_preference.py:
@@ -16,6 +18,8 @@ Each kept row is:
                 "non_commercial_interest_names": [str]},
      "output": {"deal_seeking": {"value", "details"}, "price_tier": {"value", "details"},
                 "affinity": {"shopping": {"product_categories", "shopper_type"}, "dining": {"restrictions"}}}}
+GPT-5.6 outputs have discount_sensitivity, price_sensitivity, and subscription_affinity instead of deal_seeking and
+price_tier.
 
 `input` is the user message only (the shared system prompt is dropped). Deduplication, output
 selection, and the report follow layer3_commercial_step1_merge_input_output.py.
