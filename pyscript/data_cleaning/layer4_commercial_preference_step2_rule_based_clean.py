@@ -36,7 +36,8 @@ Free text is not checked for braces: evidence legitimately quotes ad templates s
      "affinity": {...as above...}}
 where every value / level is "Low"|"Medium-Low"|"Medium"|"Medium-High"|"High" (value may also be "Unknown"), using
 CATEGORIES_V2 / FLAG_CATEGORIES_V2: Unknown exactly when there are no details, a known value within the range of its
-detail levels, the V1 affinity checks, and English free text (fastText vote, layer1_step2 helpers). The report is also
+detail levels, the V1 affinity checks, a non-empty life_stage (the biography may have failed for the user), and English
+free text (fastText vote, layer1_step2 helpers). The report is also
 written to <output stem>.report.json.
 
 The JSON-format checker, cleaning loop, and summary printer come from layer4_biography_step2_rule_based_clean.py.
@@ -251,7 +252,7 @@ KEY_ORDERS_V2 = {
 CATEGORIES_V2 = {
     "json_format": "Output does not match the V2 JSON format (missing/extra key, wrong type or enum value such as a "
                    "category outside Ads Vertical L1, empty string, or keys out of order)",
-    "invalid_input": "Input has no commercial interests, an empty interest name, or a non-object life_stage",
+    "invalid_input": "Input has no commercial interests, an empty interest name, or a non-object or empty life_stage",
     "inconsistent_content": "A sensitivity / affinity value is Unknown with details, known without details, or outside "
                             "the range of its detail levels; shopper_type or dining restrictions disagree with their "
                             "details; or product_categories repeats a category",
@@ -279,7 +280,8 @@ def check_row_v2(record: dict, model, t2s, s2t, args) -> CheckResult:
     interests = [interest for interest in source.get("commercial_interests") or [] if isinstance(interest, dict)]
     names = [interest.get("interest_name") for interest in interests]
     names += list(source.get("non_commercial_interest_names") or [])
-    if not interests or not isinstance(source.get("life_stage"), dict) or has_empty_name(names):
+    if not interests or not isinstance(source.get("life_stage"), dict) or not source["life_stage"] \
+            or has_empty_name(names):
         reasons.add("invalid_input")
     if has_duplicates([str(name or "") for name in names]):
         flags.add("duplicate_input_name")

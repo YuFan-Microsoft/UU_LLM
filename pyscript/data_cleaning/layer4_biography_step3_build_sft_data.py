@@ -9,11 +9,12 @@ Each row becomes:
 
 PROMPT is prompts/prompt_l4_biography.md verbatim. The input carries only per-user data (no user_id or date):
 `declared_attributes` (self-reported age_group / gender, {} when none), `facts` (any of location_data,
-linkedin_profile, market, or {}), and the teacher's `active_interests` as `interests`. The answer is the teacher
-output unchanged. JSON is minified. Train/test is split by user_hash exactly as in
+linkedin_profile, market, or {}), and the teacher's `active_interests` as `interests`. The answer is the step2
+output unchanged (the teacher output without confidence_score, Unknown evidence emptied). JSON is minified. Train/test
+is split by user_hash exactly as in
 layer3_commercial_step4_build_sft_data.py (--test-ratio, or --test-rows in bucket order); --test-ratio 0.0485 holds
-out the Layer 1/2 split buckets 0-484, the test users of the Layer 3 V2 configurations. Rows are never filtered by
-length; with --tokenizer the full-chat token percentiles are reported.
+out the Layer 1/2 split buckets 0-484, the test users of the Layer 3 V2 configurations. With --tokenizer the
+full-chat token percentiles of the written rows are reported, and --max-tokens drops rows longer than that.
 
 `build` is shared with layer4_commercial_preference_step3_build_sft_data.py.
 """
@@ -69,9 +70,14 @@ def parse_args(description: str) -> argparse.Namespace:
                         help="Hold out exactly this many users for test instead of --test-ratio: the users with the "
                              "lowest (hash bucket, user_hash), so every --test-ratio test user comes first (0 = off)")
     parser.add_argument("--tokenizer", help="HF tokenizer name or path (e.g. the Qwen3.5-4B model dir) to report "
-                                            "full-chat token length percentiles; rows are never filtered by length")
+                                            "full-chat token length percentiles")
+    parser.add_argument("--max-tokens", type=int, default=0,
+                        help="Drop rows whose full-chat token length exceeds this (requires --tokenizer; 0 = keep all)")
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N rows (0 = all)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_tokens and not args.tokenizer:
+        parser.error("--max-tokens requires --tokenizer")
+    return args
 
 
 def build(description: str, prompt: str, build_payload: Callable[[dict], dict],
@@ -83,6 +89,7 @@ def build(description: str, prompt: str, build_payload: Callable[[dict], dict],
     test_users = lowest_bucket_users(args.input, args.test_rows, args.limit) if args.test_rows else None
 
     rows = Counter()
+    too_long = Counter()
     users = {"train": set(), "test": set()}
     inputs = {"train": Counter(), "test": Counter()}
     user_chars, answer_chars, token_lengths = [], [], []
@@ -96,12 +103,16 @@ def build(description: str, prompt: str, build_payload: Callable[[dict], dict],
                     break
                 record = orjson.loads(line)
                 example = build_example(record, prompt, build_payload)
-                if count_tokens:
-                    token_lengths.append(count_tokens(example["messages"]))
                 if test_users is not None:
                     split = "test" if example["user_hash"] in test_users else "train"
                 else:
                     split = "test" if is_test_user(example["user_hash"], args.test_ratio) else "train"
+                if count_tokens:
+                    tokens = count_tokens(example["messages"])
+                    if args.max_tokens and tokens > args.max_tokens:
+                        too_long[split] += 1
+                        continue
+                    token_lengths.append(tokens)
                 handles[split].write(orjson.dumps(example) + b"\n")
                 rows[split] += 1
                 users[split].add(example["user_hash"])
@@ -120,6 +131,8 @@ def build(description: str, prompt: str, build_payload: Callable[[dict], dict],
         "users": {split: len(values) for split, values in users.items()},
         "test_ratio": None if test_users is not None else args.test_ratio,
         "test_rows": args.test_rows or None,
+        "max_tokens": args.max_tokens or None,
+        "rows_dropped_over_max_tokens": dict(too_long),
         "input_rows_with": {split: dict(sorted(counts.items())) for split, counts in inputs.items()},
         "user_chars": length_stats(user_chars),
         "assistant_chars": length_stats(answer_chars),

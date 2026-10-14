@@ -31,9 +31,13 @@ gender) and whose output is
                          "education_area": {"evidence", "value", "confidence", "confidence_score", "source"}},
      "biography": str}
 with CATEGORIES_V2 / FLAG_CATEGORIES_V2: the V2 JSON format, declared attributes copied verbatim (and age_group.signals
-only for an inferred age_group), sources backed by the matching facts, consistent Unknown values, no repeated evidence or
-pronouns contradicting gender, no JSON leftovers, and English text (fastText vote, layer1_step2 helpers). The report is
-also written to <output stem>.report.json.
+only for an inferred age_group), sources backed by the matching facts (and, for LinkedIn occupation / company /
+education_area, by the field they are copied from; values that do not match their fact are flagged), consistent
+Unknown values, no repeated evidence or
+pronouns contradicting gender, no JSON leftovers, and English text (fastText vote, layer1_step2 helpers). Kept v2
+rows are written without confidence_score (the confidence label carries it), and every Unknown attribute gets
+`"evidence": []` (the teacher mixes [] with "no evidence" filler). The report is also written to
+<output stem>.report.json.
 
 The JSON-format checker, cleaning loop, and summary printer below are shared with the other
 layer4_*_rule_based_clean.py scripts.
@@ -51,6 +55,7 @@ from pathlib import Path
 import re
 import sys
 from typing import Any, Callable, Iterator
+import unicodedata
 
 from jsonschema import Draft202012Validator
 import orjson
@@ -111,8 +116,10 @@ def leaks_user_id(record: dict) -> bool:
 
 
 def clean(args: argparse.Namespace, check_row: Callable[[dict], CheckResult],
-          categories: dict[str, str], flag_categories: dict[str, str]) -> dict:
-    rows = kept = 0
+          categories: dict[str, str], flag_categories: dict[str, str],
+          normalize: Callable[[dict], bool] | None = None) -> dict:
+    """Write the rows no category drops; `normalize` may edit a kept record in place and returns True if it did."""
+    rows = kept = normalized = 0
     dropped: Counter[str] = Counter()
     flagged: Counter[str] = Counter()
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -122,17 +129,21 @@ def clean(args: argparse.Namespace, check_row: Callable[[dict], CheckResult],
             if args.limit and line_number > args.limit:
                 break
             rows += 1
-            reasons, flags = check_row(orjson.loads(line))
+            record = orjson.loads(line)
+            reasons, flags = check_row(record)
             dropped.update(reasons)
             if reasons:
                 continue
+            if normalize and normalize(record):
+                normalized += 1
+                line = orjson.dumps(record)
             destination.write(line if line.endswith(b"\n") else line + b"\n")
             kept += 1
             flagged.update(flags)
     os.replace(temporary, args.output)
 
     fraction = lambda count, total: round(count / total, 6) if total else 0.0  # noqa: E731
-    return {
+    report = {
         "input_path": str(args.input),
         "output_path": str(args.output),
         "rows_scanned": rows,
@@ -144,6 +155,9 @@ def clean(args: argparse.Namespace, check_row: Callable[[dict], CheckResult],
         "flag_categories_on_kept_rows": {name: {"rows": flagged[name], "fraction": fraction(flagged[name], kept)}
                                          for name in flag_categories},
     }
+    if normalize:
+        report["rows_normalized"] = {"rows": normalized, "fraction": fraction(normalized, kept)}
+    return report
 
 
 def print_summary(report: dict, categories: dict[str, str]) -> None:
@@ -334,17 +348,90 @@ CATEGORIES_V2 = {
                          "for an inferred one",
     "source_mismatch": "source linkedin / location_data without that fact, or signals.linkedin_min_age present without "
                        "a LinkedIn profile / missing with one",
-    "unknown_mismatch": "value Unknown without source unknown and confidence_score 0 (or the reverse), or a known value "
-                        "with no evidence",
+    "linkedin_field_missing": "occupation / company / education_area has source linkedin but the LinkedIn profile has no "
+                              "titles / companies / fieldOfStudy to copy it from",
+    "unknown_mismatch": "value Unknown without source unknown (or the reverse), or a known value with no evidence",
     "inconsistent_content": "An evidence list repeats a string, or the biography's pronouns contradict gender.value",
     "text_quality": "biography/evidence contains leftover JSON syntax, or the output repeats the user_id",
     "non_english": "fastText vote over the biography and evidence strings is not English",
 }
 FLAG_CATEGORIES_V2 = {
-    "confidence_band_mismatch": "An attribute's confidence disagrees with its confidence_score band "
-                                "(high >= 0.75, medium 0.5-0.75, low < 0.5)",
     "duplicate_input_name": "Two input interests share the same interest_name",
+    "fact_copy_mismatch": "A value with source linkedin / location_data does not match that fact: home_location names a "
+                          "city or region absent from it, company / occupation / education_area shares no word with "
+                          "the LinkedIn companies / titles / fieldOfStudy, or career_stage disagrees with seniorities",
 }
+
+# LinkedIn fields that occupation / company / education_area with source linkedin must be copied from.
+LINKEDIN_FIELDS = {"occupation": ("titles", "current_roles"), "company": ("current_company", "companies"),
+                   "education_area": ("fieldOfStudy", "areas")}
+# Values that may come from an explicit LinkedIn status rather than the copied field.
+STATUS_VALUES = {"Unknown", "Self-Employed", "Retired", "Student", "Homemaker", "Not in Workforce"}
+SENIORITY_STAGES = {"entry": "Entry Level", "senior": "Senior Professional", "manager": "Manager",
+                    "director": "Director/Executive", "vp": "Director/Executive", "cxo": "Director/Executive",
+                    "owner": "Business Owner/Self-Employed", "partner": "Business Owner/Self-Employed",
+                    "training": "Student"}
+SELF_EMPLOYED = re.compile(r"\b(?:self employed|freelance|owner|founder)\b")
+
+
+def as_list(value: Any) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    return [item for item in value if isinstance(item, str)] if isinstance(value, list) else []
+
+
+def fold(text: str) -> str:
+    """Casefold, strip accents, and turn punctuation into single spaces."""
+    text = "".join(char for char in unicodedata.normalize("NFKD", text.casefold()) if not unicodedata.combining(char))
+    return " ".join(re.sub(r"[^\w\s]", " ", text).split())
+
+
+def words(texts: list[str]) -> set[str]:
+    return {word for text in texts for word in fold(text).split() if len(word) >= 2}
+
+
+def place_names(texts: list[str]) -> set[str]:
+    return {fold(part) for text in texts for part in text.split(",") if fold(part)}
+
+
+def copies_fact(name: str, attribute: dict, facts: dict) -> bool:
+    """False when a value sourced from linkedin / location_data is not found in that fact."""
+    value, source = attribute["value"], attribute["source"]
+    linkedin = facts.get("linkedin_profile") or {}
+    if value == "Unknown":
+        return True
+    if name == "home_location":
+        if source == "location_data":
+            location = facts["location_data"]
+            texts = [*as_list(location.get("current_location")), *as_list(location.get("recent_visits")),
+                     *(item.get("place", "") for item in location.get("place_frequency") or []),
+                     *(item.get("region", "") for item in location.get("region_frequency") or [])]
+        else:
+            texts = as_list(linkedin.get("profile_geo"))
+        # The country (last component) may be expanded from a code or translated, so only city / region are checked.
+        return place_names(value.split(",")[:-1]) <= place_names(texts)
+    if source != "linkedin" or value in STATUS_VALUES:
+        return True
+    titles = as_list(linkedin.get("titles")) + as_list(linkedin.get("current_roles"))
+    companies = as_list(linkedin.get("current_company")) + as_list(linkedin.get("companies"))
+    if name == "company":
+        compact = lambda text: fold(text).replace(" ", "")  # noqa: E731
+        return any(compact(value) in compact(company) or compact(company) in compact(value)
+                   for company in companies if compact(company)) or bool(words([value]) & words(companies))
+    if name == "occupation":
+        return bool(words([value]) & words(titles))
+    if name == "education_area":
+        return bool(words([value]) & words(as_list(linkedin.get("fieldOfStudy")) + as_list(linkedin.get("areas"))))
+    if name == "career_stage":
+        stages = {SENIORITY_STAGES[item] for item in as_list(linkedin.get("seniorities")) if item in SENIORITY_STAGES}
+        if not stages:  # decided from title scope, which is not checkable
+            return True
+        if any(SELF_EMPLOYED.search(fold(text)) for text in titles + companies):
+            stages.add("Business Owner/Self-Employed")
+        if "12+ years" in as_list(linkedin.get("yearsOfExperience")) + as_list(linkedin.get("experience_band")):
+            stages.add("Senior Professional")
+        return value in stages
+    return True
 
 
 def matches_format_v2(output: Any) -> bool:
@@ -354,10 +441,6 @@ def matches_format_v2(output: Any) -> bool:
     signals = age_group.get("signals")
     return (tuple(age_group) in (ATTRIBUTE_KEYS, ("signals", *ATTRIBUTE_KEYS))
             and (signals is None or tuple(signals) in (SIGNAL_KEYS, (*SIGNAL_KEYS, "linkedin_min_age"))))
-
-
-def confidence_band(score: float) -> str:
-    return "high" if score >= 0.75 else "medium" if score >= 0.5 else "low"
 
 
 def check_row_v2(record: dict, model, t2s, s2t, args: argparse.Namespace) -> CheckResult:
@@ -385,12 +468,14 @@ def check_row_v2(record: dict, model, t2s, s2t, args: argparse.Namespace) -> Che
             reasons.add("declared_mismatch")
         if attribute["source"] in FACT_FOR_SOURCE and FACT_FOR_SOURCE[attribute["source"]] not in facts:
             reasons.add("source_mismatch")
+        elif attribute["source"] == "linkedin" and name in LINKEDIN_FIELDS and attribute["value"] not in STATUS_VALUES \
+                and not any(facts["linkedin_profile"].get(key) for key in LINKEDIN_FIELDS[name]):
+            reasons.add("linkedin_field_missing")
+        elif attribute["source"] in FACT_FOR_SOURCE and not copies_fact(name, attribute, facts):
+            flags.add("fact_copy_mismatch")
         unknown = attribute["value"] == "Unknown"
-        if unknown != (attribute["source"] == "unknown") or (unknown and attribute["confidence_score"] != 0) \
-                or (not unknown and not attribute["evidence"]):
+        if unknown != (attribute["source"] == "unknown") or (not unknown and not attribute["evidence"]):
             reasons.add("unknown_mismatch")
-        if confidence_band(attribute["confidence_score"]) != attribute["confidence"]:
-            flags.add("confidence_band_mismatch")
 
     signals = attributes["age_group"].get("signals")
     if (signals is not None) == ("age_group" in declared):
@@ -412,6 +497,16 @@ def check_row_v2(record: dict, model, t2s, s2t, args: argparse.Namespace) -> Che
     if not is_english(texts, model, t2s, s2t, args):
         reasons.add("non_english")
     return reasons, flags
+
+
+def normalize_v2(record: dict) -> bool:
+    """Drop every attribute's confidence_score (the confidence label carries it) and empty the evidence of Unknown
+    attributes (the teacher mixes [] and "no evidence" filler)."""
+    for attribute in record["output"]["user_attributes"].values():
+        attribute.pop("confidence_score", None)
+        if attribute["value"] == "Unknown":
+            attribute["evidence"] = []
+    return True
 
 
 def load_language(args: argparse.Namespace):
@@ -452,7 +547,7 @@ def main() -> None:
         return
     model, t2s, s2t = load_language(args)
     report = clean(args, lambda record: check_row_v2(record, model, t2s, s2t, args), CATEGORIES_V2,
-                   FLAG_CATEGORIES_V2)
+                   FLAG_CATEGORIES_V2, normalize_v2)
     print_summary(report, CATEGORIES_V2)
     write_report(report, args)
 

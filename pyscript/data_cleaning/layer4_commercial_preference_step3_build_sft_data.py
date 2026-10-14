@@ -10,7 +10,8 @@ Each row becomes:
      "user_hash": sha256(user_id)[:16]}
 
 PROMPT is prompts/prompt_l4_commercial_preference.md verbatim. The input carries only per-user data (no user_id or
-date); the answer is the teacher output unchanged. JSON is minified. Train/test splitting, summary, and options follow
+date, and no topics[].intent, which is always empty); the answer is the teacher output unchanged. JSON is minified.
+Train/test splitting, summary, and options follow
 layer4_biography_step3_build_sft_data.py (use the same --test-ratio, e.g. 0.0485, so a user is a test user of both).
 """
 
@@ -29,7 +30,13 @@ INPUT_KEYS = ("life_stage", "commercial_interests", "non_commercial_interest_nam
 
 
 def payload(row_input: dict) -> dict:
-    return {key: row_input[key] for key in INPUT_KEYS}
+    """The input sections, without topics[].intent (always "": Layer 3 commercial topics carry no intent)."""
+    result = {key: row_input[key] for key in INPUT_KEYS}
+    result["commercial_interests"] = [
+        {**interest, "topics": [{key: value for key, value in topic.items() if key != "intent"}
+                                for topic in interest.get("topics") or []]}
+        for interest in result["commercial_interests"]]
+    return result
 
 
 def input_features(row_input: dict) -> list[str]:
