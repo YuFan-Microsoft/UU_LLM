@@ -342,8 +342,9 @@ ROLLOUT_EVAL=0 sh run_user_profile_multi_gpu.sh   # perplexity eval only
 ROLLOUT_EVAL_SAMPLES=-1 sh run_user_profile_multi_gpu.sh   # roll out the whole test split (default: 256 per task)
 ```
 
-The script currently uses debug settings (1 epoch, `--checkpoint_steps 100`, 256 rollouts per task); raise
-`--checkpoint_steps` and set `ROLLOUT_EVAL_SAMPLES=-1` for a full run.
+The script currently uses debug settings (1 epoch, `--checkpoint_steps 100`, `--max_eval_steps 64` = a fixed ~5k-row
+perplexity subset, 256 rollouts per task); raise `--checkpoint_steps`, raise or drop `--max_eval_steps` (the full V2
+test split is ~335 steps on 40 GPUs) and set `ROLLOUT_EVAL_SAMPLES=-1` for a full run.
 
 Generic SFT on another dataset uses the base trainer directly (see `run_multi_gpu.sh`):
 
