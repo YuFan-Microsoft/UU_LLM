@@ -85,8 +85,9 @@ L1 Negative  negative feedback -> rejected topics   (standalone: no user ID to j
 ## 4. Shared types and notation
 
 ```ts
-// Source: activity source
-type Source = "MSN" | "Edge" | "Uet" | "Bing" | "Ads" | "ChromeImports" | "Shopping" | "Linkedin";
+// Source: activity source. The last 7 values are rare (27 occurrences, only in L3 Commercial / L4 Biography inputs)
+type Source = "MSN" | "Edge" | "Uet" | "Bing" | "Ads" | "ChromeImports" | "Shopping" | "Linkedin"
+            | "YouTube" | "Amazon" | "Xbox" | "Facebook" | "Google Play" | "Walmart" | "Yahoo";
 type Lang   = "en" | "de" | "fr" | "es" | "ja" | "pt" | "nl" | "it" | "sv" | "pl" | "zh-Hans" | "zh-Hant";
 type Level  = "high" | "medium" | "low";
 type Scale  = "Low" | "Medium-Low" | "Medium" | "Medium-High" | "High";
@@ -94,7 +95,7 @@ type Signal = "strong" | "moderate" | "weak";
 ```
 
 - `field?` = optional field; `~N%` = how often it is present.
-- Counts such as `1–39, median 10` come from 700 sampled rows per config (500 train + 200 test); L1 Negative uses all rows.
+- All counts (`1–39, median 10`) and percentages are measured on every row of the config (train + test).
 
 ---
 
@@ -102,7 +103,7 @@ type Signal = "strong" | "moderate" | "weak";
 
 `V2_User_Profile_L1_gpt56` · Find the user's interests in one window of activities.
 
-**Input** — JSONL, one activity per line (1–200 lines, median 41)
+**Input** — JSONL, one activity per line (1–200 lines, median 37)
 
 ```ts
 { idx: int, date: "YYYY-MM-DD", source: Source, action: string }   // action: page title, query, or article title
@@ -113,11 +114,11 @@ type Signal = "strong" | "moderate" | "weak";
 ```ts
 {
   predicted_content_locale: Lang | "mix",   // main language of the activities
-  interests: [{                             // 1–39, median 10 (can be empty)
+  interests: [{                             // 0–39, median 10 (0.3% of rows have none)
     interest_name: string,
-    topics: [{                              // 1–10
+    topics: [{                              // 1–53, median 2
       topic: string,
-      source: Source[],                     // 1–4
+      source: Source[],                     // 1–6
       evidence: int[]                       // input idx
     }],
     actual_activity: string,                // one factual sentence
@@ -176,20 +177,22 @@ type Signal = "strong" | "moderate" | "weak";
 
 ```ts
 {
-  snapshot: [{ interest_name: string, actual_activity: string, topics: string[] }],   // existing profile, 1–159
-  delta:    [{ interest_name: string, actual_activity: string, topics: string[] }]    // new interests, 1–44
+  // existing profile, 0–275 interests (median 39)
+  snapshot: [{ interest_name: string, actual_activity: string, topics: string[] }],
+  // new interests, 1–95 (median 10)
+  delta:    [{ interest_name: string, actual_activity: string, topics: string[] }]
 }
 ```
 
-**Output** — one decision per `delta` interest, in the same order
+**Output** — one decision per `delta` interest, in the same order (66 rows, 0.02%, list them in another order)
 
 ```ts
 {
   decisions: [
-      { action: "merge",                     // ~52%
+      { action: "merge",                     // ~60%
         delta_interest_name: string, snapshot_interest_name: string,
         merged_interest_name: string, merged_actual_activity: string, merged_inferred_intent: string }
-    | { action: "add",                       // ~48%
+    | { action: "add",                       // ~40%
         delta_interest_name: string, actual_activity: string, inferred_intent: string }
   ]
 }
@@ -206,7 +209,7 @@ and search queries.
 
 ```ts
 {
-  interests: [{                              // 1–30, median 23
+  interests: [{                              // 1–30, median 24
     interest_name: string,
     actual_activity: string,
     sources: Source[],
@@ -247,7 +250,7 @@ and search queries.
 
 ```ts
 {
-  interests: [{                 // 1–177, median 42
+  interests: [{                 // 1–187, median 43
     interest_name: string,
     actual_activity: string,
     inferred_intent: string,
@@ -279,25 +282,25 @@ and search queries.
 
 ```ts
 {
-  declared_attributes: {                     // usually {}
-    age_group?: "18 - 24" | "25 - 34" | "35 - 49" | "50 - 65" | "65+",   // ~11%
-    gender?: "Male" | "Female"                                           // ~8%
+  declared_attributes: {                     // {} in 65% of rows
+    age_group?: "18 - 24" | "25 - 34" | "35 - 49" | "50 - 65" | "65+",   // ~32%
+    gender?: "Male" | "Female"                                           // ~26%
   },
-  facts: {                                   // usually {}
-    market?: string,                         // ~9%, e.g. "en-US"
-    location_data?: {                        // ~9%
+  facts: {                                   // {} in 55% of rows
+    market?: string,                         // ~28%, e.g. "en-US"
+    location_data?: {                        // ~30%
       current_location: string,
       place_frequency:  [{ place: string,  count: int }],
-      region_frequency: [{ region: string, count: int }],
-      recent_visits?: string[]
+      region_frequency?: [{ region: string, count: int }],   // ~97% of location_data
+      recent_visits?: string[]                               // ~53% of location_data
     },
-    linkedin_profile?: {                     // ~4%; sparse fields, each a string or string[]
-      profile_geo: string,
+    linkedin_profile?: {                     // ~16%; sparse fields, each a string or string[]
+      profile_geo?: string,                  // 99.9% of linkedin_profile
       industries?, degree?, degrees?, fieldOfStudy?, areas?, titles?, current_roles?,
       yearsOfExperience?, experience_band?, seniorities?, functions?, companies?, current_company?
     }
   },
-  interests: [{                              // 1–164, median 38
+  interests: [{                              // 1–190, median 44
     interest_name: string,
     actual_activity: string,
     inferred_intent: string,
@@ -308,8 +311,8 @@ and search queries.
     last_detect_date: "YYYY-MM-DD",
     source: Source[],
     topics: string[],
-    predicted_queries?: string[],            // ~68%, from L3 Commercial
-    products?: string[],                     // ~52%
+    predicted_queries?: string[],            // ~66%, from L3 Commercial
+    products?: string[],                     // ~51%
     brands?: string[]                        // ~44%
   }]
 }
@@ -337,15 +340,16 @@ type Attr = { evidence: string[], value: string, confidence: Level, source: Attr
     home_location: Attr,                     // place name | "Unknown"
     occupation: Attr,                        // occupation category | "Unknown"
     company: Attr,                           // company name | "Self-Employed" | "Unknown"
-    career_stage: Attr,                      // "Student" | "Entry Level" | "Senior Professional"
-                                             //   | "Director/Executive" | "Business Owner/Self-Employed"
-                                             //   | "Retired" | "Unknown"
+    career_stage: Attr,                      // "Student" | "Entry Level" | "Mid-Level Professional"
+                                             //   | "Senior Professional" | "Manager" | "Director/Executive"
+                                             //   | "Business Owner/Self-Employed" | "Retired"
+                                             //   | "Not in Workforce" | "Unknown"
     education_area: Attr                     // field of study | "Unknown"
   },
   biography: string                          // 2–3 sentences
 }
 
-type AgeSignals = {                          // present ~89%
+type AgeSignals = {                          // present ~68%
   later_life_status: boolean,
   later_life_clusters: ("home_garden" | "leisure_travel_clubs" | "savings_income" | "heritage_hobbies"
                       | "classic_media" | "health_aging" | "grandchildren")[],
@@ -375,7 +379,7 @@ type AgeSignals = {                          // present ~89%
 ```ts
 {
   life_stage: { value: string, confidence: Level, evidence: string[] },   // L4 Biography output
-  commercial_interests: [{                   // 1–92, median 25
+  commercial_interests: [{                   // 1–114, median 27
     interest_name: string,
     persona: string,
     brands: string[],
@@ -412,7 +416,8 @@ type AdsVertical = "HomeGarden" | "ComputersConsumerElectronics" | "RetailersGen
                  | "SportsFitness";          // Ads Vertical L1
 type ShopperType = "ResearchDriven" | "DealDriven" | "BrandRetailerLoyal" | "ValueDriven"
                  | "NoveltySeeker" | "ConvenienceDriven" | "PremiumDriven";
-type Diet        = "Unknown" | "Vegan" | "Vegetarian" | "No Gluten" | "Low-Carb" | "Keto" | "Halal" | "Dairy-Free";
+type Diet        = "Unknown" | "Vegan" | "Vegetarian" | "No Gluten" | "Low-Carb" | "Keto" | "Halal" | "Dairy-Free"
+                 | "Kosher" | "Pescatarian" | "Paleo" | "No Nuts";    // the last 4 are rare (25 occurrences)
 ```
 
 **Notes**
@@ -432,7 +437,7 @@ search queries.
 {
   personal_context: string,        // Markdown list or "": Market, Current location, Age group, Gender,
                                    //   Recent visits
-  professional_context: string,    // Markdown list, "" in ~94%: Current company, Current roles, Functions,
+  professional_context: string,    // Markdown list, "" in ~88%: Current company, Current roles, Functions,
                                    //   Industries, Seniorities, Years of experience, Degrees, Education areas
   commercial_preferences: string,  // a JSON string: parse it again (format below)
   commercial_interests: string,    // Markdown, one block per interest (format below)
@@ -450,7 +455,7 @@ search queries.
   subscription_affinity?: { value: Scale, confidence_score: float },
   affinity: {
     shopping: {
-      product_categories: [{ category: string, description: string }],
+      product_categories?: [{ category: string, description: string }],   // missing in 1 row
       shopper_type?: { value: ShopperType[], confidence_score: float }
     },
     dining?: { restrictions: { value: Diet[], confidence_score: float } }
@@ -458,7 +463,7 @@ search queries.
 }
 ```
 
-`commercial_interests` block:
+`commercial_interests` block (in < 0.1% of rows a block misses its Category, Persona, Activity, or Intent line):
 
 ```md
 ### Interest 1: <interest_name>
@@ -478,13 +483,13 @@ search queries.
 
 ```ts
 {
-  missions: [{                                   // 1–15, median 12
+  missions: [{                                   // 0–16, median 12 (13 rows have none)
     mission_name: string,                        // in query_language
     source_interests: string[],                  // exact input interest names
     scenarios: ("shopping" | "travel" | "technology" | "hobbies" | "learning" | "fitness" | "dining")[],
     predicted_brands: string[],                  // ≤ 3 new brands
     predicted_queries: [{                        // 1–4
-      query: string,                             // 2–7 words, in query_language
+      query: string,                             // 1–7 words (median 4), in query_language
       value_type: "explore" | "refine" | "advance",
       source_query_refs: string[],               // Existing queries it improves on
       delta_source: "commercial_preference" | "source_interest" | "personal_context"
