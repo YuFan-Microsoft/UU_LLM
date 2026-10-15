@@ -12,6 +12,7 @@ import multiprocessing.connection
 import os
 from pathlib import Path
 import shutil
+import socket
 
 # user_profile_rules (a copy of the trainer's rollout rules) finds fastText lid.176.bin here, downloading it if missing.
 os.environ.setdefault("LID_MODEL_PATH", str(Path(__file__).resolve().parents[2] / "models" / "lid.176.bin"))
@@ -30,6 +31,7 @@ L34_STAGES = [task.stage for task in layer3.TASKS + layer4.TASKS]
 PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL, L3_DONE, L3_TOTAL, L4_DONE, L4_TOTAL = range(FIELDS := 9)
 PHASES = ["loading", "layer1", "layer2", "layer3", "layer4", "done"]
 REFRESH_SECONDS = 2
+LID_DOWNLOAD_TIMEOUT_SECONDS = 60  # per socket operation: a stalled download fails instead of hanging
 # vLLM engine settings. "original" is the setting this script always used; "best" mirrors
 # code/prod_deployment/best_qwen35_prod_server.sh (keep them in sync). None = vLLM's default (not passed).
 ENGINE_PRESETS = {
@@ -98,6 +100,23 @@ def rule_metrics(calls: list[dict]) -> dict:
         stage, _, metric = name.partition("/")
         metrics.setdefault(stage, {})[metric] = round(value, 4)
     return metrics
+
+
+def prepare_language_tools() -> None:
+    """Downloads (once, in this process) and loads fastText lid.176.bin before the engines start. The engines first
+    need it when scoring Layer 3, hours into the run; there each would download it itself, with no timeout."""
+    path = user_profile_rules.LID_MODEL_PATH
+    if not path.exists():
+        print(f"Downloading {user_profile_rules.LID_MODEL_URL} to {path}", flush=True)
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(LID_DOWNLOAD_TIMEOUT_SECONDS)
+    try:
+        user_profile_rules.language_tools()
+    except Exception as error:
+        raise RuntimeError(f"Cannot load the fastText language-ID model {path}; copy lid.176.bin there (or set "
+                           f"LID_MODEL_PATH) from {user_profile_rules.LID_MODEL_URL}, and install fasttext") from error
+    finally:
+        socket.setdefaulttimeout(previous)
 
 
 def engine_kwargs(args: argparse.Namespace) -> dict:
@@ -372,6 +391,7 @@ def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], 
 
 def main() -> None:
     args = parse_args()
+    prepare_language_tools()
     args.output_dir.mkdir(parents=True, exist_ok=True)
     raw_path = args.output_dir / "raw_behaviors.tmp.jsonl"
     with raw_path.open("w", encoding="utf-8") as raw:

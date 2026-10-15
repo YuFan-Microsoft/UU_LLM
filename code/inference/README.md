@@ -268,7 +268,9 @@ call's first sample is also scored with the in-training rollout rules (`user_pro
 same metrics as W&B `<Task>_Evaluation/*` during training: `json_valid_ratio`, `rule_based_pass_ratio`,
 `truncated_ratio` and the task's own ratios (e.g. `topic_evidence_valid_ratio` for L1, `input_match_ratio` for L2 /
 L3 / L4 Hyper, `query_language_match_ratio_*` for L3 Commercial). The run ends with one line per task of these values.
-fastText `lid.176.bin` (language checks) is read from `UU_LLM/models/` (`LID_MODEL_PATH`) and downloaded if missing.
+fastText `lid.176.bin` (language checks) is read from `UU_LLM/models/` (`LID_MODEL_PATH`). The main process downloads
+it if missing (60 s socket timeout) and loads it before starting the engines, so a missing file, no network or no
+`fasttext` fails at once instead of hanging at the end of Layer 3. Without internet access, copy the file there first.
 
 To re-run Layers 3 and 4 with maiprofilev3dev's own LLM steps instead, run it on the same raw data (or with the same
 grid start date):
