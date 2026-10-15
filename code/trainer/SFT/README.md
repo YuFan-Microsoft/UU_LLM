@@ -322,6 +322,7 @@ Raw logs: `user_logs/training_speed_baseline_zero3.log`,
 | `user_profile_rules.py` | Layer-1 / Layer-2 rule checks and the rollout metrics |
 | `evaluate_user_profile_vllm.py` | Standalone vLLM evaluation of a saved checkpoint |
 | `run_user_profile_multi_gpu.sh` | Launch script for user-profile SFT |
+| `run_user_profile_multi_gpu_2B.sh` | Same run with Qwen3.5-2B (only the model path, output directory and W&B run name differ) |
 | `run_multi_gpu.sh` | Launch script for generic SFT (UltraData Chinese) |
 
 ## Environment
@@ -340,6 +341,7 @@ export HF_TOKEN=...   # needs access to yufan/user_profile_dataset
 sh run_user_profile_multi_gpu.sh                  # perplexity + vLLM rollout eval on the whole test split (default)
 ROLLOUT_EVAL=0 sh run_user_profile_multi_gpu.sh   # perplexity eval only
 ROLLOUT_EVAL_SAMPLES=256 sh run_user_profile_multi_gpu.sh   # roll out 256 examples per task (debug)
+sh run_user_profile_multi_gpu_2B.sh               # the same run with Qwen3.5-2B
 ```
 
 The script evaluates on the whole V2 test split (52,639 rows over the 8 configs) every 2000 steps
