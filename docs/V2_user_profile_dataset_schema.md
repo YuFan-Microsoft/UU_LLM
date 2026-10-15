@@ -13,11 +13,11 @@ For every config this guide shows what the model reads (**Input**) and what it m
 | `V2_User_Profile_L1_gpt56` | Raw activities → interests | 267,810 | 5,378 |
 | `V2_User_Profile_L1_Negative_gpt56` | Negative feedback → rejected topics | 557,734 | 11,184 |
 | `V2_User_Profile_L2_gpt56` | Existing profile + new interests → merge / add decisions | 259,918 | 5,199 |
-| `V2_User_Profile_L3_Commercial_gpt56` | Interests → commercial label, brands, search queries | 34,722 | 1,712 |
-| `V2_User_Profile_L3_Persona_gpt56` | Interests → persona + category | 19,258 | 966 |
-| `V2_User_Profile_L4_Biography_gpt56` | Interests + facts → life stage, attributes, biography | 19,482 | 973 |
-| `V2_User_Profile_L4_CommercialPreference_gpt56` | Commercial interests → shopping preferences | 16,311 | 811 |
-| `V2_User_Profile_L4_Hyper_gpt56` | Commercial interests + context → ad missions + new queries | 11,584 | 567 |
+| `V2_User_Profile_L3_Commercial_gpt56` | Interests → commercial label, brands, search queries | 145,277 | 7,059 |
+| `V2_User_Profile_L3_Persona_gpt56` | Interests → persona + category | 77,312 | 3,780 |
+| `V2_User_Profile_L4_Biography_gpt56` | Interests + facts → life stage, attributes, biography | 161,793 | 8,103 |
+| `V2_User_Profile_L4_CommercialPreference_gpt56` | Commercial interests → shopping preferences | 141,250 | 7,093 |
+| `V2_User_Profile_L4_Hyper_gpt56` | Commercial interests + context → ad missions + new queries | 94,514 | 4,843 |
 
 ---
 
@@ -483,13 +483,13 @@ search queries.
 
 ```ts
 {
-  missions: [{                                   // 0–16, median 12 (13 rows have none)
+  missions: [{                                   // 0–17, median 12 (128 rows have none)
     mission_name: string,                        // in query_language
     source_interests: string[],                  // exact input interest names
     scenarios: ("shopping" | "travel" | "technology" | "hobbies" | "learning" | "fitness" | "dining")[],
     predicted_brands: string[],                  // ≤ 3 new brands
     predicted_queries: [{                        // 1–4
-      query: string,                             // 1–7 words (median 4), in query_language
+      query: string,                             // 1–8 words (median 4), in query_language
       value_type: "explore" | "refine" | "advance",
       source_query_refs: string[],               // Existing queries it improves on
       delta_source: "commercial_preference" | "source_interest" | "personal_context"
