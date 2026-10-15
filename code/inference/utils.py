@@ -273,7 +273,6 @@ def load_users(rows) -> dict[str, list[dict]]:
             action = (behavior.get("action") or "")[:MAX_ACTION_CHARS]
             if day >= MIN_VALID_DATE and action:
                 behaviors.append({"date": day, "source": behavior["source"], "action": action,
-                                  "intent": behavior.get("intent") or "",
                                   "detailed_source": behavior.get("detailed_source") or ""})
         users[row["user_id"]] = sorted(behaviors, key=lambda b: b["date"])
     return {user_id: users[user_id] for user_id in sorted(users) if users[user_id]}  # pipeline.py: users with signals

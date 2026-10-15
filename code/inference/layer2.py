@@ -3,6 +3,7 @@ to the user's previous snapshot. There is no temporal classification (the produc
 every class the same daily decay of 1.0, so untouched interests decay by DECAY_BASE per day exactly as in production."""
 
 from datetime import date, datetime
+import json
 
 from utils import HERE, INPUT_MARKER, PROMPT_BUDGET, dumps, layer2_keys_valid, normalize_language_tag
 
@@ -116,8 +117,46 @@ def _sources(topics: list[dict]) -> list:
     return list(dict.fromkeys(s for topic in topics for s in topic.get("source", [])))
 
 
+def _valid_evidence_date(value) -> bool:
+    """activity_support.parse_support_time accepts it: YYYYMMDD or an ISO date / timestamp."""
+    if not isinstance(value, str) or not value.strip():
+        return False
+    text = value.strip()
+    try:
+        if len(text) == 8 and text.isdigit():
+            datetime.strptime(text, "%Y%m%d")
+        else:
+            datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return False
+    return True
+
+
+def _evidence_sort_key(evidence) -> tuple[int, str]:
+    if not isinstance(evidence, dict) or not isinstance(evidence.get("date"), str):
+        return 0, ""
+    try:
+        return 1, datetime.fromisoformat(evidence["date"][:10]).date().isoformat()
+    except ValueError:
+        return 0, ""
+
+
 def _merge_evidence(a: list, b: list) -> list:
-    return sorted(list(a or []) + list(b or []), key=lambda e: e.get("date", ""))[-3:]
+    """layer2_postmerge._merge_evidence: drop evidence with an invalid date, keep the first of the items identical on
+    (date, source, action), sort by date and keep the 3 most recent."""
+    seen, merged = set(), []
+    for evidence in (a if isinstance(a, list) else []) + (b if isinstance(b, list) else []):
+        if isinstance(evidence, dict):
+            if not _valid_evidence_date(evidence.get("date")):
+                continue
+            key = json.dumps({k: evidence.get(k) for k in ("date", "source", "action")},
+                             sort_keys=True, ensure_ascii=False, default=str)
+        else:
+            key = json.dumps(evidence, ensure_ascii=False, default=str)
+        if key not in seen:
+            seen.add(key)
+            merged.append(evidence)
+    return sorted(merged, key=_evidence_sort_key)[-3:]
 
 
 def _prune_sort(items: list[dict]) -> list[dict]:
@@ -260,35 +299,44 @@ def postmerge(user_id: str, date_str: str, decisions: list[dict] | None, delta: 
     prev = _date(prev_snapshot["date"]) if prev_snapshot and prev_snapshot.get("date") else cur
     delta_by_name = {i.get("interest_name", "").lower(): i for i in delta.get("interests", [])}
     snapshot_by_name = {i.get("interest_name", "").lower(): i for i in (prev_snapshot or {}).get("interests", [])}
-    consumed, interests, index = set(), [], {}
+    consumed, interests = set(), []
 
     for decision in decisions or []:
-        if (decision.get("action") or "add").lower() == "merge":
-            merged = _merge(decision, delta_by_name, snapshot_by_name, cur, prev)
-            snapshot_name = (decision.get("snapshot_interest_name") or "").lower()
-            merged_name = merged.get("interest_name", "").lower()
-            consumed.update(name for name in (snapshot_name, merged_name) if name)
-            if snapshot_name:
-                snapshot_by_name[snapshot_name] = merged
-            if merged_name and merged_name != snapshot_name:
-                snapshot_by_name[merged_name] = merged
-            if merged_name in index:
-                interests[index[merged_name]] = merged
-            else:
-                index[merged_name] = len(interests)
-                interests.append(merged)
+        action = (decision.get("action") or "add").lower()
+        snapshot_name = (decision.get("snapshot_interest_name") if action == "merge"
+                         else decision.get("delta_interest_name") or decision.get("merged_interest_name") or "")
+        snapshot_name = (snapshot_name or "").lower()
+        # The interest this decision updates: an original snapshot interest, or one already built in this window
+        # (several decisions may reinforce the same interest, and an "add" may repeat a name).
+        target = snapshot_by_name.get(snapshot_name)
+        if action == "merge":
+            item = _merge(decision, delta_by_name, snapshot_by_name, cur, prev)
+        elif target is not None:  # an "add" that names an existing interest is a merge into it
+            item = _merge({"delta_interest_name": decision.get("delta_interest_name") or "",
+                           "snapshot_interest_name": snapshot_name,
+                           "merged_interest_name": target.get("interest_name", ""),
+                           "merged_actual_activity": decision.get("actual_activity") or "",
+                           "merged_inferred_intent": decision.get("inferred_intent") or ""},
+                          delta_by_name, snapshot_by_name, cur, prev)
         else:
             item = _add(decision, delta_by_name, cur)
-            name = item.get("interest_name", "").lower()
-            if name in snapshot_by_name:  # an "add" that names an existing interest is a merge into it
-                existing = snapshot_by_name[name].get("interest_name", "")
-                item = _merge({"delta_interest_name": decision.get("delta_interest_name") or "",
-                               "snapshot_interest_name": existing, "merged_interest_name": existing,
-                               "merged_actual_activity": decision.get("actual_activity") or "",
-                               "merged_inferred_intent": decision.get("inferred_intent") or ""},
-                              delta_by_name, snapshot_by_name, cur, prev)
-                consumed.add(name)
-            index.setdefault(name, len(interests))
+
+        # Every name of the updated interest, and of an interest whose name the result takes, now points to the
+        # result, which replaces their earlier versions in place (the result's name wins on a collision).
+        result_name = item.get("interest_name", "").lower()
+        colliding = snapshot_by_name.get(result_name)
+        aliases = {name for name, value in snapshot_by_name.items()
+                   if value is not None and (value is target or value is colliding)}
+        aliases.update(name for name in (snapshot_name, result_name) if name)
+        for name in aliases:
+            snapshot_by_name[name] = item
+        consumed.update(aliases)
+        replaced = [position for position, value in enumerate(interests) if value is target or value is colliding]
+        if replaced:
+            interests[replaced[0]] = item
+            for position in reversed(replaced[1:]):
+                del interests[position]
+        else:
             interests.append(item)
 
     interests += [_decay(dict(i), cur, prev) for i in (prev_snapshot or {}).get("interests", [])

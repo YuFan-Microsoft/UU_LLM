@@ -60,7 +60,7 @@ def to_record(user_id: str, date_str: str, output: dict | None, signals: list[di
     actual_activity / inferred_intent text. An answer that never
     became valid gives no interests, like an unparseable layer1_delta response. predicted_content_locale is kept
     only when it is a valid language tag (Layer1Delta: normalize_language_tag). The evidence keeps each signal's
-    intent and detailed source from the input, although the model does not see them.
+    detailed source from the input, although the model does not see it, and, like production, no intent.
     """
     locale = normalize_language_tag((output or {}).get("predicted_content_locale"))
     interests = []
@@ -76,8 +76,8 @@ def to_record(user_id: str, date_str: str, output: dict | None, signals: list[di
                 "topic": topic["topic"],
                 "source": topic["source"],
                 "evidence": [{"date": signals[i]["date"], "source": [signals[i]["source"]],
-                              "detailed_source": signals[i]["detailed_source"], "action": signals[i]["action"],
-                              "intent": signals[i]["intent"]} for i in indices],
+                              "detailed_source": signals[i]["detailed_source"], "action": signals[i]["action"]}
+                             for i in indices],
             })
         interests.append({
             "interest_name": interest["interest_name"],

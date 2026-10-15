@@ -17,7 +17,7 @@ from utils import (dumps, l4_biography_keys_valid, l4_commercial_preference_keys
 SCENARIOS = {"shopping", "dining", "learning", "travel", "hobbies", "fitness", "technology"}
 ENRICHMENT_SOURCES = ("cross_interest", "commercial_preference", "personal_context", "professional_context")
 DELTA_SOURCES = {"source_interest", *ENRICHMENT_SOURCES}
-SCALE = ("Low", "Medium-Low", "Medium", "Medium-High", "High")
+MIN_HYPER_CONFIDENCE = 0.3  # hyper_preferences: preferences below this confidence are not shown to the hyper call
 # Query languages written without spaces between words; their query word counts are not checked.
 UNSPACED_LANGUAGES = {"ja", "zh", "zh-Hans", "zh-Hant", "th"}
 
@@ -129,34 +129,65 @@ class CommercialPreference(Task):
                                    "dining": {"restrictions": restrictions}}
         return self.record(profile, commercial_preferences=preferences)
 
+    @staticmethod
+    def _projected_value(item) -> dict | None:
+        """hyper_preferences._preference_value: {value[, confidence_score]} of a preference with a known value and a
+        confidence_score in [0, 1] of at least MIN_HYPER_CONFIDENCE (or none); None otherwise."""
+        if not isinstance(item, dict):
+            return None
+        value = item.get("value")
+        values = value if isinstance(value, list) else [value]
+        if not any(isinstance(v, str) and v.strip() and v.strip().casefold() != "unknown" for v in values):
+            return None
+        confidence = item.get("confidence_score")
+        if confidence is not None:
+            if (isinstance(confidence, bool) or not isinstance(confidence, (int, float)) or not math.isfinite(confidence)
+                    or not 0 <= confidence <= 1 or confidence < MIN_HYPER_CONFIDENCE):
+                return None
+            return {"value": value, "confidence_score": confidence}
+        return {"value": value}
+
     @classmethod
     def to_json(cls, record: dict) -> str:
-        """The hyper input's commercial_preferences: a JSON string of the short form (docs/V2_user_profile_dataset_
-        schema.md, L4 Hyper): each known dimension as {value, confidence_score}; under affinity.shopping the product
-        categories and shopper types when present; dining restrictions only when not ["Unknown"]."""
-        preferences = record.get("commercial_preferences") or {}
+        """The hyper input's commercial_preferences, as the production hyper step builds it
+        (hyper_preferences.project_commercial_preferences, then _format_commercial_preferences): the minified JSON of
+        each dimension, shopper type and dining restriction with a known value and a confidence_score of at least 0.3
+        (as {value, confidence_score}) and the product categories, without empty containers; "" when nothing is left."""
+        preferences = record.get("commercial_preferences")
+        if not isinstance(preferences, dict):
+            return ""
         short = {}
-        for key in cls.DIMENSIONS:
-            item = preferences.get(key)
-            if isinstance(item, dict) and item.get("value") in SCALE:
-                short[key] = {"value": item["value"], "confidence_score": item.get("confidence_score", 0.0)}
+        for current, legacy in (("discount_sensitivity", "deal_seeking"), ("price_sensitivity", "price_tier"),
+                                ("subscription_affinity", "subscription_preference")):
+            key = current if current in preferences else legacy
+            value = cls._projected_value(preferences.get(key))
+            if value:
+                short[key] = value
         affinity = preferences.get("affinity") or {}
-        shopping_in = affinity.get("shopping") or {}
+        if not isinstance(affinity, dict):
+            return dumps(short) if short else ""
+        shopping_in, dining_in = affinity.get("shopping") or {}, affinity.get("dining") or {}
+        shopping_in = shopping_in if isinstance(shopping_in, dict) else {}
+        dining_in = dining_in if isinstance(dining_in, dict) else {}
+        categories = shopping_in.get("product_categories") or []
+        categories = [{key: c[key] for key in ("category", "description") if c.get(key) not in (None, "")}
+                      for c in (categories if isinstance(categories, list) else [])
+                      if isinstance(c, dict) and isinstance(c.get("category"), str) and c["category"].strip()]
         shopping = {}
-        categories = [{"category": c["category"], "description": c.get("description", "")}
-                      for c in shopping_in.get("product_categories") or [] if isinstance(c, dict) and c.get("category")]
         if categories:
             shopping["product_categories"] = categories
-        shopper_type = shopping_in.get("shopper_type") or {}
-        if isinstance(shopper_type, dict) and shopper_type.get("value"):
-            shopping["shopper_type"] = {"value": shopper_type["value"],
-                                        "confidence_score": shopper_type.get("confidence_score", 0.0)}
-        short["affinity"] = {"shopping": shopping}
-        restrictions = (affinity.get("dining") or {}).get("restrictions") or {}
-        if isinstance(restrictions, dict) and restrictions.get("value") and restrictions["value"] != ["Unknown"]:
-            short["affinity"]["dining"] = {"restrictions": {
-                "value": restrictions["value"], "confidence_score": restrictions.get("confidence_score", 0.0)}}
-        return dumps(short)
+        shopper_type = cls._projected_value(shopping_in.get("shopper_type"))
+        if shopper_type:
+            shopping["shopper_type"] = shopper_type
+        restrictions = cls._projected_value(dining_in.get("restrictions"))
+        projected_affinity = {}
+        if shopping:
+            projected_affinity["shopping"] = shopping
+        if restrictions:
+            projected_affinity["dining"] = {"restrictions": restrictions}
+        if projected_affinity:
+            short["affinity"] = projected_affinity
+        return dumps(short) if short else ""
 
 
 # ---------------------------------------------------------------------------
@@ -470,9 +501,8 @@ def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
 
     for p in profiles:
         item = items[p.user_id]
-        # commercial_preference is a usable delta source only when the preferences say something.
-        allowed = {"commercial_preference"} if preferences[p.user_id] != dumps({"affinity": {"shopping": {}}}) \
-            else set()
+        # commercial_preference is a usable delta source only when the hyper input shows some preference.
+        allowed = {"commercial_preference"} if preferences[p.user_id] else set()
         missions = HYPER.missions(item["output"], catalogs[p.user_id], allowed, p.language["locale"]) \
             if output(item) else []
         hyper = hyper_record(p, missions, failed=bool(item) and item["output"] is None)

@@ -76,8 +76,8 @@ are the settings of the run the SFT data comes from (the V2 L1 inputs have exact
 signals; maiprofilev3dev's own defaults add Copilot / LinkedIn and allow 1000). The user message is
 `prompt_l1.md + "\nInput:\n"` followed by one minified JSON object per signal and line,
 `{"idx":0,"date":"YYYY-MM-DD","source":"Bing","action":"..."}`, with the signals sorted by date and numbered from 0,
-exactly as the SFT data. The model does not see the behaviors' `intent` (the V2 input has none); it is only kept in
-the evidence of the Layer-1 record. Prompts are trimmed to leave 8192 of the 32768 context tokens for the answer
+exactly as the SFT data. The behaviors' `intent` is not used: the model does not see it (the V2 input has none) and,
+as in production, the evidence of the Layer-1 record does not store it. Prompts are trimmed to leave 8192 of the 32768 context tokens for the answer
 (at most 10240 answer tokens; the V2 SFT length is 25600, within Qwen3.5's native 262144-token context): L1 drops
 the lowest-priority / oldest signals.
 
@@ -130,7 +130,7 @@ the two postprocessing records copy the snapshot, so they keep its `date` (the u
 | — | `layer3_postprocessing` | rule: persona / category and commercial fields merged by exact name into the gated interests, sorted by confidence | — |
 | 2 | `layer4_biography` | `{"declared_attributes": {}, "facts": {}, "interests"}`: the Layer-3 interests highest `count` first (name, activity, intent, persona, confidence, count, dates, source, topic names, and the brands / products / predicted queries when not empty) | no interest |
 | 3 | `layer4_commercial_preference` | `life_stage` from the biography, commercial interests (persona, brands, retailers, products, topics with evidence actions), non-commercial names; then the rule-based `confidence_score`s and defaults | no commercial interest |
-| 4 | `layer4_hyper_commercial_interest` (discovery + enhancement in one call) | `personal_context` / `professional_context` `""`, `commercial_preferences` (JSON string of the short form: each known dimension as `{value, confidence_score}`, product categories, shopper types, dining restrictions when not Unknown), the `### Interest N` blocks of the commercial interests, `query_language` | no commercial interest |
+| 4 | `layer4_hyper_commercial_interest` (discovery + enhancement in one call) | `personal_context` / `professional_context` `""`, `commercial_preferences` (JSON string of the short form, as production's `project_commercial_preferences`: each dimension, shopper type and dining restriction with a known value and `confidence_score` >= 0.3 as `{value, confidence_score}`, the product categories, no empty containers; `""` when nothing is left), the `### Interest N` blocks of the commercial interests, `query_language` | no commercial interest |
 | — | `layer4_postprocessing` | rule: Layer-3 snapshot + biography, life stage, `user_attributes`, commercial preferences, `enriched_commercial_interests`, and the missions appended to `interests` as `hyper_commercial` | — |
 
 Payloads follow the V2 SFT data (`docs/V2_user_profile_dataset_schema.md`) with the user-context fields empty, as in
@@ -169,6 +169,10 @@ come from replacing the LLM calls with a 25600-token model trained on the V2 dat
   does counts as an unparseable response (no Layer-1 interests; synthetic adds in Layer 2; empty Layer-3 / Layer-4
   output). Where production fails the whole hyper step after exhausted validation retries, this script leaves that
   user without missions and marks the hyper record with `_failed`.
+- The hyper input's `commercial_preferences` follows the current maiprofilev3dev projection
+  (`hyper_preferences.project_commercial_preferences`): preferences with a `confidence_score` below 0.3 and empty
+  containers are left out, and `commercial_preference` is an allowed delta source only when something is left. This
+  has not been checked against the V2 hyper rows (built from MAIProfile_Official runs).
 - There is no user context, world knowledge or negative feedback: declared attributes and facts are `{}`, the
   personal / professional context is `""`, the event filter is not called, `negative_interests` is `[]` and the
   query language never comes from a Market. (In the V2 data, about half of the biography rows carry declared
