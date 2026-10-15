@@ -1,19 +1,19 @@
-"""Layer 1: one model call replaces maiprofilev3dev's layer1_delta -> layer1_actual -> layer1_intent and gives the
+"""Layer 1: one model call replaces the production layer1_delta -> layer1_actual -> layer1_intent and gives the
 layer1_postprocessing record."""
 
 from utils import (HERE, INPUT_MARKER, MAX_SIGNAL_ACTIONS, PROMPT_BUDGET, cap, dumps, layer1_keys_valid,
                    normalize_language_tag)
 
-# Must stay identical to UU_LLM/prompts/prompt_l1.md, the prompt of the V1 SFT data.
+# Must stay identical to UU_LLM/prompts/prompt_l1.md, the prompt of the V2 SFT data.
 PROMPT = (HERE / "prompts" / "prompt_l1.md").read_text(encoding="utf-8")
 
 
 def build_message(signals: list[dict]) -> str:
-    """Same input table as layer1_step3_build_sft_data.build_input."""
-    days = {}
-    for idx, signal in enumerate(signals):
-        days.setdefault(signal["date"], []).append([idx, signal["source"], signal["action"], signal["intent"]])
-    return PROMPT + INPUT_MARKER + dumps({"columns": ["idx", "source", "action", "intent"], "days": days})
+    """Same input as layer1_step3_build_sft_data: the date-sorted signals numbered 0..n-1, one minified
+    {"idx", "date", "source", "action"} object per line (no intent or detailed source)."""
+    lines = [dumps({"idx": idx, "date": signal["date"], "source": signal["source"], "action": signal["action"]})
+             for idx, signal in enumerate(signals)]
+    return PROMPT + INPUT_MARKER + "\n".join(lines)
 
 
 def fit_prompt(signals: list[dict], encode) -> tuple[list[dict], list[int]]:
@@ -53,13 +53,14 @@ def evidence_index(ref) -> int | None:
 
 
 def to_record(user_id: str, date_str: str, output: dict | None, signals: list[dict]) -> dict:
-    """layer1_postprocessing, built as maiprofilev3dev does from one answer instead of three calls.
+    """layer1_postprocessing, built as the production pipeline does from one answer instead of three calls.
 
     Layer1Delta keeps the interests and topics as the model wrote them and rebuilds evidence from the indices
-    (_reconstruct_evidence_from_indices: unknown / repeated indices are dropped); Layer1PostProcessing adds
-    temporal / decay defaults (LongTerm / 0.9) and the actual_activity / inferred_intent text. An answer that never
+    (_reconstruct_evidence_from_indices: unknown / repeated indices are dropped); Layer1PostProcessing adds the
+    actual_activity / inferred_intent text. An answer that never
     became valid gives no interests, like an unparseable layer1_delta response. predicted_content_locale is kept
-    only when it is a valid language tag (Layer1Delta: normalize_language_tag).
+    only when it is a valid language tag (Layer1Delta: normalize_language_tag). The evidence keeps each signal's
+    intent and detailed source from the input, although the model does not see them.
     """
     locale = normalize_language_tag((output or {}).get("predicted_content_locale"))
     interests = []
@@ -81,8 +82,6 @@ def to_record(user_id: str, date_str: str, output: dict | None, signals: list[di
         interests.append({
             "interest_name": interest["interest_name"],
             "topics": topics,
-            "temporal": "LongTerm",
-            "decay": 0.9,
             "actual_activity": interest["actual_activity"],
             "inferred_intent": interest["inferred_intent"],
         })

@@ -1,4 +1,4 @@
-"""Layer-1 to Layer-4 user-profile inference with one Qwen3.5 SFT checkpoint, reproducing maiprofilev3dev.
+"""Layer-1 to Layer-4 user-profile inference with one Qwen3.5 V2 SFT checkpoint, reproducing the production pipeline.
 
 See README.md in this directory.
 """
@@ -13,12 +13,15 @@ import os
 from pathlib import Path
 import shutil
 
-import layer1
-import layer2
-import layer3
-import layer4
-from task import UserProfile
-from utils import (MAX_MODEL_LEN, SPEC_FIELDS, SPEC_PER_POS, build_grid, build_prompt_ids, build_windows, dumps,
+# user_profile_rules (a copy of the trainer's rollout rules) finds fastText lid.176.bin here, downloading it if missing.
+os.environ.setdefault("LID_MODEL_PATH", str(Path(__file__).resolve().parents[2] / "models" / "lid.176.bin"))
+import layer1  # noqa: E402
+import layer2  # noqa: E402
+import layer3  # noqa: E402
+import layer4  # noqa: E402
+import user_profile_rules  # noqa: E402
+from task import UserProfile  # noqa: E402
+from utils import (MAX_MODEL_LEN, SPEC_FIELDS, SPEC_PER_POS, build_grid, build_prompt_ids, build_windows, dumps,  # noqa: E402
                    generate, load_users, new_item, read_rows, spec_counters, spec_summary, visible_gpus)
 
 LAYERS = ["layer1_postprocessing", "layer2_postmerge"]  # written for every window
@@ -74,6 +77,27 @@ def parse_args() -> argparse.Namespace:
         if getattr(args, key) is None:
             setattr(args, key, value)
     return args
+
+
+def score(item: dict) -> dict | None:
+    """The training rollout check (user_profile_rules.score_example) of the call's first sample: json_valid,
+    rule_pass, violations, stats and finish_reason. None for a prompt that was never generated (too long)."""
+    content = item.pop("content", None)
+    if content is None or "first_text" not in item:
+        return None
+    result = user_profile_rules.score_example([{"role": "user", "content": content}], item["first_text"])
+    return {**result, "finish_reason": item["first_finish_reason"]}
+
+
+def rule_metrics(calls: list[dict]) -> dict:
+    """Per task, the metrics of the in-training rollout evaluation (user_profile_rules.summarize_records) over the
+    first samples: json_valid_ratio, rule_based_pass_ratio, truncated_ratio and the task's own ratios."""
+    records = [{"config": call["stage"], "skipped": False, **call["score"]} for call in calls if call.get("score")]
+    metrics = {}
+    for name, value in user_profile_rules.summarize_records(records).items():
+        stage, _, metric = name.partition("/")
+        metrics.setdefault(stage, {})[metric] = round(value, 4)
+    return metrics
 
 
 def engine_kwargs(args: argparse.Namespace) -> dict:
@@ -148,7 +172,7 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
         l1_items = []
         for user_id, date_str, signals in windows:
             kept, prompt_ids = layer1.fit_prompt(signals, encode)
-            l1_items.append({**new_item(f"{user_id}|{date_str}", prompt_ids),
+            l1_items.append({**new_item(f"{user_id}|{date_str}", prompt_ids), "content": layer1.build_message(kept),
                              "user_id": user_id, "date": date_str, "signals": kept, "dropped": len(signals) - len(kept)})
         generate(llm, l1_items, layer1.is_valid, "l1", progress_bar=counter(L1_DONE), **sampling)
         progress[base + L1_DONE] = len(windows)  # also counts prompts too long to send
@@ -159,7 +183,7 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
             emit(kind="record", layer="layer1_postprocessing", date=item["date"], record=record)
             emit(kind="call", stage="l1", user_id=item["user_id"], date=item["date"], attempts=item["attempts"],
                  valid=item["output"] is not None, signals_dropped=item["dropped"],
-                 interests=len(record["interests"]), text=item["text"])
+                 interests=len(record["interests"]), score=score(item), text=item["text"])
         # Every user-window with Layer-1 interests after the user's first one is one Layer-2 call (the first starts
         # the snapshot without a call); exact unless a snapshot decays to nothing, corrected after Layer 2.
         with_interests = Counter(user_id for (user_id, _), record in deltas.items() if record["interests"])
@@ -179,7 +203,8 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
                     plans[user_id] = (mode, None, 0)
                     continue
                 prompt_ids, dropped = layer2.fit_prompt(snapshot, delta["interests"], encode)
-                plans[user_id] = (mode, new_item(f"{user_id}|{date_str}", prompt_ids), dropped)
+                content = layer2.build_message(snapshot[:len(snapshot) - dropped], delta["interests"])
+                plans[user_id] = (mode, {**new_item(f"{user_id}|{date_str}", prompt_ids), "content": content}, dropped)
             items = [item for _, item, _ in plans.values() if item]
             generate(llm, items, layer2.is_valid, "l2", progress_bar=counter(L2_DONE), **sampling)
             l2_done += len(items)
@@ -187,14 +212,13 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
 
             for user_id, (mode, item, dropped) in plans.items():
                 delta = deltas[(user_id, date_str)]
-                decisions, temporal = layer2.to_decisions(mode, delta["interests"], item and item["output"])
-                snapshots[user_id] = layer2.postmerge(user_id, date_str, decisions, delta, temporal,
-                                                      snapshots.get(user_id))
+                decisions = layer2.to_decisions(mode, delta["interests"], item and item["output"])
+                snapshots[user_id] = layer2.postmerge(user_id, date_str, decisions, delta, snapshots.get(user_id))
                 emit(kind="record", layer="layer2_postmerge", date=date_str, record=snapshots[user_id])
                 if item:
                     emit(kind="call", stage="l2", user_id=user_id, date=date_str, mode=mode,
                          attempts=item["attempts"], valid=item["output"] is not None, snapshot_dropped=dropped,
-                         actions=dict(Counter(d["action"] for d in decisions)), text=item["text"])
+                         actions=dict(Counter(d["action"] for d in decisions)), score=score(item), text=item["text"])
             for user_id, snapshot in snapshots.items():
                 if user_id not in plans:  # idle this window: pipeline._carry_forward keeps the record as is
                     snapshots[user_id] = {**snapshot, "_carried_forward": True}
@@ -209,6 +233,8 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
                 nonlocal done
                 progress[base + total_field] += len(items)
                 generate(llm, items, None, "l34", progress_bar=counter(done_field), **sampling)
+                for item in items:
+                    item["score"] = score(item)
                 done += len(items)
                 progress[base + done_field] = done
             return run_round
@@ -229,7 +255,7 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
     its model, so vLLM's loading logs come first. Each bar's clock (rate / ETA) starts at its layer's first finished
     call. Totals: Layer 1 is known up front; Layer 2 once an engine finishes Layer 1 (each user-window with Layer-1
     interests after the user's first one is one call); Layer 3 once an engine starts it (one round); Layer 4 grows
-    round by round (enhancement calls depend on the discovered missions). Only first attempts are counted."""
+    round by round (biography, commercial preference, hyper). Only first attempts are counted."""
     from tqdm import tqdm
 
     engines = len(processes)
@@ -317,7 +343,8 @@ def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], 
                          final: dict[str, dict]) -> None:
     """final_profiles.jsonl: per user, the raw past / future behaviors and the final profile, the user's
     layer4_postprocessing record (Layer-3-enriched interests with confidence >= 0.2 plus the hyper-commercial
-    missions, biography, life stage and commercial preferences); empty if the user never had a Layer-1 interest."""
+    missions, biography, life stage, user attributes and commercial preferences); empty if the user never had a
+    Layer-1 interest."""
     wanted = set(user_ids)
     with raw_path.open(encoding="utf-8") as source, (output_dir / "final_profiles.jsonl").open("w", encoding="utf-8") as out:
         for line in source:
@@ -336,6 +363,7 @@ def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], 
                 "interests": profile.get("interests", []),
                 "biography": profile.get("biography", ""),
                 "life_stage": profile.get("life_stage", {}),
+                "user_attributes": profile.get("user_attributes", {}),
                 "commercial_preferences": profile.get("commercial_preferences", {}),
                 "enriched_commercial_interests": profile.get("enriched_commercial_interests", []),
             }) + "\n")
@@ -363,7 +391,7 @@ def main() -> None:
     for row in rows:
         if row["kind"] == "record":
             files.setdefault((row["layer"], row["date"]), []).append(row["record"])
-    # Layer 1 / 2 files exist for every window, even empty (maiprofilev3dev --base-run needs them); Layer 3 / 4
+    # Layer 1 / 2 files exist for every window, even empty (the production --base-run needs them); Layer 3 / 4
     # files only for the windows where some user's final snapshot was built.
     for (layer, date_str), records in files.items():
         path = args.output_dir / date_str / f"{layer}.jsonl"
@@ -395,6 +423,8 @@ def main() -> None:
         "final_avg_hyper_missions": (
             sum(len(r["hyper_commercial_interests"]) for r in hyper) / len(hyper) if hyper else None),
         "hyper_failures": sum(bool(r.get("_failed")) for r in hyper),
+        # First samples scored with the training rollout rules (code/trainer/SFT/user_profile_rules.py).
+        "rule_metrics": rule_metrics(calls),
     }
     if args.num_speculative_tokens:
         # Whole run over all engines (retries included).
@@ -405,6 +435,17 @@ def main() -> None:
                                            **(spec_summary(totals) or {})}
     (args.output_dir / "inference_summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(summary, indent=2), flush=True)
+    print_rule_metrics(summary["rule_metrics"])
+
+
+def print_rule_metrics(metrics: dict) -> None:
+    """One line per task: the shared training-check ratios, then the task's own ratios."""
+    shared = ("json_valid_ratio", "rule_based_pass_ratio", "truncated_ratio")
+    print(f"\n{'task':<26}{'json_valid':>12}{'rule_pass':>12}{'truncated':>12}  other", flush=True)
+    for stage, values in metrics.items():
+        other = ", ".join(f"{k}={v}" for k, v in values.items() if k not in shared)
+        cells = "".join(f"{values[k]:>12.4f}" if k in values else f"{'-':>12}" for k in shared)
+        print(f"{stage:<26}{cells}  {other}", flush=True)
 
 
 if __name__ == "__main__":

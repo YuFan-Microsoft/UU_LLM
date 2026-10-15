@@ -10,8 +10,8 @@ import zlib
 
 HERE = Path(__file__).resolve().parent
 
-# maiprofilev3dev settings of the production run the SFT data comes from (mini_mai/config.py: --signal-source-priority
-# MSN,Bing,Ads,Shopping,Uet,Edge,ChromeImports --max-user-actions 200; the V1 L1 inputs have exactly these sources and
+# MAIProfile_Official settings of the GPT-5.6 run the V2 SFT data comes from (--signal-source-priority
+# MSN,Bing,Ads,Shopping,Uet,Edge,ChromeImports --max-user-actions 200; the V2 L1 inputs have exactly these sources and
 # at most 200 signals).
 SOURCE_RANK = {source: rank for rank, source in enumerate(  # signal_source_priority, best first
     ["MSN", "Bing", "Ads", "Shopping", "Uet", "Edge", "ChromeImports"])}
@@ -19,7 +19,7 @@ MAX_SIGNAL_ACTIONS = 200        # max_signal_actions (production --max-user-acti
 MAX_ACTION_CHARS = 128          # data_reader.clean_signals
 MIN_VALID_DATE = "2025-01-01"   # data_reader.MIN_VALID_DATE
 
-# SFT / rollout eval use 20,480 tokens; Qwen3.5 has a native 262,144-token context, so inference can use more.
+# SFT / rollout eval use 25,600 tokens; Qwen3.5 has a native 262,144-token context, so inference can use more.
 MAX_MODEL_LEN = 32768
 MAX_TOKENS = 10240
 MIN_OUTPUT_TOKENS = 8192        # prompts are trimmed until this many tokens are left for the answer
@@ -32,7 +32,7 @@ def dumps(value) -> str:
 
 
 # ---------------------------------------------------------------------------
-# maiprofilev3dev modules/query_language.py. There is no user context (Market) here, so the query language is
+# Production modules/query_language.py. There is no user context (Market) here, so the query language is
 # the snapshot's predicted_content_locale, else English.
 # ---------------------------------------------------------------------------
 
@@ -41,8 +41,8 @@ _COMPACT_BCP47 = re.compile(r"^(?P<language>[A-Za-z]{2,3})(?:-(?P<script>[A-Za-z
 
 def normalize_language_tag(value) -> str | None:
     """normalize_language_tag: a canonical compact BCP-47 tag, or None when invalid (or "mul" / "und"). The Layer-1
-    SFT labels also use "mix" (no single dominant language), which maiprofilev3dev never produces; it is treated
-    like no detected locale, so the query language falls back to the previous locale or English ("mix" never
+    SFT labels also use "mix" (no single dominant language), which the production pipeline never produces; it is
+    treated like no detected locale, so the query language falls back to the previous locale or English ("mix" never
     occurs as a query language in the L3 / L4 SFT data)."""
     if not isinstance(value, str):
         return None
@@ -64,23 +64,47 @@ def query_language(predicted_content_locale) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Copied from code/trainer/SFT so this directory runs on its own; keep them identical to the originals.
+# Copied from code/trainer/SFT/user_profile_rules.py so this directory runs on its own; keep them identical to the
+# originals. keys_valid of every task: exactly the expected keys at every level (any order) with the expected value
+# types, the "json_valid" of the rollout metrics.
 # ---------------------------------------------------------------------------
 
-INPUT_MARKER = "\nInput:\n"  # user_profile_INPUT_MARKER: between the prompt and the input JSON
+INPUT_MARKER = "\nInput:\n"  # between the prompt and the input
 
-L1_TOP_KEYS = {"predicted_content_locale", "interests"}
-L1_INTEREST_KEYS = {"interest_name", "topics", "actual_activity", "inferred_intent"}
-L1_TOPIC_KEYS = {"topic", "source", "evidence"}
-L2_DECISION_KEYS = {
-    "merge": {"action", "delta_interest_name", "snapshot_interest_name", "merged_interest_name",
-              "merged_actual_activity", "merged_inferred_intent", "temporal"},
-    "add": {"action", "delta_interest_name", "actual_activity", "inferred_intent", "temporal"},
-}
+
+class ListOf:
+    def __init__(self, item):
+        self.item = item
+
+
+NULL = type(None)
+
+
+def matches(value, schema):
+    """True when a parsed JSON value has the schema's shape and value types. A dict schema needs exactly its keys
+    (any order), ListOf(s) a list whose items all match s, a tuple any one of its options, a type that JSON type
+    (int excludes bool), and a function returns its own verdict."""
+    if isinstance(schema, dict):
+        return (isinstance(value, dict) and set(value) == set(schema)
+                and all(matches(value[key], item) for key, item in schema.items()))
+    if isinstance(schema, ListOf):
+        return isinstance(value, list) and all(matches(item, schema.item) for item in value)
+    if isinstance(schema, tuple):
+        return any(matches(value, option) for option in schema)
+    if schema is int:
+        return type(value) is int
+    if isinstance(schema, type):
+        return isinstance(value, schema)
+    return schema(value)
+
+
+def one_of(value, allowed):
+    """Enum check that is safe for any JSON value (lists and dicts are unhashable)."""
+    return isinstance(value, str) and value in allowed
 
 
 def parse_json_object(text):
-    """user_profile_parse_json_object: the parsed JSON object, or None if the text is not a JSON object."""
+    """The parsed JSON object, or None if the text is not a JSON object."""
     try:
         value = json.loads(text.strip())
     except json.JSONDecodeError:
@@ -88,38 +112,115 @@ def parse_json_object(text):
     return value if isinstance(value, dict) else None
 
 
+L1_SCHEMA = {
+    "predicted_content_locale": str,
+    "interests": ListOf({
+        "interest_name": str,
+        "topics": ListOf({"topic": str, "source": ListOf(str), "evidence": ListOf(int)}),
+        "actual_activity": str,
+        "inferred_intent": str,
+    }),
+}
+
+
 def layer1_keys_valid(output):
-    """user_profile_layer1_keys_valid: the top level, every interest and every topic have exactly the expected
-    keys, and interests / topics / source / evidence are lists."""
-    interests = output.get("interests")
-    if set(output) != L1_TOP_KEYS or not isinstance(interests, list):
-        return False
-    for interest in interests:
-        if not isinstance(interest, dict) or set(interest) != L1_INTEREST_KEYS:
-            return False
-        topics = interest["topics"]
-        if not isinstance(topics, list) or not all(
-            isinstance(topic, dict) and set(topic) == L1_TOPIC_KEYS
-            and isinstance(topic["source"], list) and isinstance(topic["evidence"], list)
-            for topic in topics
-        ):
-            return False
-    return True
+    return matches(output, L1_SCHEMA)
+
+
+L2_DECISION_KEYS = {
+    "merge": {"action", "delta_interest_name", "snapshot_interest_name", "merged_interest_name",
+              "merged_actual_activity", "merged_inferred_intent"},
+    "add": {"action", "delta_interest_name", "actual_activity", "inferred_intent"},
+}
 
 
 def layer2_keys_valid(output):
-    """user_profile_layer2_keys_valid: the top level is exactly {"decisions": [...]} and every decision has a
-    valid action and exactly the keys expected for that action."""
-    decisions = output.get("decisions")
-    if set(output) != {"decisions"} or not isinstance(decisions, list):
-        return False
-    return all(
-        isinstance(decision, dict)
-        and isinstance(decision.get("action"), str)
-        and decision["action"] in L2_DECISION_KEYS
-        and set(decision) == L2_DECISION_KEYS[decision["action"]]
-        for decision in decisions
-    )
+    """The V2 keys only (the trainer copy also accepts the V1 `temporal` key)."""
+    return matches(output, {"decisions": ListOf(lambda decision: (
+        isinstance(decision, dict) and one_of(decision.get("action"), L2_DECISION_KEYS)
+        and matches(decision, dict.fromkeys(L2_DECISION_KEYS[decision["action"]], str))))})
+
+
+def l3_persona_keys_valid(output):
+    return matches(output, {"interest_personas": ListOf({"interest_name": str, "category": str, "persona": str})})
+
+
+L3C_LIST_KEYS = ("brands", "retailers", "products", "predicted_queries")
+
+
+def l3_commercial_keys_valid(output):
+    return matches(output, {"interest_commercial": ListOf({
+        "interest_name": str, "commercial": bool, "commercial_score": (str, NULL), "intent_funnel_stage": (str, NULL),
+        **dict.fromkeys(L3C_LIST_KEYS, ListOf(str))})})
+
+
+L4B_ATTRIBUTES = ("age_group", "gender", "estimated_income_level", "home_location", "occupation", "company",
+                  "career_stage", "education_area")
+L4B_SIGNAL_FLAGS = ("later_life_status", "children_content", "own_current_study", "own_high_school",
+                    "household_signals", "news_heavy", "youth_culture_top5")
+L4B_ATTRIBUTE_SCHEMA = {"evidence": ListOf(str), "value": str, "confidence": str, "source": str}
+L4B_SIGNALS_SCHEMA = {**dict.fromkeys(L4B_SIGNAL_FLAGS, bool), "later_life_clusters": ListOf(str),
+                      "early_adult_events": ListOf(str)}
+
+
+def l4b_signals_shape(signals):
+    optional = {"linkedin_min_age": (int, NULL)} if isinstance(signals, dict) and "linkedin_min_age" in signals else {}
+    return matches(signals, {**L4B_SIGNALS_SCHEMA, **optional})
+
+
+def l4b_age_group_shape(attribute):
+    optional = {"signals": l4b_signals_shape} if isinstance(attribute, dict) and "signals" in attribute else {}
+    return matches(attribute, {**L4B_ATTRIBUTE_SCHEMA, **optional})
+
+
+L4B_SCHEMA = {
+    "life_stage": {"value": str, "confidence": str, "evidence": ListOf(str)},
+    "user_attributes": {
+        "age_group": l4b_age_group_shape,
+        "gender": {"lean": {"male": ListOf(str), "female": ListOf(str)}, **L4B_ATTRIBUTE_SCHEMA},
+        **dict.fromkeys(L4B_ATTRIBUTES[2:], L4B_ATTRIBUTE_SCHEMA),
+    },
+    "biography": str,
+}
+
+
+def l4_biography_keys_valid(output):
+    return matches(output, L4B_SCHEMA)
+
+
+L4P_SENSITIVITIES = {"discount_sensitivity": "sensitivity", "price_sensitivity": "sensitivity",
+                     "subscription_affinity": "affinity"}
+
+
+def l4p_details_schema(level_key):
+    return ListOf({"area": str, level_key: str, "evidence": str, "signal_strength": str})
+
+
+L4P_SCHEMA = {
+    **{name: {"value": str, "details": l4p_details_schema(level_key)} for name, level_key in L4P_SENSITIVITIES.items()},
+    "affinity": {
+        "shopping": {
+            "product_categories": ListOf({"category": str, "description": str}),
+            "shopper_type": {"value": ListOf(str), "details": l4p_details_schema("type")},
+        },
+        "dining": {"restrictions": {"value": ListOf(str), "details": l4p_details_schema("restriction")}},
+    },
+}
+
+
+def l4_commercial_preference_keys_valid(output):
+    return matches(output, L4P_SCHEMA)
+
+
+L4H_QUERY_SCHEMA = {"query": str, "value_type": str, "source_query_refs": ListOf(str), "delta_source": str,
+                    "delta_evidence": str, "decision_change": str}
+L4H_MISSION_SCHEMA = {"mission_name": str, "source_interests": ListOf(str), "scenarios": ListOf(str),
+                      "predicted_brands": ListOf(str), "predicted_queries": ListOf(L4H_QUERY_SCHEMA),
+                      "enrichment_sources": ListOf(str)}
+
+
+def l4_hyper_keys_valid(output):
+    return matches(output, {"missions": ListOf(L4H_MISSION_SCHEMA)})
 
 
 def build_prompt_ids(tokenizer, messages: list[dict]) -> list[int]:
@@ -259,6 +360,9 @@ def generate(llm, items: list[dict], is_valid, stage: str, temperature: float, t
         for item, output in zip(todo, outputs):
             item["attempts"] += 1
             item["text"] = output.outputs[0].text
+            item["finish_reason"] = output.outputs[0].finish_reason
+            if attempt == 0:  # the first sample is scored like an in-training rollout
+                item["first_text"], item["first_finish_reason"] = item["text"], item["finish_reason"]
             parsed = parse_json_object(item["text"])
             if parsed is not None and (item.get("check") or is_valid)(parsed):
                 item["output"] = parsed

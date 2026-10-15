@@ -1,21 +1,25 @@
 """Layer 4 on each user's layer3_postprocessing snapshot, one round per task:
 
-    Biography -> CommercialPreference -> MissionDiscovery -> MissionEnhancement (one call per mission)
+    Biography -> CommercialPreference -> Hyper (one call: the final shopping missions with their new queries)
     -> layer4_hyper_commercial_interest record -> layer4_postprocessing (the final profile)
 
-Payloads are built as maiprofilev3dev layer4_biography.py / layer4_commercial_preference.py /
-layer4_hyper_commercial_interest.py build their requests, in the layouts of
-pyscript/data_cleaning/layer3_layer4_build_sft_data.py. There is no user context or world knowledge here: the
-personal / professional context and world-knowledge sections are empty and the event filter is not called.
+Payloads follow the V2 SFT data (layer4_biography_step3 / layer4_commercial_preference_step3 /
+layer4_hyper_step4_build_sft_data.py and docs/V2_user_profile_dataset_schema.md), built from the production
+(MAIProfile_Official) requests. There is no user context here: declared attributes and facts are {}, and the personal
+/ professional context sections of the hyper input are "".
 """
 
 import math
 
-from task import (Task, UserProfile, emit_record, exact_dict_keys, exact_list_keys, normalize_category, output)
+from task import Task, UserProfile, emit_record, normalize_category, output
+from utils import (dumps, l4_biography_keys_valid, l4_commercial_preference_keys_valid, l4_hyper_keys_valid)
 
 SCENARIOS = {"shopping", "dining", "learning", "travel", "hobbies", "fitness", "technology"}
-ENRICHMENT_SOURCES = ("cross_interest", "commercial_preference", "personal_context", "professional_context",
-                      "world_knowledge")
+ENRICHMENT_SOURCES = ("cross_interest", "commercial_preference", "personal_context", "professional_context")
+DELTA_SOURCES = {"source_interest", *ENRICHMENT_SOURCES}
+SCALE = ("Low", "Medium-Low", "Medium", "Medium-High", "High")
+# Query languages written without spaces between words; their query word counts are not checked.
+UNSPACED_LANGUAGES = {"ja", "zh", "zh-Hans", "zh-Hant", "th"}
 
 
 def _text(value) -> str:
@@ -32,58 +36,58 @@ def _name_key(value) -> str:
 # ---------------------------------------------------------------------------
 
 class Biography(Task):
-    """layer4_biography: life stage and a short biography."""
+    """layer4_biography: life stage, user attributes and a short biography."""
     stage, layer, prompt_file = "l4_biography", "layer4_biography", "prompt_l4_biography.md"
 
     def keys_valid(self, output: dict) -> bool:
-        return set(output) == {"life_stage", "biography"} and exact_dict_keys(
-            output["life_stage"], {"value", "confidence", "evidence"})
+        return l4_biography_keys_valid(output)
 
     def payload(self, interests: list[dict]) -> dict:
-        """Layer4Biography._call_llm: _project_interest of every layer3_postprocessing interest (facts are {})."""
-        return {"facts": {}, "interests": [
-            {"interest_name": i.get("interest_name"), "actual_activity": i.get("actual_activity", ""),
-             "inferred_intent": i.get("inferred_intent", ""), "persona": i.get("persona", ""),
-             "confidence_score": i.get("confidence_score", 0), "count": i.get("count", 0),
-             "first_detect_date": i.get("first_detect_date", ""), "last_detect_date": i.get("last_detect_date", ""),
-             "source": i.get("source", [])}
-            for i in interests]}
+        """The V2 input: no declared attributes or facts here, and the layer3_postprocessing interests highest count
+        first (ties keep the confidence order), each with its topic names and, when not empty, the Layer-3 brands,
+        products and predicted queries."""
+        projected = []
+        for i in sorted(interests, key=lambda i: i.get("count") or 0, reverse=True):
+            item = {"interest_name": i.get("interest_name"), "actual_activity": i.get("actual_activity", ""),
+                    "inferred_intent": i.get("inferred_intent", ""), "persona": i.get("persona", ""),
+                    "confidence_score": i.get("confidence_score", 0), "count": i.get("count", 0),
+                    "first_detect_date": i.get("first_detect_date", ""),
+                    "last_detect_date": i.get("last_detect_date", ""), "source": i.get("source", []),
+                    "topics": [t.get("topic", "") for t in (i.get("topics") or [])]}
+            for key in ("brands", "products", "predicted_queries"):
+                if i.get(key):
+                    item[key] = i[key]
+            projected.append(item)
+        return {"declared_attributes": {}, "facts": {}, "interests": projected}
 
     def to_record(self, profile: UserProfile, answer: dict | None) -> dict:
-        return self.record(profile, biography=(answer or {}).get("biography", ""),
-                           life_stage=(answer or {}).get("life_stage", {}))
+        answer = answer or {}
+        return self.record(profile, biography=answer.get("biography", ""), life_stage=answer.get("life_stage", {}),
+                           user_attributes=answer.get("user_attributes", {}))
 
 
 class CommercialPreference(Task):
-    """layer4_commercial_preference: deal seeking, price tier, shopping and dining affinity."""
+    """layer4_commercial_preference: discount / price sensitivity, subscription affinity, shopping and dining."""
     stage, layer, prompt_file = ("l4_commercial_preference", "layer4_commercial_preference",
                                  "prompt_l4_commercial_preference.md")
-    VALUE_DETAILS = {"value", "details"}
+    DIMENSIONS = ("discount_sensitivity", "price_sensitivity", "subscription_affinity")
     STRENGTH = {"strong": 1.0, "moderate": 0.6, "weak": 0.3}
 
     def keys_valid(self, output: dict) -> bool:
-        affinity = output.get("affinity")
-        return (set(output) == {"deal_seeking", "price_tier", "affinity"}
-                and exact_dict_keys(output["deal_seeking"], self.VALUE_DETAILS)
-                and exact_dict_keys(output["price_tier"], self.VALUE_DETAILS)
-                and exact_dict_keys(affinity, {"shopping", "dining"})
-                and exact_dict_keys(affinity["shopping"], {"product_categories", "shopper_type"})
-                and exact_dict_keys(affinity["shopping"]["shopper_type"], self.VALUE_DETAILS)
-                and exact_dict_keys(affinity["dining"], {"restrictions"})
-                and exact_dict_keys(affinity["dining"]["restrictions"], self.VALUE_DETAILS))
+        return l4_commercial_preference_keys_valid(output)
 
     @staticmethod
     def interests(layer3: dict) -> list[dict]:
         return [i for i in layer3.get("interests", []) if i.get("commercial")]
 
     def payload(self, interests: list[dict], layer3: dict, biography: dict) -> dict:
-        """Layer4CommercialPreference._call_llm."""
+        """Layer4CommercialPreference._call_llm in the V2 layout (topics carry no intent)."""
         return {
             "life_stage": biography.get("life_stage", {}),
             "commercial_interests": [
                 {"interest_name": i.get("interest_name"), "persona": i.get("persona", ""),
                  "brands": i.get("brands", []), "retailers": i.get("retailers", []), "products": i.get("products", []),
-                 "topics": [{"topic": t.get("topic", ""), "intent": t.get("intent", ""),
+                 "topics": [{"topic": t.get("topic", ""),
                              "evidence": [e.get("action", "") for e in (t.get("evidence") or [])]}
                             for t in (i.get("topics") or [])]}
                 for i in interests],
@@ -99,11 +103,13 @@ class CommercialPreference(Task):
         return round(min(1.0, math.log(1 + len(scores)) / math.log(6) * sum(scores) / len(scores)), 4)
 
     def to_record(self, profile: UserProfile, answer: dict | None) -> dict:
-        """Layer4CommercialPreference._process_user after the call: rule-based confidence scores and defaults."""
+        """The answer with rule-based confidence scores, and defaults when the call failed."""
         result = answer or {}
-        for key in ("deal_seeking", "price_tier"):
-            if isinstance(result.get(key), dict):
-                result[key]["confidence_score"] = self.confidence(result[key].get("details", []))
+        preferences = {}
+        for key in self.DIMENSIONS:
+            item = result.get(key) if isinstance(result.get(key), dict) else {"value": "Unknown", "details": []}
+            item["confidence_score"] = self.confidence(item.get("details", []))
+            preferences[key] = item
         shopping = result.get("affinity", {}).get("shopping", {})
         shopper_type = shopping.get("shopper_type", {"value": [], "details": []})
         if isinstance(shopper_type, dict):
@@ -118,60 +124,43 @@ class CommercialPreference(Task):
             values = [v for v in values if v != "Unknown"]
         restrictions["value"] = values
         restrictions["confidence_score"] = self.confidence(restrictions.get("details", []))
-        return self.record(profile, commercial_preferences={
-            "deal_seeking": result.get("deal_seeking", {"value": "unknown", "details": []}),
-            "price_tier": result.get("price_tier", {"value": "unknown", "details": []}),
-            "affinity": {"shopping": {"product_categories": shopping.get("product_categories", []),
-                                      "shopper_type": shopper_type},
-                         "dining": {"restrictions": restrictions}},
-        })
+        preferences["affinity"] = {"shopping": {"product_categories": shopping.get("product_categories", []),
+                                                "shopper_type": shopper_type},
+                                   "dining": {"restrictions": restrictions}}
+        return self.record(profile, commercial_preferences=preferences)
 
-    @staticmethod
-    def to_text(record: dict) -> str:
-        """_format_commercial_preferences: the "Commercial preferences" section of both mission calls."""
-        preferences = record.get("commercial_preferences")
-        if not isinstance(preferences, dict):
-            return ""
-        lines = []
-
-        def add_value(label, item, detail_key):
-            if not isinstance(item, dict):
-                return
-            value = item.get("value")
-            if value in (None, "", [], "unknown", ["Unknown"]):
-                return
-            confidence = item.get("confidence_score")
-            text = ", ".join(str(v) for v in value) if isinstance(value, list) else str(value)
-            suffix = f" (confidence {confidence:.2f})" if isinstance(confidence, (int, float)) else ""
-            lines.append(f"- {label}: {text}{suffix}")
-            for detail in item.get("details", []) or []:
-                if not isinstance(detail, dict):
-                    continue
-                area = _text(detail.get("area") or "general")
-                detail_value = _text(detail.get(detail_key))
-                strength = _text(detail.get("signal_strength") or "unspecified")
-                evidence = _text(detail.get("evidence"))
-                lines.append(f"  - {f'{area}: {detail_value}' if detail_value else area} [{strength}]")
-                if evidence:
-                    lines.append(f"    Evidence: {evidence}")
-
-        add_value("Deal seeking", preferences.get("deal_seeking"), "seeking")
-        add_value("Price tier", preferences.get("price_tier"), "tier")
+    @classmethod
+    def to_json(cls, record: dict) -> str:
+        """The hyper input's commercial_preferences: a JSON string of the short form (docs/V2_user_profile_dataset_
+        schema.md, L4 Hyper): each known dimension as {value, confidence_score}; under affinity.shopping the product
+        categories and shopper types when present; dining restrictions only when not ["Unknown"]."""
+        preferences = record.get("commercial_preferences") or {}
+        short = {}
+        for key in cls.DIMENSIONS:
+            item = preferences.get(key)
+            if isinstance(item, dict) and item.get("value") in SCALE:
+                short[key] = {"value": item["value"], "confidence_score": item.get("confidence_score", 0.0)}
         affinity = preferences.get("affinity") or {}
-        shopping = affinity.get("shopping") or {}
-        categories = [f"  - {c['category']}: {c['description']}" if c.get("description") else f"  - {c['category']}"
-                      for c in shopping.get("product_categories") or []
-                      if isinstance(c, dict) and str(c.get("category") or "").strip()]
+        shopping_in = affinity.get("shopping") or {}
+        shopping = {}
+        categories = [{"category": c["category"], "description": c.get("description", "")}
+                      for c in shopping_in.get("product_categories") or [] if isinstance(c, dict) and c.get("category")]
         if categories:
-            lines.append("- Shopping categories:")
-            lines.extend(categories)
-        add_value("Shopper types", shopping.get("shopper_type"), "type")
-        add_value("Dining restrictions", (affinity.get("dining") or {}).get("restrictions"), "restriction")
-        return "\n".join(lines)
+            shopping["product_categories"] = categories
+        shopper_type = shopping_in.get("shopper_type") or {}
+        if isinstance(shopper_type, dict) and shopper_type.get("value"):
+            shopping["shopper_type"] = {"value": shopper_type["value"],
+                                        "confidence_score": shopper_type.get("confidence_score", 0.0)}
+        short["affinity"] = {"shopping": shopping}
+        restrictions = (affinity.get("dining") or {}).get("restrictions") or {}
+        if isinstance(restrictions, dict) and restrictions.get("value") and restrictions["value"] != ["Unknown"]:
+            short["affinity"]["dining"] = {"restrictions": {
+                "value": restrictions["value"], "confidence_score": restrictions.get("confidence_score", 0.0)}}
+        return dumps(short)
 
 
 # ---------------------------------------------------------------------------
-# Hyper commercial missions (layer4_hyper_commercial_interest.py)
+# Hyper commercial missions (layer4_hyper_commercial_interest.py, discovery + enhancement in one call)
 # ---------------------------------------------------------------------------
 
 def build_catalog(interests: list[dict]) -> dict:
@@ -183,13 +172,13 @@ def build_catalog(interests: list[dict]) -> dict:
     return {"ordered": interests, "by_name": by_name}
 
 
-def _resolve_sources(raw_sources, catalog: dict, allowed_keys: set | None = None) -> tuple[list[str], bool]:
-    """Canonical source names (deduped) and whether any name is unknown, ambiguous or outside allowed_keys."""
+def _resolve_sources(raw_sources, catalog: dict) -> tuple[list[str], bool]:
+    """Canonical source names (deduped) and whether any name is unknown or ambiguous."""
     names, seen, invalid = [], set(), False
     for raw in raw_sources:
         key = _name_key(raw)
         matches = catalog["by_name"].get(key, []) if key else []
-        if len(matches) != 1 or (allowed_keys is not None and key not in allowed_keys):
+        if len(matches) != 1:
             invalid = True
             continue
         if key not in seen:
@@ -216,33 +205,43 @@ def _clean_brands(raw) -> list[str]:
     return out
 
 
+def _values(raw) -> list[str]:
+    """_format_commercial_interests: unique non-empty texts (dict items give their name)."""
+    result, seen = [], set()
+    for item in raw or []:
+        if isinstance(item, dict):
+            item = item.get("name") or item.get("product_name") or ""
+        value = _text(item)
+        if value and value.casefold() not in seen:
+            seen.add(value.casefold())
+            result.append(value)
+    return result
+
+
 def _resolve_enrichment_sources(mission: dict, allowed: set | None = None) -> list[str]:
+    """The mission's enrichment sources: its own tags (within `allowed`) plus the delta sources of its queries;
+    cross_interest exactly when it has several source interests."""
     values = {v for v in mission.get("enrichment_sources", []) or [] if v in ENRICHMENT_SOURCES}
     if allowed is not None:
-        values &= allowed | {"cross_interest", "world_knowledge"}
+        values &= allowed | {"cross_interest"}
+    values.update(p.get("delta_source") for p in mission.get("query_delta_provenance", []) or []
+                  if isinstance(p, dict) and p.get("delta_source") in ENRICHMENT_SOURCES)
     if len(mission.get("source_interests", []) or []) > 1:
         values.add("cross_interest")
     else:
         values.discard("cross_interest")
-    query_sources = {p.get("delta_source") for p in mission.get("query_delta_provenance", []) or []
-                     if isinstance(p, dict)}
-    values.update(query_sources & set(ENRICHMENT_SOURCES))
-    if "world_knowledge" in query_sources:
-        values.add("world_knowledge")
-    else:
-        values.discard("world_knowledge")
     return [v for v in ENRICHMENT_SOURCES if v in values]
 
 
-class MissionDiscovery(Task):
-    """layer4_hyper_commercial_interest call 1: group the commercial interests into shopping missions."""
-    stage, layer, prompt_file = ("l4_mission_discovery", "layer4_hyper_commercial_interest",
-                                 "prompt_l4_hyper_mission_discovery.md")
-    MAX_MISSIONS = 12
+class Hyper(Task):
+    """layer4_hyper_commercial_interest in one call: group the commercial interests into shopping missions, each with
+    new search queries (discovery and enhancement of the production pipeline, merged in the V2 data)."""
+    stage, layer, prompt_file = "l4_hyper", "layer4_hyper_commercial_interest", "prompt_l4_hyper.md"
+    MAX_BRANDS = 3
+    VALUE_TYPES = {"explore", "refine", "advance"}
 
     def keys_valid(self, output: dict) -> bool:
-        return set(output) == {"candidate_missions"} and exact_list_keys(
-            output["candidate_missions"], {"mission_name", "source_interests", "scenarios"})
+        return l4_hyper_keys_valid(output)
 
     @staticmethod
     def interests(layer3: dict) -> list[dict]:
@@ -250,18 +249,7 @@ class MissionDiscovery(Task):
 
     @staticmethod
     def profile_text(interests: list[dict]) -> str:
-        """_format_commercial_interests: the "Source commercial interest profile" section."""
-        def values(raw):
-            result, seen = [], set()
-            for item in raw or []:
-                if isinstance(item, dict):
-                    item = item.get("name") or item.get("product_name") or ""
-                value = _text(item)
-                if value and value.casefold() not in seen:
-                    seen.add(value.casefold())
-                    result.append(value)
-            return result
-
+        """_format_commercial_interests: the "### Interest N: <name>" blocks of commercial_interests."""
         sections = []
         for index, interest in enumerate(interests, start=1):
             lines = [f"### Interest {index}: {_text(interest.get('interest_name'))}"]
@@ -269,151 +257,50 @@ class MissionDiscovery(Task):
                                ("Intent", "inferred_intent")):
                 if _text(interest.get(key)):
                     lines.append(f"- {label}: {_text(interest.get(key))}")
-            queries = values(interest.get("predicted_queries"))
+            queries = _values(interest.get("predicted_queries"))
             if queries:
                 lines.append("- Existing queries:")
                 lines.extend(f"  - {query}" for query in queries)
-            groups = [(label, items) for label, items in (("Brands", values(interest.get("brands"))),
-                                                          ("Retailers", values(interest.get("retailers"))),
-                                                          ("Products", values(interest.get("products")))) if items]
+            groups = [(label, items) for label, items in (("Brands", _values(interest.get("brands"))),
+                                                          ("Retailers", _values(interest.get("retailers"))),
+                                                          ("Products", _values(interest.get("products")))) if items]
             if groups:
                 lines.append("- Known entities:")
                 lines.extend(f"  - {label}: {', '.join(items)}" for label, items in groups)
             sections.append("\n".join(lines))
         return "\n\n".join(sections)
 
-    def payload(self, interests: list[dict], preferences_text: str) -> dict:
-        return {"personal_context": "", "professional_context": "", "commercial_preferences": preferences_text,
-                "commercial_interests": self.profile_text(interests)}
-
-    def missions(self, answer: dict, catalog: dict) -> tuple[list[dict], int]:
-        """_normalize_discovered_missions: (accepted missions with code-owned ids, rejected candidate count)."""
-        raw = answer.get("candidate_missions", [])
-        accepted, rejected, seen = [], 0, set()
-        for candidate in (raw if isinstance(raw, list) else [])[:self.MAX_MISSIONS]:
-            if not isinstance(candidate, dict):
-                rejected += 1
-                continue
-            name = _text(candidate.get("mission_name"))
-            sources = candidate.get("source_interests")
-            if not name or not isinstance(sources, list) or not sources or name.casefold() in seen:
-                rejected += 1
-                continue
-            names, invalid = _resolve_sources(sources, catalog)
-            scenarios = _scenarios(candidate.get("scenarios"))
-            if invalid or not names or not scenarios:
-                rejected += 1
-                continue
-            seen.add(name.casefold())
-            accepted.append({"mission_id": f"mission_{len(accepted) + 1}", "mission_name": name,
-                             "source_interests": names, "scenarios": scenarios})
-        return accepted, rejected
-
-    def check(self, catalog: dict):
-        """The official step retries while any candidate is rejected."""
-        return lambda answer: self.keys_valid(answer) and self.missions(answer, catalog)[1] == 0
-
-
-class MissionEnhancement(Task):
-    """layer4_hyper_commercial_interest call 2, once per mission: new queries and brands for the mission."""
-    stage, layer, prompt_file = ("l4_mission_enhancement", "layer4_hyper_commercial_interest",
-                                 "prompt_l4_hyper_mission_enhancement.md")
-    TOP_KEYS = {"geo_resolution", "professional_opportunities", "price_tier_resolution",
-                "shopping_category_opportunities", "preference_opportunities", "enhanced_missions"}
-    MISSION_KEYS = {"input_mission_name", "mission_name", "source_interests", "scenarios", "predicted_brands",
-                    "predicted_queries", "enrichment_sources"}
-    QUERY_KEYS = {"query", "value_type", "source_query_refs", "delta_source", "delta_evidence", "decision_change"}
-    VALUE_TYPES = {"explore", "refine", "advance"}
-    STANDALONE_QUERIES, MERGED_QUERIES = 2, 4
-
-    def keys_valid(self, output: dict) -> bool:
-        missions = output.get("enhanced_missions")
-        return set(output) <= self.TOP_KEYS and exact_list_keys(missions, self.MISSION_KEYS) and all(
-            exact_list_keys(m["predicted_queries"], self.QUERY_KEYS) for m in missions)
+    def payload(self, interests: list[dict], preferences_json: str, language: str) -> dict:
+        return {"personal_context": "", "professional_context": "", "commercial_preferences": preferences_json,
+                "commercial_interests": self.profile_text(interests), "query_language": language}
 
     @staticmethod
-    def evidence_text(interests: list[dict]) -> str:
-        """_format_detailed_commercial_interests, except that "Existing queries" is a nested list (one "  - " line per
-        query): that is how the V1 SFT data was rendered, and what the rollout rules parse."""
-        def compact(value) -> str:
-            return ", ".join(str(item) for item in value) if isinstance(value, list) else _text(value)
+    def existing_queries(names: list[str], catalog: dict) -> dict:
+        """normalized query -> the Existing query as shown in the input, over the given source interests."""
+        return {_name_key(query): query for name in names for interest in catalog["by_name"].get(_name_key(name), [])
+                for query in _values(interest.get("predicted_queries"))}
 
-        sections = []
-        for index, interest in enumerate(interests, start=1):
-            lines = [f"### Source interest {index}: {compact(interest.get('interest_name'))}"]
-            for label, key in (("Category", "category"), ("Persona", "persona"), ("Activity", "actual_activity"),
-                               ("Intent", "inferred_intent"), ("Funnel stage", "intent_funnel_stage"),
-                               ("Confidence", "confidence_score"), ("Temporal", "temporal"),
-                               ("Seasonality", "seasonality"), ("First detected", "first_detect_date"),
-                               ("Last detected", "last_detect_date")):
-                if compact(interest.get(key)):
-                    lines.append(f"- {label}: {compact(interest.get(key))}")
-            queries = [q for q in (compact(q) for q in interest.get("predicted_queries", []) or []) if q]
-            if queries:
-                lines.append("- Existing queries:")
-                lines.extend(f"  - {query}" for query in queries)
-            for label, key in (("Brands", "brands"), ("Retailers", "retailers"), ("Products", "products")):
-                items = [v for v in (compact(item) for item in interest.get(key, []) or []) if v]
-                if items:
-                    lines.append(f"- {label}: {', '.join(items)}")
-            sections.append("\n".join(lines))
-        return "\n\n".join(sections)
+    def references_valid(self, answer: dict, catalog: dict) -> bool:
+        """Every source interest names one input interest and every source_query_ref is an Existing query of the
+        mission's sources (the production enhancement retries otherwise; the V2 cleaning drops such rows)."""
+        for mission in answer["missions"]:
+            names, invalid = _resolve_sources(mission["source_interests"], catalog)
+            existing = self.existing_queries(names, catalog)
+            if invalid or not names or any(_name_key(ref) not in existing for query in mission["predicted_queries"]
+                                           for ref in query["source_query_refs"]):
+                return False
+        return True
 
-    def payload(self, mission: dict, catalog: dict, preferences_text: str, language: str) -> dict:
-        """_build_mission_enhancement_context for a batch of one mission (hyper_mission_enhancement_batch_size)."""
-        keys = {_name_key(name) for name in mission["source_interests"]}
-        sources = [_prune_empty(i) for i in catalog["ordered"] if _name_key(i.get("interest_name")) in keys]
-        return {"query_language": language,
-                "candidate_missions": [{k: mission[k] for k in ("mission_name", "source_interests", "scenarios")}],
-                "source_evidence": self.evidence_text(sources), "personal_context": "", "professional_context": "",
-                "commercial_preferences": preferences_text, "world_knowledge": ""}
-
-    def _normalize_queries(self, mission: dict, records: dict) -> None:
-        """_normalize_generated_queries: lowercased 2-7 word queries with valid provenance, up to 2 per standalone
-        mission (4 when merged). A reference to an unknown existing query raises ValueError."""
-        names = list(mission.get("source_interests", []) or [])
-        base = {" ".join(q.casefold().split()): q for name in names
-                for q in records.get(name, {}).get("predicted_queries", []) or [] if isinstance(q, str) and q.strip()}
-        merged = len(names) > 1
-        raw_sources = set(mission.get("enrichment_sources", []) or [])
-        queries, provenance = [], []
-        for item in mission.get("predicted_queries", []) or []:
-            if not isinstance(item, dict):
-                continue
-            value = " ".join(item["query"].strip().lower().split()) if isinstance(item.get("query"), str) else ""
-            if not 2 <= len(value.split()) <= 7 or value in queries:
-                value = ""
-            refs, delta_source = item.get("source_query_refs"), item.get("delta_source")
-            delta_evidence, decision_change = _text(item.get("delta_evidence")), _text(item.get("decision_change"))
-            value_type = str(item.get("value_type") or "").strip().casefold()
-            if (not value or not isinstance(refs, list) or not refs or not delta_evidence or not decision_change
-                    or value_type not in self.VALUE_TYPES or (delta_source == "cross_interest" and not merged)
-                    or (delta_source not in {"source_interest", "cross_interest"} and delta_source not in raw_sources)):
-                continue
-            canonical = []
-            for ref in refs:
-                found = base.get(" ".join(str(ref or "").casefold().split()))
-                if not found:
-                    raise ValueError("Generated query references an unknown source query")
-                if found not in canonical:
-                    canonical.append(found)
-            queries.append(value)
-            provenance.append({"query": value, "source_query_refs": canonical, "delta_evidence": delta_evidence,
-                               "decision_change": decision_change, "delta_source": delta_source,
-                               "value_type": value_type})
-            if len(queries) == (self.MERGED_QUERIES if merged else self.STANDALONE_QUERIES):
-                break
-        mission["predicted_queries"], mission["query_delta_provenance"] = queries, provenance
+    def check(self, catalog: dict):
+        return lambda answer: self.keys_valid(answer) and self.references_valid(answer, catalog)
 
     @staticmethod
     def _category(mission: dict, records: dict) -> str:
-        """_resolve_category: the source category, else the model's, else the common prefix of the sources'."""
+        """_resolve_category: the source category, else the common prefix of the sources' categories."""
         names = list(mission.get("source_interests", []) or [])
         categories = [c for c in (normalize_category(records.get(n, {}).get("category")) for n in names) if c]
         if len(names) == 1 and categories:
             return categories[0]
-        if normalize_category(mission.get("category")):
-            return normalize_category(mission.get("category"))
         if not categories or len(categories) < len(names):
             return ""
         common = []
@@ -423,80 +310,66 @@ class MissionEnhancement(Task):
             common.append(parts[0])
         return f"/{'/'.join(common)}" if common else ""
 
-    def missions(self, answer: dict, mission: dict, catalog: dict, allowed_sources: set) -> list[dict]:
-        """_normalize_enhanced_missions for a batch of one mission (no world knowledge). Raises ValueError when the
-        official step would retry the call."""
-        batch = {mission["mission_name"]: mission, f"Candidate 1: {mission['mission_name']}": mission}
+    def _queries(self, mission: dict, names: list[str], catalog: dict, allowed: set, language: str) -> None:
+        """Valid new queries with their provenance, as the V2 cleaning requires: 2-7 words (any length for ja / zh /
+        th), no question mark, not an Existing query, a known value type, a delta source the input supports, refs to
+        Existing queries, evidence and a decision change. The query text is kept as written (the V2 prompt does not
+        ask for lowercase)."""
+        existing = self.existing_queries(names, catalog)
+        merged = len(names) > 1
+        queries, provenance = [], []
+        for item in mission.get("predicted_queries", []) or []:
+            value = _text(item.get("query"))
+            words = len(value.split())
+            refs = [existing[_name_key(ref)] for ref in item.get("source_query_refs", []) if _name_key(ref) in existing]
+            delta_source, value_type = item.get("delta_source"), str(item.get("value_type") or "").strip().casefold()
+            if (not value or value.endswith(("?", "？")) or _name_key(value) in existing
+                    or _name_key(value) in {_name_key(q) for q in queries}
+                    or not (language in UNSPACED_LANGUAGES or 2 <= words <= 7)
+                    or value_type not in self.VALUE_TYPES or delta_source not in DELTA_SOURCES
+                    or (delta_source == "cross_interest" and not merged)
+                    or (delta_source not in {"source_interest", "cross_interest"} and delta_source not in allowed)
+                    or not _text(item.get("delta_evidence")) or not _text(item.get("decision_change"))):
+                continue
+            queries.append(value)
+            provenance.append({"query": value, "source_query_refs": list(dict.fromkeys(refs)),
+                               "delta_evidence": _text(item.get("delta_evidence")),
+                               "decision_change": _text(item.get("decision_change")), "delta_source": delta_source,
+                               "value_type": value_type})
+        mission["predicted_queries"], mission["query_delta_provenance"] = queries, provenance
+
+    def missions(self, answer: dict, catalog: dict, allowed: set, language: str) -> list[dict]:
+        """The answer's missions with resolved source interests and scenarios, valid queries (see _queries), new
+        brands only (at most 3), a category and enrichment sources; missions left without a query are dropped."""
         records = {str(i.get("interest_name") or "").strip(): i for i in catalog["ordered"] if i.get("interest_name")}
-        raw_missions = answer.get("enhanced_missions", [])
-        accepted, rejected, zero_query, bad_reference = [], 0, 0, False
-        for raw in raw_missions if isinstance(raw_missions, list) else []:
-            if not isinstance(raw, dict):
-                rejected += 1
-                continue
-            if not isinstance(raw.get("input_mission_name"), str):
-                raise ValueError("Enhancement input_mission_name must be an exact candidate name")
-            candidate = batch.get(raw["input_mission_name"])
-            name, raw_sources = _text(raw.get("mission_name")), raw.get("source_interests")
-            if candidate is None:
-                bad_reference, rejected = True, rejected + 1
-                continue
-            if not name or not isinstance(raw_sources, list) or not raw_sources:
-                rejected += 1
-                continue
-            names, invalid = _resolve_sources(
-                raw_sources, catalog, {_name_key(n) for n in candidate.get("source_interests", [])})
-            bad_reference |= invalid
+        accepted = []
+        for raw in answer.get("missions", []):
+            name = _text(raw.get("mission_name"))
+            names, _ = _resolve_sources(raw.get("source_interests", []), catalog)
             scenarios = _scenarios(raw.get("scenarios"))
-            if invalid or not names or not scenarios:
-                rejected += 1
+            if not name or not names or not scenarios:
                 continue
-            mission_allowed = set(allowed_sources) | ({"cross_interest"} if len(names) > 1 else set())
-            tags = raw.get("enrichment_sources", [])
-            normalized = {**raw, "enrichment_sources": [t for t in tags if t in mission_allowed]
-                          if isinstance(tags, list) else [], "input_mission_id": candidate.get("mission_id"),
-                          "input_mission_name": candidate.get("mission_name"), "mission_name": name,
-                          "interest_name": name, "source_interests": names, "scenarios": scenarios}
-            self._normalize_queries(normalized, records)
-            if not normalized["predicted_queries"]:
-                zero_query, rejected = zero_query + 1, rejected + 1
+            mission_allowed = set(allowed) | ({"cross_interest"} if len(names) > 1 else set())
+            mission = {"mission_name": name, "interest_name": name, "source_interests": names, "scenarios": scenarios,
+                       "predicted_queries": raw.get("predicted_queries", []),
+                       "enrichment_sources": [t for t in raw.get("enrichment_sources", []) if t in mission_allowed]}
+            self._queries(mission, names, catalog, allowed, language)
+            if not mission["predicted_queries"]:
                 continue
-            normalized["predicted_brands"] = _clean_brands(normalized.get("predicted_brands"))
-            normalized["category"] = self._category(normalized, records)
-            normalized["enrichment_sources"] = _resolve_enrichment_sources(normalized, mission_allowed)
-            accepted.append(normalized)
-        if bad_reference:
-            raise ValueError("Invalid enhancement references")
-        if rejected > zero_query:
-            raise ValueError("Invalid enhancement response schema")
+            known = {_name_key(b) for n in names for i in catalog["by_name"].get(_name_key(n), [])
+                     for b in _values(i.get("brands"))}
+            mission["predicted_brands"] = [b for b in _clean_brands(raw.get("predicted_brands"))
+                                           if _name_key(b) not in known][:self.MAX_BRANDS]
+            mission["category"] = self._category(mission, records)
+            mission["enrichment_sources"] = _resolve_enrichment_sources(mission, mission_allowed)
+            accepted.append(mission)
         return accepted
 
-    def check(self, mission: dict, catalog: dict, allowed_sources: set):
-        def check(answer: dict) -> bool:
-            if not self.keys_valid(answer):
-                return False
-            try:
-                self.missions(answer, mission, catalog, allowed_sources)
-            except ValueError:
-                return False
-            return True
-        return check
 
-
-def _prune_empty(value):
-    """_mission_prune_empty: drop None / [] / {} values recursively."""
-    if isinstance(value, dict):
-        pruned = {k: _prune_empty(v) for k, v in value.items()}
-        return {k: v for k, v in pruned.items() if v not in (None, [], {})}
-    if isinstance(value, list):
-        return [_prune_empty(v) for v in value]
-    return value
-
-
-def _dedupe_missions(enhanced: list[dict]) -> list[dict]:
-    """_enhance_mission_batches tail: drop repeated mission names and queries across batches, renumber."""
+def _dedupe_missions(missions: list[dict]) -> list[dict]:
+    """Drop repeated mission names and queries across missions (the V2 data repeats no query), renumber."""
     result, seen_queries, seen_names = [], set(), set()
-    for mission in enhanced:
+    for mission in missions:
         if _name_key(mission.get("mission_name")) in seen_names:
             continue
         by_query = {p.get("query"): p for p in mission.get("query_delta_provenance", []) or [] if isinstance(p, dict)}
@@ -508,48 +381,42 @@ def _dedupe_missions(enhanced: list[dict]) -> list[dict]:
         if not queries:
             continue
         seen_names.add(_name_key(mission.get("mission_name")))
-        result.append({**mission, "predicted_queries": queries,
-                       "query_delta_provenance": [by_query[q] for q in queries if q in by_query],
-                       "mission_id": f"mission_{len(result) + 1}"})
+        result.append({"mission_id": f"mission_{len(result) + 1}", **mission, "predicted_queries": queries,
+                       "query_delta_provenance": [by_query[q] for q in queries if q in by_query]})
     return result
 
 
 def _mission_to_interest(mission: dict) -> dict:
     """_mission_to_interest_schema: one hyper_commercial interest for the final interests list."""
-    queries = []
-    for query in mission.get("predicted_queries", []) or []:
-        if isinstance(query, str) and query.strip() and query.strip() not in queries:
-            queries.append(query.strip())
     return {
         "interest_name": mission.get("mission_name") or mission.get("interest_name", ""),
         "interest_type": "hyper_commercial", "enrichment_sources": _resolve_enrichment_sources(mission),
         "category": normalize_category(mission.get("category")),
         "children": list(mission.get("source_interests", []) or []), "commercial": True, "persona": "",
-        "predicted_queries": queries, "brands": _clean_brands(mission.get("predicted_brands")),
+        "predicted_queries": list(dict.fromkeys(q for q in mission.get("predicted_queries", []) or [] if q)),
+        "brands": _clean_brands(mission.get("predicted_brands")),
         "intent_funnel_stage": None, "inferred_intent": "", "actual_activity": "", "topics": [],
         "confidence_score": None, "first_detect_date": None, "last_detect_date": None, "count": None,
-        "state": None, "source": [], "temporal": None, "decay": None, "seasonality": None,
+        "state": None, "source": [], "seasonality": None,
         "retailers": [], "products": [],
     }
 
 
-BIOGRAPHY, PREFERENCE = Biography(), CommercialPreference()
-DISCOVERY, ENHANCEMENT = MissionDiscovery(), MissionEnhancement()
-TASKS = [BIOGRAPHY, PREFERENCE, DISCOVERY, ENHANCEMENT]
+BIOGRAPHY, PREFERENCE, HYPER = Biography(), CommercialPreference(), Hyper()
+TASKS = [BIOGRAPHY, PREFERENCE, HYPER]
 
 
-def hyper_record(profile: UserProfile, candidates: list[dict], enhanced: list[dict], failed: list[str]) -> dict:
-    """The layer4_hyper_commercial_interest record (no audit blocks); `failed` lists calls that never validated."""
-    missions = _dedupe_missions(enhanced)
-    return DISCOVERY.record(profile, enriched_interests=missions,
-                            hyper_commercial_interests=[_mission_to_interest(m) for m in missions],
-                            mission_candidates=candidates, _query_language=profile.language,
-                            **({"_failed": failed} if failed else {}))
+def hyper_record(profile: UserProfile, missions: list[dict], failed: bool) -> dict:
+    """The layer4_hyper_commercial_interest record; `_failed` marks a call that never validated."""
+    missions = _dedupe_missions(missions)
+    return HYPER.record(profile, enriched_interests=missions,
+                        hyper_commercial_interests=[_mission_to_interest(m) for m in missions],
+                        _query_language=profile.language, **({"_failed": [HYPER.stage]} if failed else {}))
 
 
 def postprocess(layer3: dict, biography: dict, preference: dict, hyper: dict) -> dict:
-    """layer4_postprocessing without negative feedback: the layer3_postprocessing snapshot plus biography / life
-    stage, commercial preferences and the hyper-commercial missions (appended to interests)."""
+    """layer4_postprocessing without negative feedback: the layer3_postprocessing snapshot plus biography, life stage,
+    user attributes, commercial preferences and the hyper-commercial missions (appended to interests)."""
     valid = {str(i.get("interest_name")).strip().casefold() for i in layer3.get("interests", [])
              if i.get("interest_name")}
 
@@ -562,6 +429,7 @@ def postprocess(layer3: dict, biography: dict, preference: dict, hyper: dict) ->
     interests = list(layer3.get("interests", [])) + list(hyper.get("hyper_commercial_interests", []) or [])
     return {**layer3, "interests": [i for i in interests if keep(i, "children")],
             "biography": biography.get("biography", ""), "life_stage": biography.get("life_stage", {}),
+            "user_attributes": biography.get("user_attributes", {}),
             "commercial_preferences": preference.get("commercial_preferences", {}),
             "enriched_commercial_interests": [i for i in hyper.get("enriched_interests", [])
                                               if keep(i, "source_interests")],
@@ -569,8 +437,8 @@ def postprocess(layer3: dict, biography: dict, preference: dict, hyper: dict) ->
 
 
 def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
-    """Rounds 2-5 after layer3.run: biography, commercial preference, mission discovery, one enhancement per
-    mission; then the hyper record and layer4_postprocessing for every user."""
+    """Rounds 2-4 after layer3.run: biography, commercial preference, hyper; then the hyper record and
+    layer4_postprocessing for every user."""
     items = {}
     for p in profiles:
         interests = p.layer3["interests"]
@@ -590,41 +458,23 @@ def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
         p.preference = PREFERENCE.to_record(p, output(items[p.user_id]))
         emit_record(emit, p, p.preference, items[p.user_id])
 
-    discovery, catalogs, texts = {}, {}, {p.user_id: PREFERENCE.to_text(p.preference) for p in profiles}
+    catalogs, preferences = {}, {p.user_id: PREFERENCE.to_json(p.preference) for p in profiles}
     for p in profiles:
-        interests = DISCOVERY.interests(p.layer3)
-        discovery[p.user_id] = interests and DISCOVERY.request(
-            p, lambda k: DISCOVERY.payload(interests[:k], texts[p.user_id]), len(interests), encode,
-            make_check=lambda k: DISCOVERY.check(build_catalog(interests[:k])))
-        if discovery[p.user_id]:
-            catalogs[p.user_id] = build_catalog(interests[:discovery[p.user_id]["kept"]])
-    run_round([item for item in discovery.values() if item])
-
-    candidates, enhance, failed = {}, {}, {p.user_id: [] for p in profiles}
-    for p in profiles:
-        item, catalog = discovery[p.user_id], catalogs.get(p.user_id)
-        if item and item["output"] is None:
-            failed[p.user_id].append(DISCOVERY.stage)
-        candidates[p.user_id] = DISCOVERY.missions(item["output"], catalog)[0] if output(item) else []
-        allowed = {"commercial_preference"} if texts[p.user_id] else set()
-        enhance[p.user_id] = []
-        for mission in candidates[p.user_id]:
-            request = ENHANCEMENT.request(
-                p, lambda k: ENHANCEMENT.payload(mission, catalog, texts[p.user_id], p.language["locale"]), 1, encode,
-                make_check=lambda k: ENHANCEMENT.check(mission, catalog, allowed), suffix=f"|{mission['mission_id']}")
-            if request:
-                enhance[p.user_id].append((mission, request, allowed))
-            else:
-                failed[p.user_id].append(f"{ENHANCEMENT.stage}:{mission['mission_name']}")
-    run_round([request for pending in enhance.values() for _, request, _ in pending])
+        interests = HYPER.interests(p.layer3)
+        items[p.user_id] = interests and HYPER.request(
+            p, lambda k: HYPER.payload(interests[:k], preferences[p.user_id], p.language["locale"]), len(interests),
+            encode, make_check=lambda k: HYPER.check(build_catalog(interests[:k])))
+        if items[p.user_id]:
+            catalogs[p.user_id] = build_catalog(interests[:items[p.user_id]["kept"]])
+    run_round([item for item in items.values() if item])
 
     for p in profiles:
-        enhanced = []
-        for mission, request, allowed in enhance[p.user_id]:
-            if request["output"] is None:
-                failed[p.user_id].append(f"{ENHANCEMENT.stage}:{mission['mission_name']}")
-            else:
-                enhanced += ENHANCEMENT.missions(request["output"], mission, catalogs[p.user_id], allowed)
-        hyper = hyper_record(p, candidates[p.user_id], enhanced, failed[p.user_id])
-        emit_record(emit, p, hyper, discovery[p.user_id], *(request for _, request, _ in enhance[p.user_id]))
+        item = items[p.user_id]
+        # commercial_preference is a usable delta source only when the preferences say something.
+        allowed = {"commercial_preference"} if preferences[p.user_id] != dumps({"affinity": {"shopping": {}}}) \
+            else set()
+        missions = HYPER.missions(item["output"], catalogs[p.user_id], allowed, p.language["locale"]) \
+            if output(item) else []
+        hyper = hyper_record(p, missions, failed=bool(item) and item["output"] is None)
+        emit_record(emit, p, hyper, item)
         emit_record(emit, p, postprocess(p.layer3, p.biography, p.preference, hyper))

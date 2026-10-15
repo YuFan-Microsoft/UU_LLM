@@ -1,17 +1,13 @@
-"""Layer 2: one model call replaces maiprofilev3dev's layer2_merge + layer2_temporal (merge/add decisions that each
-carry a temporal class); postmerge (no model) applies them to the user's previous snapshot."""
+"""Layer 2: one model call replaces the production layer2_merge (merge/add decisions); postmerge (no model) applies them
+to the user's previous snapshot. There is no temporal classification (the production layer2_temporal call): it gives
+every class the same daily decay of 1.0, so untouched interests decay by DECAY_BASE per day exactly as in production."""
 
 from datetime import date, datetime
 
 from utils import HERE, INPUT_MARKER, PROMPT_BUDGET, dumps, layer2_keys_valid, normalize_language_tag
 
-# Must stay identical to UU_LLM/prompts/prompt_l2.md, the prompt of the V1 SFT data.
+# Must stay identical to UU_LLM/prompts/prompt_l2.md, the prompt of the V2 SFT data.
 PROMPT = (HERE / "prompts" / "prompt_l2.md").read_text(encoding="utf-8")
-TEMPORALS = {"Ephemeral", "ShortTerm", "LongTerm", "Persistent"}  # layer2_temporal: decay is 1.0 for all of them
-# init (no previous snapshot): maiprofilev3dev adds every delta interest without a merge call and classifies them
-# with a layer2_temporal call. The model takes no empty-snapshot input (the V1 L2 data has none), so there is no
-# call: the interests keep Layer 1's temporal label and get the decay layer2_temporal gives every class.
-INIT_TEMPORAL = "LongTerm"
 
 
 def plan(delta: dict, prev_snapshot: dict | None) -> tuple[str, list[dict]]:
@@ -33,51 +29,42 @@ def project(interest: dict) -> dict:
             "topics": [topic["topic"] for topic in interest["topics"]]}
 
 
+def build_message(snapshot: list[dict], delta: list[dict]) -> str:
+    """Same input as layer2_step2_build_sft_data: {"snapshot": [...], "delta": [...]} of projected interests."""
+    return PROMPT + INPUT_MARKER + dumps({"snapshot": [project(interest) for interest in snapshot],
+                                          "delta": [project(interest) for interest in delta]})
+
+
 def fit_prompt(snapshot: list[dict], delta: list[dict], encode) -> tuple[list[int], int]:
     """Drop the lowest-confidence snapshot interests (the snapshot is sorted by confidence) until the prompt fits.
     Returns the prompt ids and the number of snapshot interests left out."""
-    kept, delta_view = list(snapshot), [project(interest) for interest in delta]
+    kept = list(snapshot)
     while True:
-        payload = {"snapshot": [project(interest) for interest in kept], "delta": delta_view}
-        prompt_ids = encode(PROMPT + INPUT_MARKER + dumps(payload))
+        prompt_ids = encode(build_message(kept, delta))
         if len(prompt_ids) <= PROMPT_BUDGET or not kept:
             return prompt_ids, len(snapshot) - len(kept)
         kept = kept[:max(0, min(len(kept) - 1, int(len(kept) * PROMPT_BUDGET / len(prompt_ids) * 0.95)))]
 
 
 def is_valid(output: dict) -> bool:
-    """Expected keys for every decision (as in training) and string values, which postmerge lowercases."""
-    return layer2_keys_valid(output) and all(
-        isinstance(value, str) for decision in output["decisions"] for value in decision.values())
+    """Expected keys and string values for every decision (as in training), which postmerge lowercases."""
+    return layer2_keys_valid(output)
 
 
-def to_decisions(mode: str, delta: list[dict], output: dict | None) -> tuple[list[dict] | None, list[dict]]:
-    """(layer2_merge decisions, layer2_temporal interests) for one active user.
+def to_decisions(mode: str, delta: list[dict], output: dict | None) -> list[dict] | None:
+    """The layer2_merge decisions of one active user (None when there is no delta interest).
 
-    init: the synthetic add-all layer2_merge writes when there is no snapshot, each interest with INIT_TEMPORAL and
-    decay 1.0 (no model call).
+    init: the synthetic add-all layer2_merge writes when there is no snapshot (no model call).
     merge: the model's decisions, plus a synthetic add for every delta without one (layer2_merge._backfill_missing).
-    Each decision's temporal is filed under the name layer2_temporal summarizes it by (merged name / delta name);
-    postmerge looks them up by name, so a later entry with the same name wins, as in its temporal_map.
     """
     if mode == "empty":
-        return None, []
+        return None
     if mode == "init":
-        return ([{"action": "add", "delta_interest_name": interest["interest_name"]} for interest in delta],
-                [{"interest_name": interest["interest_name"], "temporal": INIT_TEMPORAL, "decay": 1.0}
-                 for interest in delta])
-    answer = (output or {}).get("decisions", [])
-    decisions = [{key: value for key, value in d.items() if key != "temporal"} for d in answer]
+        return [{"action": "add", "delta_interest_name": interest["interest_name"]} for interest in delta]
+    decisions = list((output or {}).get("decisions", []))
     covered = {d["delta_interest_name"].lower() for d in decisions}
-    decisions += [{"action": "add", "delta_interest_name": interest["interest_name"]}
-                  for interest in delta if interest["interest_name"].lower() not in covered]
-    temporal = []
-    for d in answer:
-        name = (d.get("merged_interest_name") or d["delta_interest_name"]) if d["action"] == "merge" \
-            else d["delta_interest_name"]
-        if d["temporal"] in TEMPORALS and name:
-            temporal.append({"interest_name": name, "temporal": d["temporal"], "decay": 1.0})
-    return decisions, temporal
+    return decisions + [{"action": "add", "delta_interest_name": interest["interest_name"]}
+                        for interest in delta if interest["interest_name"].lower() not in covered]
 
 
 # ---------------------------------------------------------------------------
@@ -86,7 +73,7 @@ def to_decisions(mode: str, delta: list[dict], output: dict | None) -> tuple[lis
 # ---------------------------------------------------------------------------
 
 BOOST_ALPHA = 0.4           # merge: w' = a*w + (1-a)
-DECAY_BASE = 0.98           # untouched: w' = w * (base * temporal_decay) ** days, days capped at 7
+DECAY_BASE = 0.98           # untouched: w' = w * base ** days, days capped at 7
 INITIAL_CONFIDENCE = 0.6    # new interest with 1 topic (0.75 with 2+ topics)
 INITIAL_CONFIDENCE_MULTI = 0.75
 PRUNE_THRESHOLD = 0.01
@@ -222,8 +209,6 @@ def _add(decision: dict, delta_by_name: dict, cur: date) -> dict:
         "count": 1,
         "state": "Emerging",
         "source": _sources(topics),
-        "temporal": delta.get("temporal", "Persistent"),
-        "decay": float(delta.get("decay", 1.0)),
         "_run_event": "added",
     }
 
@@ -247,8 +232,6 @@ def _merge(decision: dict, delta_by_name: dict, snapshot_by_name: dict, cur: dat
         "count": int(snapshot.get("count", 0)) + 1,
         "state": _state(first, cur, cur),
         "source": _sources(topics),
-        "temporal": snapshot.get("temporal", "Persistent"),
-        "decay": float(snapshot.get("decay", 1.0)),
         "_run_event": "boosted",
     }
 
@@ -259,7 +242,7 @@ def _decay(interest: dict, cur: date, prev: date) -> dict:
     topics = _prune_sort([_decay_topic(topic, cur, prev) for topic in interest.get("topics", [])])
     return {**interest,
             "confidence_score": _clamp(float(interest.get("confidence_score", INITIAL_CONFIDENCE))
-                                       * (DECAY_BASE * float(interest.get("decay", 1.0))) ** _days(cur, prev)),
+                                       * DECAY_BASE ** _days(cur, prev)),
             "first_detect_date": str(first),
             "last_detect_date": str(last),
             "count": max(int(interest.get("count", 0)), 1),
@@ -269,10 +252,10 @@ def _decay(interest: dict, cur: date, prev: date) -> dict:
             "_run_event": "decayed"}
 
 
-def postmerge(user_id: str, date_str: str, decisions: list[dict] | None, delta: dict, temporal: list[dict],
+def postmerge(user_id: str, date_str: str, decisions: list[dict] | None, delta: dict,
               prev_snapshot: dict | None) -> dict:
-    """Layer2PostProcessor._process_user: apply merge/add decisions, decay untouched snapshot interests, apply the
-    temporal classes, prune and sort by confidence."""
+    """Layer2PostProcessor._process_user: apply merge/add decisions, decay untouched snapshot interests, prune and
+    sort by confidence."""
     cur = _date(date_str)
     prev = _date(prev_snapshot["date"]) if prev_snapshot and prev_snapshot.get("date") else cur
     delta_by_name = {i.get("interest_name", "").lower(): i for i in delta.get("interests", [])}
@@ -310,11 +293,6 @@ def postmerge(user_id: str, date_str: str, decisions: list[dict] | None, delta: 
 
     interests += [_decay(dict(i), cur, prev) for i in (prev_snapshot or {}).get("interests", [])
                   if i.get("interest_name", "").lower() not in consumed]
-    temporal_by_name = {t["interest_name"].lower(): t for t in temporal}
-    for interest in interests:
-        t = temporal_by_name.get(interest.get("interest_name", "").lower())
-        if t:
-            interest["temporal"], interest["decay"] = t["temporal"], float(t["decay"])
     # _resolve_predicted_content_locale: this window's Layer-1 locale, else the previous snapshot's.
     locale = (normalize_language_tag(delta.get("predicted_content_locale"))
               or normalize_language_tag((prev_snapshot or {}).get("predicted_content_locale")))

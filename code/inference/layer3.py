@@ -1,11 +1,31 @@
 """Layer 3 on each user's final Layer-2 snapshot: Persona and Commercial (one model call each, independent), then
 layer3_postprocessing merges both into the gated interests.
 
-Payloads are built as maiprofilev3dev layer3_persona.py / layer3_commercial_interests.py build their user messages,
-in the layouts of pyscript/data_cleaning/layer3_layer4_build_sft_data.py.
+Payloads are built as the production layer3_persona.py / layer3_commercial_interests.py build their user messages,
+in the layouts of the V2 SFT data (layer3_persona_step3 / layer3_commercial_step4_build_sft_data.py).
 """
 
-from task import Task, UserProfile, emit_record, exact_list_keys, normalize_category, output, output_gate
+from task import Task, UserProfile, emit_record, normalize_category, output, output_gate
+from utils import l3_commercial_keys_valid, l3_persona_keys_valid
+
+# The V2 L3 Commercial rows hold at most 30 interests: a user with more is split into near-equal chunks
+# (layer3_commercial_step4_build_sft_data.py --max-interests 30), so the model is called once per chunk.
+MAX_COMMERCIAL_INTERESTS = 30
+
+
+def chunk_bounds(count: int, max_size: int) -> list[tuple[int, int]]:
+    """layer3_commercial_step4_build_sft_data.chunk_bounds: [start, end) bounds of ceil(count / max_size) contiguous
+    chunks whose sizes differ by at most one (e.g. 103 -> 26 + 26 + 26 + 25)."""
+    if not max_size or count <= max_size:
+        return [(0, count)]
+    chunks = -(-count // max_size)
+    base, extra = divmod(count, chunks)
+    bounds, start = [], 0
+    for index in range(chunks):
+        end = start + base + (index < extra)
+        bounds.append((start, end))
+        start = end
+    return bounds
 
 
 def active_interests(snapshot: dict) -> list[dict]:
@@ -18,12 +38,11 @@ class Persona(Task):
     stage, layer, prompt_file = "l3_persona", "layer3_persona", "prompt_l3_persona.md"
 
     def keys_valid(self, output: dict) -> bool:
-        return set(output) == {"interest_personas"} and exact_list_keys(
-            output["interest_personas"], {"interest_name", "category", "persona"})
+        return l3_persona_keys_valid(output)
 
     def payload(self, interests: list[dict]) -> dict:
-        """Layer3Persona._call_llm (its facts are always {})."""
-        return {"facts": {}, "interests": [
+        """Layer3Persona._call_llm's active interests; the V2 input has no facts (always {} in production)."""
+        return {"interests": [
             {"interest_name": i.get("interest_name"), "actual_activity": i.get("actual_activity", ""),
              "inferred_intent": i.get("inferred_intent", ""),
              "topics": [t.get("topic", "") for t in (i.get("topics") or [])]}
@@ -39,11 +58,9 @@ class Persona(Task):
 class Commercial(Task):
     """layer3_commercial_interests: commercial flag, score, funnel stage, entities and predicted queries."""
     stage, layer, prompt_file = "l3_commercial", "layer3_commercial_interests", "prompt_l3_commercial.md"
-    KEYS = {"interest_name", "commercial", "commercial_score", "intent_funnel_stage", "brands", "retailers",
-            "products", "predicted_queries"}
 
     def keys_valid(self, output: dict) -> bool:
-        return set(output) == {"interest_commercial"} and exact_list_keys(output["interest_commercial"], self.KEYS)
+        return l3_commercial_keys_valid(output)
 
     def payload(self, interests: list[dict], language: str) -> dict:
         """Layer3CommercialInterests._call_llm: topics with the actions of their (at most 3) evidence items."""
@@ -94,22 +111,29 @@ def postprocess(snapshot: dict, persona: dict, commercial: dict) -> dict:
 
 
 def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
-    """One round with both tasks for every user; sets profile.layer3."""
+    """One round with both tasks for every user (Commercial once per chunk of at most 30 interests, the answers
+    concatenated in input order); sets profile.layer3."""
     requests = {}
     for profile in profiles:
         interests = active_interests(profile.snapshot)
+        bounds = chunk_bounds(len(interests), MAX_COMMERCIAL_INTERESTS) if interests else []
+        commercial = [COMMERCIAL.request(
+            profile, lambda k, chunk=interests[start:end]: COMMERCIAL.payload(chunk[:k], profile.language["locale"]),
+            end - start, encode, suffix=f"|chunk{index}" if len(bounds) > 1 else "")
+            for index, (start, end) in enumerate(bounds)]
         requests[profile.user_id] = (
             interests and PERSONA.request(profile, lambda k: PERSONA.payload(interests[:k]), len(interests), encode),
-            interests and COMMERCIAL.request(
-                profile, lambda k: COMMERCIAL.payload(interests[:k], profile.language["locale"]), len(interests),
-                encode))
-    run_round([item for pair in requests.values() for item in pair if item])
+            [item for item in commercial if item])
+    run_round([item for persona, commercial in requests.values() for item in [persona, *commercial] if item])
 
     for profile in profiles:
-        persona_item, commercial_item = requests[profile.user_id]
+        persona_item, commercial_items = requests[profile.user_id]
+        answers = [output(item) for item in commercial_items]
+        merged = {"interest_commercial": [entry for answer in answers if answer
+                                          for entry in answer["interest_commercial"]]} if any(answers) else None
         persona = PERSONA.to_record(profile, output(persona_item))
-        commercial = COMMERCIAL.to_record(profile, output(commercial_item))
+        commercial = COMMERCIAL.to_record(profile, merged)
         emit_record(emit, profile, persona, persona_item)
-        emit_record(emit, profile, commercial, commercial_item)
+        emit_record(emit, profile, commercial, *commercial_items)
         profile.layer3 = postprocess(profile.snapshot, persona, commercial)
         emit_record(emit, profile, profile.layer3)
