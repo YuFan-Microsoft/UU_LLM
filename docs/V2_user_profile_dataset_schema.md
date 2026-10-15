@@ -85,9 +85,10 @@ L1 Negative  negative feedback -> rejected topics   (standalone: no user ID to j
 ## 4. Shared types and notation
 
 ```ts
-// Source: activity source. The last 7 values are rare (27 occurrences, only in L3 Commercial / L4 Biography inputs)
+// Source: activity source. The 9 values after "Shopping" are rare (259 occurrences, only in L3 Commercial / L4
+// Biography inputs; "Home Depot" 6)
 type Source = "MSN" | "Edge" | "Uet" | "Bing" | "Ads" | "ChromeImports" | "Shopping" | "Linkedin"
-            | "YouTube" | "Amazon" | "Xbox" | "Facebook" | "Google Play" | "Walmart" | "Yahoo";
+            | "YouTube" | "Amazon" | "Xbox" | "Facebook" | "Google Play" | "Walmart" | "Yahoo" | "Home Depot";
 type Lang   = "en" | "de" | "fr" | "es" | "ja" | "pt" | "nl" | "it" | "sv" | "pl" | "zh-Hans" | "zh-Hant";
 type Level  = "high" | "medium" | "low";
 type Scale  = "Low" | "Medium-Low" | "Medium" | "Medium-High" | "High";
@@ -250,7 +251,7 @@ and search queries.
 
 ```ts
 {
-  interests: [{                 // 1–187, median 43
+  interests: [{                 // 1–229, median 42
     interest_name: string,
     actual_activity: string,
     inferred_intent: string,
@@ -300,7 +301,7 @@ and search queries.
       yearsOfExperience?, experience_band?, seniorities?, functions?, companies?, current_company?
     }
   },
-  interests: [{                              // 1–190, median 44
+  interests: [{                              // 1–203, median 41
     interest_name: string,
     actual_activity: string,
     inferred_intent: string,
@@ -310,8 +311,8 @@ and search queries.
     first_detect_date: "YYYY-MM-DD",
     last_detect_date: "YYYY-MM-DD",
     source: Source[],
-    topics: string[],
-    predicted_queries?: string[],            // ~66%, from L3 Commercial
+    topics?: string[],                       // missing for 4 interests (4 rows)
+    predicted_queries?: string[],            // ~68%, from L3 Commercial
     products?: string[],                     // ~51%
     brands?: string[]                        // ~44%
   }]
@@ -379,7 +380,7 @@ type AgeSignals = {                          // present ~68%
 ```ts
 {
   life_stage: { value: string, confidence: Level, evidence: string[] },   // L4 Biography output
-  commercial_interests: [{                   // 1–114, median 27
+  commercial_interests: [{                   // 1–119, median 27
     interest_name: string,
     persona: string,
     brands: string[],
@@ -415,9 +416,11 @@ type AdsVertical = "HomeGarden" | "ComputersConsumerElectronics" | "RetailersGen
                  | "Finance" | "Apparel" | "Vehicles" | "InternetTelecom" | "Health" | "BeautyPersonalCare"
                  | "SportsFitness";          // Ads Vertical L1
 type ShopperType = "ResearchDriven" | "DealDriven" | "BrandRetailerLoyal" | "ValueDriven"
-                 | "NoveltySeeker" | "ConvenienceDriven" | "PremiumDriven";
+                 | "NoveltySeeker" | "ConvenienceDriven" | "PremiumDriven"
+                 | "ImpulseDriven";          // ImpulseDriven: 1 row
 type Diet        = "Unknown" | "Vegan" | "Vegetarian" | "No Gluten" | "Low-Carb" | "Keto" | "Halal" | "Dairy-Free"
-                 | "Kosher" | "Pescatarian" | "Paleo" | "No Nuts";    // the last 4 are rare (25 occurrences)
+                 | "Kosher" | "Pescatarian" | "Paleo" | "No Nuts"
+                 | "No Shellfish";           // the last 5 are rare (166 occurrences; No Shellfish 2)
 ```
 
 **Notes**
@@ -453,11 +456,12 @@ search queries.
   discount_sensitivity?:  { value: Scale, confidence_score: float },
   price_sensitivity?:     { value: Scale, confidence_score: float },
   subscription_affinity?: { value: Scale, confidence_score: float },
-  affinity: {
+  affinity?: {                                   // missing in 2 rows
     shopping: {
-      product_categories?: [{ category: string, description: string }],   // missing in 1 row
+      product_categories?: [{ category: string, description: string }],   // missing in 4 rows
       shopper_type?: { value: ShopperType[], confidence_score: float }
     },
+    // Diet plus "Low-Purine" / "Low-Sodium" (1 row each)
     dining?: { restrictions: { value: Diet[], confidence_score: float } }
   }
 }
