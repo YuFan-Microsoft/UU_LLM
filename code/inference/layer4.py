@@ -18,6 +18,10 @@ SCENARIOS = {"shopping", "dining", "learning", "travel", "hobbies", "fitness", "
 ENRICHMENT_SOURCES = ("cross_interest", "commercial_preference", "personal_context", "professional_context")
 DELTA_SOURCES = {"source_interest", *ENRICHMENT_SOURCES}
 MIN_HYPER_CONFIDENCE = 0.3  # hyper_preferences: preferences below this confidence are not shown to the hyper call
+# user_attributes.project_interest limits of the biography input (layer4_biography: _BIO_MAX_TOPICS, and 6 entities)
+BIO_MAX_TOPICS = 8
+BIO_MAX_COMMERCIAL_VALUES = 6
+_NULL_LIKE = {"", "-", "#null#", "null", "none", "nan", "n/a", "na", "unknown"}  # user_attributes._NULL_LIKE
 # Query languages written without spaces between words; their query word counts are not checked.
 UNSPACED_LANGUAGES = {"ja", "zh", "zh-Hans", "zh-Hant", "th"}
 
@@ -29,6 +33,26 @@ def _text(value) -> str:
 def _name_key(value) -> str:
     """_normalize_name: the case-insensitive linkage key of a name."""
     return _text(value).casefold()
+
+
+def _float(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _compact(values, limit: int) -> list[str]:
+    """user_attributes._compact: the first `limit` distinct (case-insensitive) values that are not null-like."""
+    out = []
+    for value in values:
+        text = "" if value is None else str(value).strip()
+        text = "" if text.casefold() in _NULL_LIKE else text
+        if text and text.casefold() not in {o.casefold() for o in out}:
+            out.append(text)
+        if len(out) >= limit:
+            break
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -43,20 +67,27 @@ class Biography(Task):
         return l4_biography_keys_valid(output)
 
     def payload(self, interests: list[dict]) -> dict:
-        """The V2 input: no declared attributes or facts here, and the layer3_postprocessing interests highest count
-        first (ties keep the confidence order), each with its topic names and, when not empty, the Layer-3 brands,
-        products and predicted queries."""
+        """The V2 input, built as layer4_biography does (user_attributes.rank_interests / project_interest): no
+        declared attributes or facts here, and the layer3_postprocessing interests highest count first, then highest
+        confidence, each with at most 8 distinct topic names (most frequent topics first; no topics key when none)
+        and, for commercial interests only, at most 6 distinct brands, products and predicted queries each."""
         projected = []
-        for i in sorted(interests, key=lambda i: i.get("count") or 0, reverse=True):
+        for i in sorted(interests, key=lambda i: (-_float(i.get("count")), -_float(i.get("confidence_score")))):
             item = {"interest_name": i.get("interest_name"), "actual_activity": i.get("actual_activity", ""),
                     "inferred_intent": i.get("inferred_intent", ""), "persona": i.get("persona", ""),
                     "confidence_score": i.get("confidence_score", 0), "count": i.get("count", 0),
                     "first_detect_date": i.get("first_detect_date", ""),
-                    "last_detect_date": i.get("last_detect_date", ""), "source": i.get("source", []),
-                    "topics": [t.get("topic", "") for t in (i.get("topics") or [])]}
-            for key in ("brands", "products", "predicted_queries"):
-                if i.get(key):
-                    item[key] = i[key]
+                    "last_detect_date": i.get("last_detect_date", ""), "source": i.get("source", [])}
+            topics = sorted((t for t in i.get("topics") or [] if isinstance(t, dict)),
+                            key=lambda t: -float(t.get("count") or 0))
+            names = _compact((t.get("topic") for t in topics), BIO_MAX_TOPICS)
+            if names:
+                item["topics"] = names
+            if i.get("commercial"):
+                for key in ("brands", "products", "predicted_queries"):
+                    values = _compact(i.get(key) or [], BIO_MAX_COMMERCIAL_VALUES)
+                    if values:
+                        item[key] = values
             projected.append(item)
         return {"declared_attributes": {}, "facts": {}, "interests": projected}
 
