@@ -25,14 +25,14 @@ from vllm_colocate_rollout import load_rollout_eval_examples
 QWEN3_5_FULL_ARCH = "Qwen3_5ForConditionalGeneration"
 DEFAULT_DATASET = "yufan/user_profile_dataset"
 DEFAULT_CONFIGS = [
-    "V1_User_Profile_L1_gpt54",
-    "V1_User_Profile_L2_gpt54",
-    "V1_User_Profile_L3_Persona_gpt54",
-    "V1_User_Profile_L3_Commercial_gpt54",
-    "V1_User_Profile_L4_Biography_gpt54",
-    "V1_User_Profile_L4_CommercialPreference_gpt54",
-    "V1_User_Profile_L4_MissionDiscovery_gpt54",
-    "V1_User_Profile_L4_MissionEnhancement_gpt54",
+    "V2_User_Profile_L1_gpt56",
+    "V2_User_Profile_L1_Negative_gpt56",
+    "V2_User_Profile_L2_gpt56",
+    "V2_User_Profile_L3_Persona_gpt56",
+    "V2_User_Profile_L3_Commercial_gpt56",
+    "V2_User_Profile_L4_Biography_gpt56",
+    "V2_User_Profile_L4_CommercialPreference_gpt56",
+    "V2_User_Profile_L4_Hyper_gpt56",
 ]
 
 
@@ -49,8 +49,8 @@ def parse_args() -> argparse.Namespace:
                         help="Same as --rollout_eval_samples; <= 0 evaluates the whole split")
     parser.add_argument("--dataset_shuffle_seed", type=int, default=42,
                         help="Selects the subset when --samples_per_config > 0 (same as training)")
-    parser.add_argument("--max_model_len", type=int, default=15360)
-    parser.add_argument("--max_tokens", type=int, default=8192)
+    parser.add_argument("--max_model_len", type=int, default=25600)
+    parser.add_argument("--max_tokens", type=int, default=16384)
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.8)
     parser.add_argument("--top_k", type=int, default=-1, help="<= 0 leaves top-k disabled")

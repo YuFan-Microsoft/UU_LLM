@@ -339,7 +339,11 @@ cd UU_LLM/code/trainer/SFT
 export HF_TOKEN=...   # needs access to yufan/user_profile_dataset
 sh run_user_profile_multi_gpu.sh                  # perplexity + vLLM rollout eval (default)
 ROLLOUT_EVAL=0 sh run_user_profile_multi_gpu.sh   # perplexity eval only
+ROLLOUT_EVAL_SAMPLES=-1 sh run_user_profile_multi_gpu.sh   # roll out the whole test split (default: 256 per task)
 ```
+
+The script currently uses debug settings (1 epoch, `--checkpoint_steps 100`, 256 rollouts per task); raise
+`--checkpoint_steps` and set `ROLLOUT_EVAL_SAMPLES=-1` for a full run.
 
 Generic SFT on another dataset uses the base trainer directly (see `run_multi_gpu.sh`):
 
@@ -351,16 +355,15 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 
 - Hugging Face dataset with `train` / `test` splits and a `messages` column
   (`[{"role": "user", ...}, {"role": "assistant", ...}]`).
-- User-profile SFT loads `yufan/user_profile_dataset`, the eight `V1_` configs (L1, L2, L3 Persona, L3 Commercial,
-  L4 Biography, L4 Commercial Preference, L4 Mission Discovery, L4 Mission Enhancement; each with the simplified
-  task prompt and rows ≤ 20,480 Qwen3.5-4B tokens), concatenates them and shuffles with `--dataset_shuffle_seed`.
-  Rollout scoring rules exist for all eight configs (see the rollout metrics below).
-- The train split is mixed with `--dataset_mixing_alpha 0.5` (default in `deepspeed_user_profile_trainer.py`):
-  each epoch has the rows of one natural epoch, split across configs in proportion to `rows ** 0.5`. Large
-  configs (L1, L2, L4 Mission Enhancement, ~0.7-0.9 passes per epoch) see fresh rows each epoch and are fully
-  covered after two epochs; small configs repeat (L4 Commercial Preference ~3 passes per epoch, ~9 over the three
-  epochs of `run_user_profile_multi_gpu.sh`). The test split is not mixed.
-  The per-config quotas are printed at startup.
+- User-profile SFT loads `yufan/user_profile_dataset` with the eight `V2_` configs (L1, L1 Negative, L2, L3 Persona,
+  L3 Commercial, L4 Biography, L4 Commercial Preference, L4 Hyper; GPT-5.6, each with its simplified task prompt, rows
+  ≤ 25,600 Qwen3.5-4B tokens). Rollout scoring rules exist for all eight configs (see the rollout metrics below).
+- The train split is mixed with `--dataset_mixing_weights` (`V2_MIXTURE` in `deepspeed_user_profile_trainer.py`):
+  each epoch has the rows of one natural epoch (~1.19M), split across configs by these shares. L1 and L2 get 30%
+  each (~1.3-1.4 passes per epoch), L1 Negative 16% (~0.34 passes: short and highly redundant, 74% single-signal
+  rows), and L3 Persona / L3 Commercial / L4 Biography / L4 Commercial Preference / L4 Hyper 5 / 7 / 5 / 4 / 3%
+  (~2.4-3.1 passes each). `--dataset_mixing_alpha` (shares proportional to `rows ** alpha`) is the alternative when
+  no weights are given. The test split is not mixed. The per-config quotas, shares and passes are printed at startup.
 - The chat template is applied with `enable_thinking=False`. Loss is computed only on the assistant answer
   (through its final EOS); the prompt tokens are masked with `-100`.
 
@@ -377,7 +380,7 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
   python UU_LLM/pyscript/analyze_sequence_lengths.py --hf_token "$HF_TOKEN"
   ```
 
-- For rollout eval, `--rollout_max_model_len` (default 15360, the script uses 20480) must cover prompt + generated
+- For rollout eval, `--rollout_max_model_len` (default 15360, the script uses 25600) must cover prompt + generated
   answer; keep it at or above `--max_seq_len`. Prompts that leave no room for generation are skipped, and
   the generation budget per example is `min(--rollout_max_tokens, rollout_max_model_len - prompt_tokens)`.
 
@@ -444,42 +447,66 @@ Saved under `--output_dir` as `epoch_<e>_step_<s>_ppl_<ppl>/`:
   summarize+write, total) and `Rollout throughput` (total tokens, avg generated tokens per prompt, overall
   gen tok/s, prompts/s, outputs that hit `max_tokens`).
 
-**Metrics** (wandb `<Task>_Evaluation/<metric>`, next to the task's eval perplexity, one section per task: `L1_Delta`, `L2_Merge`, `L3_Persona`,
-`L3_Commercial`, `L4_Biography`, `L4_CommercialPreference`, `L4_MissionDiscovery`, `L4_MissionEnhancement`;
-x-axis `eval_step`)
+**Metrics** (wandb `<Task>_Evaluation/<metric>`, next to the task's eval perplexity `token_ppl`, x-axis `eval_step`).
+One section per V2 task: every section has the 4 shared charts plus 1-2 task charts (L3 Commercial: 4).
 
-| Layer | Metric | Meaning |
+| Section (config) | Charts |
+| --- | --- |
+| `L1_Interest` (`V2_User_Profile_L1_gpt56`) | shared + `topic_evidence_valid_ratio`, `avg_interest_num` |
+| `L1_Negative` (`V2_User_Profile_L1_Negative_gpt56`) | shared + `signal_coverage_ratio`, `field_consistent_ratio` |
+| `L2_Merge` (`V2_User_Profile_L2_gpt56`) | shared + `input_match_ratio`, `merge_ratio` |
+| `L3_Persona` (`V2_User_Profile_L3_Persona_gpt56`) | shared + `input_match_ratio` |
+| `L3_Commercial` (`V2_User_Profile_L3_Commercial_gpt56`) | shared + `input_match_ratio`, `query_language_match_ratio_en`, `query_language_match_ratio_glb`, `avg_query_num` |
+| `L4_Biography` (`V2_User_Profile_L4_Biography_gpt56`) | shared + `declared_match_ratio`, `source_grounded_ratio` |
+| `L4_CommercialPreference` (`V2_User_Profile_L4_CommercialPreference_gpt56`) | shared + `value_detail_consistent_ratio` |
+| `L4_Hyper` (`V2_User_Profile_L4_Hyper_gpt56`) | shared + `input_match_ratio`, `query_language_match_ratio` |
+
+| Task | Metric | Meaning |
 | --- | --- | --- |
-| All | `json_valid_ratio` | Outputs that (1) parse as a JSON object, (2) have exactly the task's keys at every level, in any order (L2: per decision, the keys of its `action`, which must be `merge` or `add`; L4 Mission Enhancement: the audit blocks are optional), and (3) have the expected value type everywhere (string, int, bool, null, list, object; e.g. L1 `evidence` is a list of ints, L3 Commercial `commercial_score` a string or null). Enum values, empty text and counts are rules, not JSON validity |
-| All | `rule_based_pass_ratio` | Outputs that are JSON-valid and break no rule (L1 / L2 cleaning rules, or the L3 / L4 categories below) |
+| All | `token_ppl` | Token-level eval perplexity of the task's test split (see "Eval perplexity") |
+| All | `json_valid_ratio` | Outputs that (1) parse as a JSON object, (2) have exactly the task's keys at every level, in any order (L2: per decision, the keys of its `action`, which must be `merge` or `add`; L4 Biography: `age_group.signals` and `signals.linkedin_min_age` are optional), and (3) have the expected value type everywhere (string, int, bool, null, list, object; e.g. L1 `evidence` is a list of ints, L3 Commercial `commercial_score` a string or null). Enum values, empty text and counts are rules, not JSON validity |
+| All | `rule_based_pass_ratio` | Outputs that are JSON-valid and break no rule (L1 / L2 cleaning rules, or the categories below) |
 | All | `truncated_ratio` | Generations that hit `--rollout_max_tokens` (`finish_reason == "length"`); these usually also fail `json_valid_ratio` |
 | L1 | `topic_evidence_valid_ratio` | Topics whose evidence idx all exist in the input and whose `source` equals their evidence sources |
 | L1 | `avg_interest_num` | Average number of interests per output |
+| L1 Negative | `signal_coverage_ratio` | Outputs whose evidence idx all exist in the input and that cite every input signal |
+| L1 Negative | `field_consistent_ratio` | Outputs where every interest's `signal_type` (the action prefixes, lowercased), `source` and `detailed_source` equal those of the signals it cites |
 | L2 | `input_match_ratio` | Outputs whose decided `delta_interest_name` values exactly equal the input delta names (same count, each side found in the other, case-sensitive) |
 | L2 | `merge_ratio` | Share of `merge` among add/merge decisions |
-| L3 / L4 | `input_match_ratio` | Outputs with no `input_mismatch`. Not logged for L4 Biography and L4 Commercial Preference |
-| L3 Commercial, L4 Enhancement | `query_language_match_ratio_en` | Outputs whose queries are in the requested `query_language` (fastText, below), over rows requesting `en` |
-| L3 Commercial, L4 Enhancement | `query_language_match_ratio_glb` | Same, over rows requesting any other language |
-| L3 Commercial, L4 Enhancement | `avg_query_num` | Predicted queries per commercial interest (L3, prompt allows 1-3) / per enhanced mission (L4, 1-4) |
+| L3 Persona / Commercial, L4 Hyper | `input_match_ratio` | Outputs with no `input_mismatch` |
+| L3 Commercial | `query_language_match_ratio_en` | Outputs whose queries are in the requested `query_language` (fastText, below), over rows requesting `en` |
+| L3 Commercial | `query_language_match_ratio_glb` | Same, over rows requesting any other language |
+| L3 Commercial | `avg_query_num` | Predicted queries per commercial interest (prompt allows 1-3) |
+| L4 Biography | `declared_match_ratio` | Outputs that copy every declared attribute verbatim with source `declared`, use `declared` for nothing else, and give `age_group.signals` only for an inferred age group |
+| L4 Biography | `source_grounded_ratio` | Outputs whose `linkedin` / `location_data` sources have that fact in the input (and LinkedIn occupation / company / education_area the field they copy, unless a status such as Self-Employed), with `signals.linkedin_min_age` exactly when there is a LinkedIn profile |
+| L4 Commercial Preference | `value_detail_consistent_ratio` | Outputs whose sensitivity / affinity values are Unknown exactly without details and otherwise within the range of their detail levels, whose shopper types and dining restrictions equal their details, and whose product categories do not repeat |
+| L4 Hyper | `query_language_match_ratio` | Outputs whose queries are in the requested `query_language` (fastText, below), over all checked rows |
 
-L3 / L4 rule categories:
+L1 Negative / L3 / L4 rule categories (mirroring `pyscript/data_cleaning/*_rule_based_clean.py`):
 
 | Category | Rules |
 | --- | --- |
-| `invalid_value` | Bad enum (category path, score, funnel stage, life stage, tier, shopper type, restriction, scenario, value_type, delta_source), empty required text, wrong count (> 12 discovery missions, > 3 brands, 1-4 enhancement queries, 1-3 L3 queries), L3 commercial=false with non-null fields |
-| `input_mismatch` | Interest names not exactly the input names once each (L3), source interests not in the input (Discovery), unknown input mission, sources or query refs, or brands / queries already in the input (Enhancement) |
-| `inconsistent` | Duplicate personas, entities, queries, evidence, categories or missions; category spelled two ways; Commercial Preference values disagreeing with their details |
-| `text_quality` | Query ending in `?` or outside 2-10 words (L3) / 2-7 words (Enhancement), skipped for ja/zh/th; JSON fragments in biography text |
-| `wrong_language` | L3 Commercial and L4 Mission Enhancement only: the predicted queries are not in the input `query_language` |
+| `invalid_value` | Bad enum (category path, score, funnel stage, life stage, attribute values / confidence / source, sensitivity level, shopper type, Ads Vertical, scenario, value_type, delta_source), empty required text, wrong count (1-3 L3 queries, > 3 attribute evidence, > 3 brands, 1-4 Hyper queries), L3 commercial=false with non-null fields, L1 Negative `reliability_score` outside 0-1 |
+| `input_mismatch` | Interest names not exactly the input names once each (L3); evidence idx missing from the input or an uncited signal (L1 Negative); declared attributes or fact sources not matching the input (L4 Biography); source interests not in the input, query refs not Existing queries of the sources, or brands / queries already in the input (L4 Hyper) |
+| `inconsistent` | Duplicate personas, entities, queries, evidence, keywords or categories; category spelled two ways; L1 Negative `signal_type` / `source` / `detailed_source` not those of the cited signals; L4 Biography Unknown values without source unknown (or the reverse), known values without evidence, or pronouns contradicting gender; Commercial Preference values disagreeing with their details |
+| `text_quality` | Query ending in `?` (L3, L4 Hyper) or outside 2-10 words (L3, skipped for ja/zh/th); JSON fragments in L4 Biography text |
+| `wrong_language` | L3 Commercial and L4 Hyper: the predicted queries are not in the input `query_language`. L4 Biography and L4 Commercial Preference: the free text (biography and evidence; descriptions, areas and evidence) is not English |
 
-`wrong_language` uses the same fastText lid.176 vote as the data cleaning
-(`pyscript/data_cleaning/layer3_commercial_step2_language_detection.py`): every distinct non-URL query tagged
-with probability >= 0.5 votes, the top language needs >= 60% of the votes (otherwise "mix", a mismatch), and
-Chinese is split into `zh-Hans` / `zh-Hant` with OpenCC. Rollouts with no taggable query are not checked.
-Those two tasks also log `query_language_match_ratio_en` / `query_language_match_ratio_glb` (over checked
-rollouts requesting `en` / any other language). It needs `fasttext-wheel` and
-`opencc-python-reimplemented` (in the Dockerfile and `requirements_inference.txt`). The model is read from
-`$LID_MODEL_PATH` (default `UU_LLM/models/lid.176.bin`) and downloaded there on first use when missing.
+Not checked, by design: L1 Negative keyword length, case and reaction words, and L4 Hyper query word counts.
+
+Closed vs open vocabulary: fields with a fixed label set (enums above, and L1 `predicted_content_locale`, which must be
+one of the V2 content locales `en`, `de`, `fr`, `es`, `ja`, `pt`, `nl`, `it`, `sv`, `pl`, `zh-Hans`, `zh-Hant` or `mix`;
+otherwise the L1 rule `invalid_content_locale`) are strict. Open attributes only need non-empty text: names, topics,
+personas, entities, queries, keywords, L4 Biography home_location / occupation / company / education_area, and L4
+Commercial Preference dining restrictions (any labels, or `["Unknown"]` alone, still matching their details).
+
+`wrong_language` uses the same fastText lid.176 vote as the data cleaning: every distinct non-URL text tagged
+with probability >= 0.5 votes and Chinese is split into `zh-Hans` / `zh-Hant` with OpenCC. For queries
+(`pyscript/data_cleaning/layer3_commercial_step2_language_detection.py`) the top language needs >= 60% of the votes
+(otherwise "mix", a mismatch); for English free text (the L4 cleaning's `is_english`) it needs >= 80%. Rollouts with
+no taggable text are not checked. It needs `fasttext-wheel` and `opencc-python-reimplemented` (in the Dockerfile and
+`requirements_inference.txt`). The model is read from `$LID_MODEL_PATH` (default `UU_LLM/models/lid.176.bin`) and
+downloaded there on first use when missing.
 
 `json_valid_ratio`, `rule_based_pass_ratio` and `truncated_ratio` are over all samples; the other ratios are over JSON-valid
 outputs, so read them together with `json_valid_ratio`. Per-example results (prediction, reference, violated rules) are written to
@@ -489,9 +516,9 @@ outputs, so read them together with `json_valid_ratio`. Per-example results (pre
 
 | Argument | Default | Notes |
 | --- | --- | --- |
-| `--rollout_eval_samples` | 256 | Per config; `<= 0` = whole split |
-| `--rollout_max_model_len` | 15360 | Prompt + generation; the script uses 20480 |
-| `--rollout_max_tokens` | 8192 | Max generated tokens |
+| `--rollout_eval_samples` | 256 | Per config; `<= 0` = whole split. The script uses `ROLLOUT_EVAL_SAMPLES` (default 256; `-1` for the whole split) |
+| `--rollout_max_model_len` | 15360 | Prompt + generation; the script uses 25600 |
+| `--rollout_max_tokens` | 8192 | Max generated tokens; the script uses 16384 (L3 Persona answers reach ~14k tokens) |
 | `--rollout_gpu_memory_utilization` | 0.3 | vLLM share of total GPU memory while awake (the script uses 0.7 on 80 GB); lower it on OOM |
 | `--rollout_max_num_seqs` | 64 | Concurrent sequences per GPU |
 | `--rollout_enforce_eager` | on | `--no-rollout_enforce_eager` enables CUDA graphs: faster, but keeps ~1-2 GiB while asleep |
@@ -509,8 +536,8 @@ python evaluate_user_profile_vllm.py --checkpoint <ckpt_dir> --output_dir <eval_
 `evaluate_user_profile_vllm.py` reproduces the in-training rollout evaluation locally: it reuses
 `load_rollout_eval_examples` / `build_prompt_ids` from `vllm_colocate_rollout.py` and
 `score_example` / `summarize_records` from `user_profile_rules.py`, so it reports the same metrics.
-Its sampling defaults match the rollout arguments in `run_user_profile_multi_gpu.sh` (whole test split,
-`max_model_len` 15360, `max_tokens` 8192, temperature 0.6, top-p 0.8, repetition penalty 1.0, thinking off);
+Its sampling defaults match the rollout arguments in `run_user_profile_multi_gpu.sh` (whole test split by default,
+`max_model_len` 25600, `max_tokens` 16384, temperature 0.6, top-p 0.8, repetition penalty 1.0, thinking off);
 pass `--temperature 0` for greedy decoding. Like training, examples are sharded round-robin over
 data-parallel vLLM engines, one per `--tensor_parallel_size` GPUs on all visible GPUs (`--num_gpus` or
 `CUDA_VISIBLE_DEVICES` to limit), each in its own process with seed `--seed + engine index`. Because

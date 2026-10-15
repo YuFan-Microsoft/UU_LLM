@@ -115,11 +115,12 @@ class ConfigIndexCollator:
         return batch
 
 
-def mixture_quotas(sizes, alpha):
-    """Rows per epoch for each config: total rows of one natural epoch split in proportion to n ** alpha
-    (alpha=1 keeps the natural mix, alpha=0 gives every config the same share)."""
+def mixture_quotas(sizes, alpha, weights=None):
+    """Rows per epoch for each config: total rows of one natural epoch split in proportion to `weights` when given,
+    else to n ** alpha (alpha=1 keeps the natural mix, alpha=0 gives every config the same share)."""
     total = sum(sizes)
-    weights = [size ** alpha for size in sizes]
+    if weights is None:
+        weights = [size ** alpha for size in sizes]
     return [max(1, int(round(total * weight / sum(weights)))) for weight in weights]
 
 
@@ -132,14 +133,14 @@ class MixedEpochLLMDataset(Dataset):
     constant, so the LR schedule is unchanged. Call set_epoch(epoch) on every rank before each epoch.
     """
 
-    def __init__(self, config_datasets, config_names, tokenizer, max_seq_len, alpha, seed) -> None:
+    def __init__(self, config_datasets, config_names, tokenizer, max_seq_len, alpha, seed, weights=None) -> None:
         super().__init__()
         self.dataset = concatenate_datasets(config_datasets)
         self.tokenizer = tokenizer
         self.max_seq_len = max_seq_len
         self.seed = seed
         self.sizes = [len(dataset) for dataset in config_datasets]
-        self.quotas = mixture_quotas(self.sizes, alpha)
+        self.quotas = mixture_quotas(self.sizes, alpha, weights)
         self.offsets = np.cumsum([0] + self.sizes[:-1])
         rng = np.random.default_rng(seed)
         self.orders = [rng.permutation(size) for size in self.sizes]
@@ -147,8 +148,10 @@ class MixedEpochLLMDataset(Dataset):
         self.set_epoch(0)
 
     def describe(self):
+        total = sum(self.quotas)
         return [
-            {"config": name, "rows": size, "rows_per_epoch": quota, "passes_per_epoch": round(quota / size, 2)}
+            {"config": name, "rows": size, "rows_per_epoch": quota, "share": round(quota / total, 4),
+             "passes_per_epoch": round(quota / size, 2)}
             for name, size, quota in zip(self.config_names, self.sizes, self.quotas)
         ]
 
@@ -177,7 +180,8 @@ def create_dataset(dataset_name,
                    dataset_configs=None,
                    hf_token=None,
                    shuffle_seed=42,
-                   mixing_alpha=None):
+                   mixing_alpha=None,
+                   mixing_weights=None):
     load_kwargs = {"token": hf_token} if hf_token else {}
     if dataset_configs:
         config_datasets = [
@@ -197,12 +201,13 @@ def create_dataset(dataset_name,
         ]).shuffle(seed=shuffle_seed)
     else:
         dataset = load_dataset(dataset_name, **load_kwargs)
-    if dataset_configs and mixing_alpha is not None:
+    if dataset_configs and (mixing_alpha is not None or mixing_weights):
         train_llm_dataset = MixedEpochLLMDataset(
             [config_dataset["train"] for config_dataset in config_datasets], list(dataset_configs),
-            tokenizer, max_seq_len, mixing_alpha, shuffle_seed)
+            tokenizer, max_seq_len, mixing_alpha, shuffle_seed, mixing_weights)
         if torch.distributed.get_rank() == 0:
-            print(f"Train mixture (alpha={mixing_alpha}, {len(train_llm_dataset)} rows per epoch): "
+            mixing = f"weights={mixing_weights}" if mixing_weights else f"alpha={mixing_alpha}"
+            print(f"Train mixture ({mixing}, {len(train_llm_dataset)} rows per epoch): "
                   f"{json.dumps(train_llm_dataset.describe(), indent=2)}", flush=True)
     else:
         train_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "train")
@@ -441,6 +446,9 @@ def parse_args(argument_defaults=None):
                         help="Mix --dataset_configs with per-epoch quotas proportional to rows ** alpha "
                              "(e.g. 0.5); large configs rotate through fresh rows, small ones repeat. "
                              "Default: concatenate all configs")
+    parser.add_argument('--dataset_mixing_weights', nargs='+', type=float, default=None,
+                        help="Relative per-epoch row shares of --dataset_configs, in the same order (e.g. 30 16 30 ...); "
+                             "overrides --dataset_mixing_alpha. The epoch length stays the total row count")
     parser.add_argument('--model_name_or_path', type=str, required=True)
     parser.add_argument('--output_dir', type=str, default='./checkpoints')
 
@@ -497,6 +505,10 @@ def parse_args(argument_defaults=None):
     if argument_defaults:
         parser.set_defaults(**argument_defaults)
     args = parser.parse_args()
+    if args.dataset_mixing_weights and (not args.dataset_configs
+                                        or len(args.dataset_mixing_weights) != len(args.dataset_configs)
+                                        or min(args.dataset_mixing_weights) <= 0):
+        parser.error("--dataset_mixing_weights needs one positive weight per --dataset_configs entry")
     return args
 
 def save_checkpoint(args, model, processor, epoch, step, ppl):
@@ -775,13 +787,14 @@ def rollout_evaluation(args, rollout, examples, rollout_scorer, model, tokenizer
         wandb_module.log(log)
 
 
-TASK_DISPLAY_NAMES = {"L1": "L1_Delta", "L2": "L2_Merge"}
+TASK_DISPLAY_NAMES = {"L1": "L1_Interest", "L2": "L2_Merge"}
 
 
 def task_name(config):
-    """Short task name of a dataset config: "User_Profile_L1_gpt54_MaxLen15360" or "V1_User_Profile_L1_gpt54"
-    -> "L1_Delta", "V1_User_Profile_L2_gpt54" -> "L2_Merge", "V1_User_Profile_L3_Persona_gpt54" -> "L3_Persona"."""
-    match = re.search(r"(?:^|_)(L\d+(?:_[A-Za-z]+)?)_gpt54(?:_|$)", config or "") \
+    """Short task name of a dataset config: "V2_User_Profile_L1_gpt56" -> "L1_Interest",
+    "V2_User_Profile_L1_Negative_gpt56" -> "L1_Negative", "V2_User_Profile_L2_gpt56" -> "L2_Merge",
+    "V2_User_Profile_L3_Persona_gpt56" -> "L3_Persona" (V1 "_gpt54" configs map the same way)."""
+    match = re.search(r"(?:^|_)(L\d+(?:_[A-Za-z]+)?)_gpt5\d(?:_|$)", config or "") \
         or re.search(r"(?:^|_)(L\d+)(?:_|$)", config or "")
     if not match:
         return config or "all"
@@ -833,6 +846,7 @@ def main(argument_defaults=None, rollout_scorer=None):
         hf_token=args.hf_token,
         shuffle_seed=args.dataset_shuffle_seed,
         mixing_alpha=args.dataset_mixing_alpha,
+        mixing_weights=args.dataset_mixing_weights,
     )
     rollout, rollout_examples = None, None
     if args.rollout_eval:
