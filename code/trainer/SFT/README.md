@@ -337,14 +337,16 @@ vLLM 0.24 supports only the full multimodal architecture, so training, checkpoin
 ```bash
 cd UU_LLM/code/trainer/SFT
 export HF_TOKEN=...   # needs access to yufan/user_profile_dataset
-sh run_user_profile_multi_gpu.sh                  # perplexity + vLLM rollout eval (default)
+sh run_user_profile_multi_gpu.sh                  # perplexity + vLLM rollout eval on the whole test split (default)
 ROLLOUT_EVAL=0 sh run_user_profile_multi_gpu.sh   # perplexity eval only
-ROLLOUT_EVAL_SAMPLES=-1 sh run_user_profile_multi_gpu.sh   # roll out the whole test split (default: 256 per task)
+ROLLOUT_EVAL_SAMPLES=256 sh run_user_profile_multi_gpu.sh   # roll out 256 examples per task (debug)
 ```
 
-The script currently uses debug settings (1 epoch, `--checkpoint_steps 100`, `--max_eval_steps 64` = a fixed ~5k-row
-perplexity subset, 256 rollouts per task); raise `--checkpoint_steps`, raise or drop `--max_eval_steps` (the full V2
-test split is ~335 steps on 40 GPUs) and set `ROLLOUT_EVAL_SAMPLES=-1` for a full run.
+The script evaluates on the whole V2 test split (52,639 rows over the 8 configs) every 2000 steps
+(`--checkpoint_steps 2000`, no `--max_eval_steps`; perplexity is ~660 eval steps on 40 GPUs with
+`--per_device_eval_batch_size 2`) and rolls out every test example (`ROLLOUT_EVAL_SAMPLES=-1`), also at step 0 and at
+the end of training. A full rollout generates up to 16,384 tokens for each of the ~52.6k examples, so every eval takes
+much longer than the training steps between evals; pass `--max_eval_steps` or set `ROLLOUT_EVAL_SAMPLES` to subsample.
 
 Generic SFT on another dataset uses the base trainer directly (see `run_multi_gpu.sh`):
 
@@ -360,10 +362,10 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
   L3 Commercial, L4 Biography, L4 Commercial Preference, L4 Hyper; GPT-5.6, each with its simplified task prompt, rows
   ≤ 25,600 Qwen3.5-4B tokens). Rollout scoring rules exist for all eight configs (see the rollout metrics below).
 - The train split is mixed with `--dataset_mixing_weights` (`V2_MIXTURE` in `deepspeed_user_profile_trainer.py`):
-  each epoch has the rows of one natural epoch (~1.19M), split across configs by these shares. L1 and L2 get 30%
-  each (~1.3-1.4 passes per epoch), L1 Negative 16% (~0.34 passes: short and highly redundant, 74% single-signal
-  rows), and L3 Persona / L3 Commercial / L4 Biography / L4 Commercial Preference / L4 Hyper 5 / 7 / 5 / 4 / 3%
-  (~2.4-3.1 passes each). `--dataset_mixing_alpha` (shares proportional to `rows ** alpha`) is the alternative when
+  each epoch has the rows of one natural epoch (1,705,608), split across configs by these shares: L1 20.1%, L1
+  Negative 13.9%, L2 19.5%, L3 Persona 5.8%, L3 Commercial 10.9%, L4 Biography 12.1%, L4 Commercial Preference 10.6%,
+  L4 Hyper 7.1%. Every config is seen ~1.28 times per epoch, except L1 Negative (~0.43 passes: short and highly
+  redundant, 74% single-signal rows). `--dataset_mixing_alpha` (shares proportional to `rows ** alpha`) is the alternative when
   no weights are given. The test split is not mixed. The per-config quotas, shares and passes are printed at startup.
 - The chat template is applied with `enable_thinking=False`. Loss is computed only on the assistant answer
   (through its final EOS); the prompt tokens are masked with `-100`.
@@ -517,7 +519,7 @@ outputs, so read them together with `json_valid_ratio`. Per-example results (pre
 
 | Argument | Default | Notes |
 | --- | --- | --- |
-| `--rollout_eval_samples` | 256 | Per config; `<= 0` = whole split. The script uses `ROLLOUT_EVAL_SAMPLES` (default 256; `-1` for the whole split) |
+| `--rollout_eval_samples` | 256 | Per config; `<= 0` = whole split. The script uses `ROLLOUT_EVAL_SAMPLES` (default -1 = the whole split; e.g. 256 to debug) |
 | `--rollout_max_model_len` | 15360 | Prompt + generation; the script uses 25600 |
 | `--rollout_max_tokens` | 8192 | Max generated tokens; the script uses 16384 (L3 Persona answers reach ~14k tokens) |
 | `--rollout_gpu_memory_utilization` | 0.3 | vLLM share of total GPU memory while awake (the script uses 0.7 on 80 GB); lower it on OOM |
