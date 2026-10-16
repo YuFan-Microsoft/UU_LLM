@@ -19,6 +19,9 @@ For every config this guide shows what the model reads (**Input**) and what it m
 | `V2_User_Profile_L4_CommercialPreference_gpt56` | Commercial interests → shopping preferences | 141,250 | 7,093 |
 | `V2_User_Profile_L4_Hyper_gpt56` | Commercial interests + context → ad missions + new queries | 94,514 | 4,843 |
 
+Which input fields can be empty, and whether "empty" means a missing key, `{}`, `[]`, or `""`, is measured per config
+in the [Appendix](#appendix--input-completeness-audit-empty-vs-missing).
+
 ---
 
 ## 2. Row format (all configs)
@@ -505,3 +508,159 @@ search queries.
   }]
 }
 ```
+
+---
+
+## Appendix — Input completeness audit (empty vs. missing)
+
+Every row of all 47 V2 files (1,758,247 rows, train + test) was scanned, one file at a time, from L4 back to L1. For
+each input path we counted whether the **key is missing** or the key is present with an **empty value** (`{}`, `[]`,
+`""`). L4 Hyper's JSON-string and Markdown fields were parsed again and counted line by line.
+
+- `null` never appears in any V2 input.
+- Every row parses, has exactly one `user` + one `assistant` turn, and uses the single prompt of its config.
+- "rare" below = < 0.5% of the parent items.
+
+### A.1 Summary — how each config says "no data"
+
+| Config | Rows | Top-level keys (always all present) | Top-level value can be empty | Absent optional data inside |
+|---|---:|---|---|---|
+| L4 Hyper | 99,357 | `personal_context`, `professional_context`, `commercial_preferences`, `commercial_interests`, `query_language` | `personal_context` = `""` 44.3%; `professional_context` = `""` 87.6% | **line / key omitted** inside the Markdown and JSON strings (never an empty value) |
+| L4 Commercial Preference | 148,343 | `life_stage`, `commercial_interests`, `non_commercial_interest_names` | `non_commercial_interest_names` = `[]` 15.4% | **key kept, value `[]`** (no key is ever missing) |
+| L4 Biography | 169,896 | `declared_attributes`, `facts`, `interests` | `declared_attributes` = `{}` 64.9%; `facts` = `{}` 54.9% | **key omitted** (never `[]` / `""` / `{}` below the top level) |
+| L3 Commercial | 152,336 | `interests`, `query_language` | no | key kept; rare `""` / `[]` |
+| L3 Persona | 81,092 | `interests` | no | key kept; rare `""` / `[]` |
+| L2 | 265,117 | `snapshot`, `delta` | `snapshot` = `[]` in 24 rows | key kept; rare `""` / `[]` |
+| L1 Negative | 568,918 | JSONL lines `{idx, source, detailed_source, action}` | no | every line has all 4 keys, none empty |
+| L1 | 273,188 | JSONL lines `{idx, date, source, action}` | no | every line has all 4 keys, none empty |
+
+L1–L3 inputs are uniform. Only L4 varies, and each L4 config uses its own convention — even for the same data. For
+example, an interest with no brands is:
+
+| Config | Representation | Share of interests |
+|---|---|---:|
+| L4 Biography | `brands` key missing | 55.5% |
+| L4 Commercial Preference | `"brands": []` | 34.4% |
+| L4 Hyper | no `- Brands:` line (or no `- Known entities:` block at all) | 16.0% no block; 21.6% of blocks lack Brands |
+
+### A.2 L4 Hyper
+
+**Row situations** — the two context strings are either `""` or a Markdown list; they are never missing:
+
+| `personal_context` | `professional_context` | Rows | Share |
+|---|---|---:|---:|
+| `""` | `""` | 43,996 | 44.28% |
+| non-empty | `""` | 42,998 | 43.28% |
+| non-empty | non-empty | 12,357 | 12.44% |
+| `""` | non-empty | 6 | 0.01% |
+
+**`commercial_preferences`** (JSON string; never `""`) — top-level keys after parsing:
+
+| Keys | Rows | Share |
+|---|---:|---:|
+| `affinity`, `discount_sensitivity`, `price_sensitivity` | 36,836 | 37.07% |
+| `affinity`, `discount_sensitivity`, `price_sensitivity`, `subscription_affinity` | 25,804 | 25.97% |
+| `affinity` only | 18,260 | 18.38% |
+| `affinity`, `price_sensitivity` | 10,342 | 10.41% |
+| `affinity`, `discount_sensitivity` | 4,543 | 4.57% |
+| `affinity`, `price_sensitivity`, `subscription_affinity` | 2,112 | 2.13% |
+| `affinity`, `subscription_affinity` | 821 | 0.83% |
+| `affinity`, `discount_sensitivity`, `subscription_affinity` | 637 | 0.64% |
+| `price_sensitivity` only (no `affinity`) | 2 | 0.00% |
+
+- A missing sensitivity / affinity key most likely means that value was `"Unknown"` (or `[]`) in the L4 Commercial
+  Preference output: the shares are close (`discount_sensitivity` missing 31.7% vs. `Unknown` 32.7% in the CP output,
+  `price_sensitivity` 24.4% vs. 27.4%) but not identical (`subscription_affinity` 70.4% vs. 61.2%), so it was not
+  joined row by row.
+- `affinity.shopping` is always present; `shopping.product_categories` is missing in 4 rows, `shopping.shopper_type`
+  in 7.6%. `affinity.dining` is present in only 1.4% (1,401 rows).
+- No empty values: every present list has ≥ 1 item.
+
+**`personal_context`** labels (when non-empty, 55,355 rows):
+
+| Label | Present | Notes |
+|---|---:|---|
+| `Gender` | 85.5% | `M` / `F` |
+| `Current location` | 82.8% | free text, mixed formats (`Sydney, New South Wales, AU`, `united states`) |
+| `Age group` | 77.9% | **not an age band**: raw age `18`–`120` (90%) or a letter code `S` / `R` / `T` / `P` / `Q` (10%) |
+| `Market` | 63.8% | `en-US` / `en-GB` / `en-CA` / `en-AU` / `en-IN` |
+| `Recent visits` | 34.1% | comma-joined places |
+
+Most common label sets: {Age group, Current location, Gender, Market} 22.3%; + Recent visits 20.8%; {Age group,
+Gender, Market} 12.7%; {Current location} only 12.4%; 22 combinations in total.
+
+**`professional_context`** labels (when non-empty, 12,363 rows; 54 combinations): `Industries` 96.6%, `Current roles`
+84.5%, `Seniorities` 84.0%, `Functions` 79.0%, `Years of experience` 73.2%, `Degrees` 53.8%, `Education areas` 53.3%,
+`Current company` 31.6%.
+
+**`commercial_interests`** blocks (3,497,853 blocks, 1–119 per row, median 31):
+
+| Line | Present |
+|---|---:|
+| `### Interest N: <name>`, `Existing queries` (1–3 queries) | always |
+| `Category`, `Persona`, `Activity`, `Intent` | ≥ 99.98% each (missing 509 / 491 / 636 / 141 blocks) |
+| `Known entities` | 84.0% |
+| ↳ `Brands` / `Products` / `Retailers` (within Known entities) | 78.4% / 90.5% / 62.1% |
+
+A sub-line is never written with an empty value: when there is no data, the line is left out.
+
+### A.3 L4 Commercial Preference
+
+Every key is always present — absence is always `[]` or `""`:
+
+| Path | Empty value |
+|---|---|
+| `non_commercial_interest_names` | `[]` in 22,878 rows (15.42%) |
+| `commercial_interests[].brands` | `[]` 34.36% of interests |
+| `commercial_interests[].products` | `[]` 23.80% |
+| `commercial_interests[].retailers` | `[]` 47.43% |
+| `commercial_interests[].persona` | `""` 3,414 (0.08%) |
+| `commercial_interests[].topics` | `[]` 2 interests |
+| `commercial_interests[].topics[].evidence` | `[]` 627 topics |
+| `commercial_interests[].topics[].topic` | `""` 54 topics |
+
+- `commercial_interests` is never `[]` (1–119 items).
+- `life_stage` always has `value`, `confidence`, `evidence` (1–3). "No life stage" is the value `"unknown"`
+  (55.7%), not a missing key. 2 rows have the off-list value `"Student"`.
+
+### A.4 L4 Biography
+
+`declared_attributes` and `facts` are always present: `{}` when there is nothing, otherwise only the known sub-keys
+appear. Row situations (`declared_attributes` × `facts`):
+
+| `facts` \ `declared_attributes` | `{}` | `{age_group, gender}` | `{age_group}` | `{gender}` | Total |
+|---|---:|---:|---:|---:|---:|
+| `{}` | 91,920 | 712 | 528 | 149 | 93,309 |
+| `{location_data, market}` | 4,252 | 14,680 | 6,308 | 1,494 | 26,734 |
+| `{market}` | 1,654 | 6,001 | 2,713 | 1,412 | 11,780 |
+| `{linkedin_profile}` | 10,187 | 744 | 235 | 113 | 11,279 |
+| `{location_data}` | 1,464 | 5,823 | 2,998 | 854 | 11,139 |
+| `{linkedin_profile, location_data, market}` | 437 | 5,013 | 1,253 | 506 | 7,209 |
+| `{linkedin_profile, location_data}` | 219 | 4,421 | 793 | 362 | 5,795 |
+| `{linkedin_profile, market}` | 113 | 1,822 | 423 | 293 | 2,651 |
+| **Total** | 110,246 | 39,216 | 15,251 | 5,183 | 169,896 |
+
+- 54.1% of rows are "behavior only": both `{}`.
+- `facts.location_data`: `current_location` and `place_frequency` always; `region_frequency` missing in 2.6%;
+  `recent_visits` missing in 47.0%. No empty lists.
+- `facts.linkedin_profile`: 59 key combinations; 36.4% contain only `profile_geo`. Value type depends on the field:
+  `profile_geo`, `current_company`, `experience_band` are always `string`; `current_roles`, `areas`, `degrees` are
+  always `string[]`; `industries`, `titles`, `functions`, `degree`, `seniorities`, `fieldOfStudy`, `companies`,
+  `yearsOfExperience` are `string` when there is one value and `string[]` (≥ 2) when there are more.
+- `interests[]`: `predicted_queries` / `products` / `brands` are **missing** (never `[]`) for non-commercial interests.
+  Key sets: all three 39.6%; none 32.2%; `predicted_queries` + `products` 11.9%; `predicted_queries` only 11.4%;
+  `predicted_queries` + `brands` 4.9%. `topics` is missing for 4 interests.
+- Rare empty values: `interests[].persona` `""` 9,135; `actual_activity` `""` 1,679; `inferred_intent` `""` 684;
+  `source` `[]` 166.
+
+### A.5 L3, L2, L1
+
+No missing keys anywhere; each config has exactly one row situation (L2: two). Only rare empty values:
+
+| Config | Empty values |
+|---|---|
+| L3 Commercial | `interests[].actual_activity` `""` 706; `sources` `[]` 79; `topics` `[]` 3; `topics[].actions` `[]` 638 |
+| L3 Persona | `interests[].actual_activity` `""` 740; `inferred_intent` `""` 176; `topics` `[]` 2; `topics[]` `""` 55 |
+| L2 | `snapshot` `[]` 24 rows; `delta[].actual_activity` `""` 10,356 (0.31%); `snapshot[].actual_activity` `""` 3,384; `topics` `[]` 16; `topics[]` `""` 292 |
+| L1 Negative | none. Row sources: MSN only 93.9%, Ads only 5.3%, both 0.8% |
+| L1 | none. 109 source mixes; the most common are `Uet` only 16.2% and `Ads+Bing+MSN+Uet` 12.1% |

@@ -24,6 +24,7 @@ BIO_MAX_COMMERCIAL_VALUES = 6
 _NULL_LIKE = {"", "-", "#null#", "null", "none", "nan", "n/a", "na", "unknown"}  # user_attributes._NULL_LIKE
 # Query languages written without spaces between words; their query word counts are not checked.
 UNSPACED_LANGUAGES = {"ja", "zh", "zh-Hans", "zh-Hant", "th"}
+UNKNOWN_LIFE_STAGE = {"value": "unknown", "confidence": "low", "evidence": []}
 
 
 def _text(value) -> str:
@@ -112,9 +113,12 @@ class CommercialPreference(Task):
         return [i for i in layer3.get("interests", []) if i.get("commercial")]
 
     def payload(self, interests: list[dict], layer3: dict, biography: dict) -> dict:
-        """Layer4CommercialPreference._call_llm in the V2 layout (topics carry no intent)."""
+        """Layer4CommercialPreference._call_llm in the V2 layout (topics carry no intent). The V2 data always has a
+        {value, confidence, evidence} life_stage (its cleaning drops an empty one), so a failed biography call sends
+        an unknown life stage rather than {}."""
+        life_stage = biography.get("life_stage")
         return {
-            "life_stage": biography.get("life_stage", {}),
+            "life_stage": life_stage if isinstance(life_stage, dict) and life_stage else UNKNOWN_LIFE_STAGE,
             "commercial_interests": [
                 {"interest_name": i.get("interest_name"), "persona": i.get("persona", ""),
                  "brands": i.get("brands", []), "retailers": i.get("retailers", []), "products": i.get("products", []),
