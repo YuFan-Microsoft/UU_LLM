@@ -24,21 +24,21 @@ DEFAULT_TOP_K = [1, 5, 10, 20, 50, 100]
 DEFAULT_INDEX_PATHS = {
     "future": Path(
         "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
-        "test_12000/ann_evaluation/future_index.jsonl"
+        "test_1200/ann_evaluation/future_index.jsonl"
     ),
     "past": Path(
         "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
-        "test_12000/ann_evaluation/history_index.jsonl"
+        "test_1200/ann_evaluation/history_index.jsonl"
     ),
 }
 DEFAULT_EMBEDDING_PATHS = {
     "future": Path(
         "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
-        "test_12000/ann_evaluation/future_index_qwen_0.6B_emb.pt"
+        "test_1200/ann_evaluation/future_index_qwen_0.6B_emb.pt"
     ),
     "past": Path(
         "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
-        "test_12000/ann_evaluation/history_index_qwen_0.6B_emb.pt"
+        "test_1200/ann_evaluation/history_index_qwen_0.6B_emb.pt"
     ),
 }
 STREAMING_SEARCH_CHUNK_SIZE = 500_000

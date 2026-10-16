@@ -22,7 +22,7 @@ HF_CONFIG = "User_Profile_TestSet"
 HF_SPLIT_USER_COUNTS = {"user_1200": 1191, "user_12000": 11947}
 DEFAULT_OUTPUT_DIR = Path(
     "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
-    "test_12000/ann_evaluation"
+    "test_1200/ann_evaluation"
 )
 VALUE_KEY = "value"
 # behavior field -> (index JSONL, embedding tensor); the defaults read by evaluate_behavior_retrieval.py
@@ -320,10 +320,10 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hf-split",
-        default="user_12000",
+        default="user_1200",
         help=(
             f"{HF_CONFIG} split of {HF_DATASET}: user_1200 or user_12000 "
-            "(reads HF_TOKEN from the environment; default: user_12000)"
+            "(reads HF_TOKEN from the environment; default: user_1200)"
         ),
     )
     parser.add_argument(
