@@ -15,7 +15,7 @@ For every config this guide shows what the model reads (**Input**) and what it m
 | `V2_User_Profile_L2_gpt56` | Existing profile + new interests → merge / add decisions | 259,918 | 5,199 |
 | `V2_User_Profile_L3_Commercial_gpt56` | Interests → commercial label, brands, search queries | 145,277 | 7,059 |
 | `V2_User_Profile_L3_Persona_gpt56` | Interests → persona + category | 77,312 | 3,780 |
-| `V2_User_Profile_L4_Biography_gpt56` | Interests + facts → life stage, attributes, biography | 161,793 | 8,103 |
+| `V2_User_Profile_L4_Biography_gpt56_NoAgeSignals` | Interests + facts → life stage, attributes, biography | 161,793 | 8,103 |
 | `V2_User_Profile_L4_CommercialPreference_gpt56` | Commercial interests → shopping preferences | 141,250 | 7,093 |
 | `V2_User_Profile_L4_Hyper_gpt56` | Commercial interests + context → ad missions + new queries | 94,514 | 4,843 |
 
@@ -280,7 +280,12 @@ and search queries.
 
 ## L4 Biography — Life Stage, Attributes, Biography
 
-`V2_User_Profile_L4_Biography_gpt56` · Infer the user's life stage and attributes, and write a short biography.
+`V2_User_Profile_L4_Biography_gpt56_NoAgeSignals` · Infer the user's life stage and attributes, and write a short
+biography.
+
+Same rows, users, and split as `V2_User_Profile_L4_Biography_gpt56` (169,896 rows, 20,861 users: 19,873 train / 988
+test, no overlap). The only difference is that `user_attributes.age_group.signals` has been removed from the output
+(it was in 115,429 rows, 67.9%: every row whose `age_group` was not declared). Everything else is byte-identical.
 
 **Input**
 
@@ -335,9 +340,8 @@ type Attr = { evidence: string[], value: string, confidence: Level, source: Attr
     confidence: Level,
     evidence: string[]                       // 1–3
   },
-  user_attributes: {
-    age_group: Attr & { signals?: AgeSignals },
-                                             // "13 - 17" | "18 - 24" | "25 - 34" | "35 - 49" | "50 - 65" | "65+"
+  user_attributes: {                         // always all 8 keys, in this order
+    age_group: Attr,                         // "13 - 17" | "18 - 24" | "25 - 34" | "35 - 49" | "50 - 65" | "65+"
                                              //   | "Unknown"
     gender: Attr & { lean: { male: string[], female: string[] } },   // "Male" | "Female" | "Unknown"
     estimated_income_level: Attr,            // "High" | "Medium" | "Low" | "Unknown"
@@ -350,27 +354,55 @@ type Attr = { evidence: string[], value: string, confidence: Level, source: Attr
                                              //   | "Not in Workforce" | "Unknown"
     education_area: Attr                     // field of study | "Unknown"
   },
-  biography: string                          // 2–3 sentences
+  biography: string                          // 2–3 sentences, 143–550 chars (median 323)
 }
-
-type AgeSignals = {                          // present ~68%
-  later_life_status: boolean,
-  later_life_clusters: ("home_garden" | "leisure_travel_clubs" | "savings_income" | "heritage_hobbies"
-                      | "classic_media" | "health_aging" | "grandchildren")[],
-  children_content: boolean,
-  own_current_study: boolean,
-  own_high_school: boolean,
-  household_signals: boolean,
-  news_heavy: boolean,
-  youth_culture_top5: boolean,
-  early_adult_events: string[],              // e.g. "first-home buying"
-  linkedin_min_age?: int | null
-};
 ```
+
+Key order is fixed: `Attr` is always `{evidence, value, confidence, source}`, and `gender` is
+`{lean, evidence, value, confidence, source}`.
+
+**Output statistics** (169,896 rows)
+
+`life_stage`:
+
+| `value` | Rows | Share |
+|---|---:|---:|
+| `unknown` | 90,953 | 53.5% |
+| `retirement` | 27,274 | 16.1% |
+| `parenting` | 22,967 | 13.5% |
+| `job_seeking` | 17,973 | 10.6% |
+| `single` | 7,078 | 4.2% |
+| `caregiving` | 2,397 | 1.4% |
+| `married` | 1,131 | 0.7% |
+| `new_grad` | 123 | 0.1% |
+
+`confidence`: low 77.1% / medium 18.7% / high 4.3%. `evidence` items: 1 19.9% / 2 60.8% / 3 19.3%.
+
+`user_attributes` (all shares are of all rows):
+
+| Attribute | `Unknown` | `source` (non-unknown) | `confidence` low / medium / high | Most common known values |
+|---|---:|---|---|---|
+| `age_group` | 5.6% | behavioral_inference 61.9%, declared 32.1%, linkedin 0.5% | 58.5 / 5.7 / 35.8% | `35 - 49` 50.5%, `50 - 65` 21.9%, `65+` 18.3%, `25 - 34` 2.5%, `18 - 24` 1.2%, `13 - 17` 77 rows |
+| `gender` | 2.3% | behavioral_inference 71.5%, declared 26.1%, linkedin 3 rows | 37.3 / 36.6 / 26.1% | `Male` 59.0%, `Female` 38.6% |
+| `estimated_income_level` | 2.5% | behavioral_inference 97.4%, linkedin 0.1% | 99.4 / 0.6 / 42 rows | `Medium` 96.4%, `High` 1.0%, `Low` 0.1% |
+| `home_location` | 31.4% | behavioral_inference 30.4%, location_data 29.9%, linkedin 8.2% | 42.4 / 32.2 / 25.4% | 10,713 distinct; `United States` 1.2%, `France` 1.0%, `United Kingdom` 0.9% |
+| `occupation` | 66.1% | behavioral_inference 25.3%, linkedin 8.6% | 89.8 / 1.1 / 9.1% | 8,475 distinct; `Business / Finance Professional` 4.4%, `Technology Professional` 1.9% |
+| `company` | 95.9% | linkedin 3.3%, behavioral_inference 0.8% | 96.5 / 0.3 / 3.2% | 905 distinct; `Self-Employed` 0.5%, then ≤ 58 rows each |
+| `career_stage` | 57.2% | behavioral_inference 34.1%, linkedin 8.7% | 86.7 / 4.3 / 8.9% | `Senior Professional` 24.0%, `Retired` 10.5%, `Entry Level` 2.7%, `Director/Executive` 1.5% |
+| `education_area` | 74.3% | behavioral_inference 20.3%, linkedin 5.4% | 94.4 / 0.2 / 5.5% | 5,046 distinct; `Business / Accounting` 4.5%, `Health Sciences` 1.7% |
 
 **Notes**
 
-- `gender.lean` entries look like `"Football (moderate)"`.
+- `value` is `"Unknown"` ⇔ `source` is `"unknown"` ⇔ `evidence` is `[]`, for every attribute in every row. Known
+  values always have 1–3 evidence items.
+- Declared attributes are copied verbatim: all 54,467 rows with a declared `age_group` output that same value with
+  `source: "declared"` (the same holds for the 44,399 declared genders).
+- `gender.lean` is always `{male, female}` (0–10 entries each). When gender is inferred, every entry is
+  `"<interest name> (strong|moderate|weak)"`, e.g. `"Football (moderate)"` (weak 51.0%, moderate 44.0%, strong 4.9%
+  of entries). When gender is declared, `lean` is not a scored list: it holds one free-text entry such as
+  `"Declared male"` (43,260 rows) or is empty in both lists (1,139 rows).
+- `age_group` has no `signals` field. The evidence text was not edited, so 25,076 rows (14.8%) still mention
+  "later-life" (e.g. `"... provide two later-life clusters"`).
 
 ---
 
