@@ -47,9 +47,10 @@ TOP30_QUERIES_PER_INTEREST = 3
 LAYER3_TOPK_KEYS = ["layer3_top10", "layer3_random10", "layer3_top30", "layer3_random30", "layer3_all"]
 RANDOM_QUERY_COUNTS = {"layer3_random10": 10, "layer3_random30": 30}
 # Oracle strategies are not stored in --eval_data: they pick, per user and with the ground truth, from layer3_all
-# what best covers the target actions at recall@ORACLE_SELECTION_TOP_K. Interest oracles pick TOP_INTERESTS
-# interests and keep their first 1 / TOP30_QUERIES_PER_INTEREST queries (like layer3_top10 / layer3_top30); query
-# oracles pick 10 / 30 distinct queries regardless of their interest.
+# (so only among the interests kept by --min_commercial_score, by default commercial with a medium or high
+# commercial_score) what best covers the target actions at recall@ORACLE_SELECTION_TOP_K. Interest oracles pick
+# TOP_INTERESTS interests and keep their first 1 / TOP30_QUERIES_PER_INTEREST queries (like layer3_top10 /
+# layer3_top30); query oracles pick 10 / 30 distinct queries regardless of their interest.
 ORACLE_POOL_KEY = "layer3_all"
 INTEREST_ORACLE_QUERIES_PER_INTEREST = {
     "layer3_interest_oracle10": 1,
@@ -61,6 +62,11 @@ ORACLE_SELECTION_TOP_K = 50
 LAYER3_EVAL_KEYS = ["layer3_random10", "layer3_random30", "layer3_top10", "layer3_top30",
                     "layer3_interest_oracle10", "layer3_interest_oracle30",
                     "layer3_query_oracle10", "layer3_query_oracle30", "layer3_all"]
+# --min_commercial_score: the interests whose queries are evaluated. "any" keeps every interest with a query; the
+# others keep commercial interests whose layer3 commercial_score is at least that level.
+COMMERCIAL_SCORE_RANK = {"low": 1, "medium": 2, "high": 3}
+MIN_COMMERCIAL_SCORE_CHOICES = ("any", "low", "medium", "high")
+DEFAULT_MIN_COMMERCIAL_SCORE = "medium"
 
 
 def iter_jsonl(path: Path) -> Iterator[dict[str, Any]]:
@@ -88,15 +94,30 @@ def interest_confidence(interest: dict[str, Any]) -> float:
         return 0.0
 
 
-def build_topk_layers(record: dict[str, Any], random_seed: int = 0) -> dict[str, list[dict[str, Any]]]:
+def commercial_interest_kept(interest: dict[str, Any], min_commercial_score: str) -> bool:
+    """True when the interest passes --min_commercial_score: always for "any", otherwise commercial is true and the
+    commercial_score ("low" / "medium" / "high") is at least the given level."""
+    if min_commercial_score == "any":
+        return True
+    score = interest.get("commercial_score")
+    rank = COMMERCIAL_SCORE_RANK.get(score.strip().casefold(), 0) if isinstance(score, str) else 0
+    return interest.get("commercial") is True and rank >= COMMERCIAL_SCORE_RANK[min_commercial_score]
+
+
+def build_topk_layers(
+    record: dict[str, Any],
+    random_seed: int = 0,
+    min_commercial_score: str = DEFAULT_MIN_COMMERCIAL_SCORE,
+) -> dict[str, list[dict[str, Any]]]:
     """layer3_top10: the first query of each of the top-10 interests by confidence_score; layer3_top30: the first 3
     queries of each of those interests; layer3_all: every query of every interest; layer3_random10 / _random30: 10 /
     30 queries drawn at random (all of them if fewer) from the distinct queries of layer3_all. The random draw is one
-    shuffle per user seeded by (random_seed, user_id), so random10 is a prefix of random30. Interests without a
-    non-blank predicted query are not ranked."""
+    shuffle per user seeded by (random_seed, user_id), so random10 is a prefix of random30. Only interests that pass
+    min_commercial_score (default: commercial with a medium or high commercial_score) and have a non-blank predicted
+    query are ranked."""
     ranked = []
     for interest in record.get("interests") or []:
-        if not isinstance(interest, dict):
+        if not isinstance(interest, dict) or not commercial_interest_kept(interest, min_commercial_score):
             continue
         queries = clean_queries(interest.get("predicted_queries"))
         if queries:
@@ -161,11 +182,13 @@ def build_eval_data(
     dataset_rows: Iterable[dict[str, Any]],
     output_path: Path,
     random_seed: int = 0,
+    min_commercial_score: str = DEFAULT_MIN_COMMERCIAL_SCORE,
 ) -> None:
     """Write --eval_data rows {user_id, past_behaviors, future_behaviors, <LAYER3_TOPK_KEYS>} for the users of
-    layer3_postprocessing.jsonl; behaviors keep only their action_id, users missing from the dataset are dropped."""
+    layer3_postprocessing.jsonl (queries of the interests that pass min_commercial_score); behaviors keep only their
+    action_id, users missing from the dataset are dropped."""
     layers_by_user = {
-        str(record["user_id"]): build_topk_layers(record, random_seed)
+        str(record["user_id"]): build_topk_layers(record, random_seed, min_commercial_score)
         for record in iter_jsonl(layer3_path)
     }
     behaviors_by_user: dict[str, dict[str, list[dict[str, Any]]]] = {}
@@ -200,7 +223,8 @@ def build_eval_data(
     users = len(behaviors_by_user)
     print(
         f"Built {users:,} users -> {output_path} "
-        f"({len(layers_by_user) - users:,} layer3 users not in the dataset, dropped)"
+        f"({len(layers_by_user) - users:,} layer3 users not in the dataset, dropped; "
+        f"min_commercial_score={min_commercial_score})"
     )
     if users:
         print(
@@ -759,7 +783,8 @@ def evaluate_oracle(
     device: Any,
     config: EvaluationConfig,
 ) -> dict[str, dict[str, Any]]:
-    """Oracle strategies (ORACLE_KEYS in `paths`), chosen per user from ORACLE_POOL_KEY by greedy maximum coverage
+    """Oracle strategies (ORACLE_KEYS in `paths`), chosen per user from ORACLE_POOL_KEY (the queries of the interests
+    kept by --min_commercial_score when --eval_data was built) by greedy maximum coverage
     of the target actions at recall@ORACLE_SELECTION_TOP_K (using the ground truth, so a ceiling rather than a
     deployable selection), then evaluated at every top_k like evaluate():
     - interest oracles: the TOP_INTERESTS interests whose first 1 / 3 queries (together) best cover the targets,
@@ -889,6 +914,15 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=0,
         help="Seed of the layer3_random10 / layer3_random30 query draws, combined with each user_id (default: 0)",
+    )
+    parser.add_argument(
+        "--min_commercial_score",
+        choices=MIN_COMMERCIAL_SCORE_CHOICES,
+        default=DEFAULT_MIN_COMMERCIAL_SCORE,
+        help=(
+            "With --layer3: evaluate only the queries of commercial interests whose commercial_score is at least "
+            "this level; 'any' keeps every interest with a query (default: medium, i.e. medium or high)"
+        ),
     )
     parser.add_argument(
         "--hf_split",
@@ -1105,6 +1139,7 @@ def main() -> int:
                 read_dataset_rows(args.dataset_jsonl, args.hf_split),
                 args.eval_data,
                 args.random_seed,
+                args.min_commercial_score,
             )
             if args.build_only:
                 return 0
