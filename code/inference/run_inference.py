@@ -13,6 +13,7 @@ import os
 from pathlib import Path
 import shutil
 import socket
+import traceback
 
 # user_profile_rules (a copy of the trainer's rollout rules) finds fastText lid.176.bin here, downloading it if missing.
 os.environ.setdefault("LID_MODEL_PATH", str(Path(__file__).resolve().parents[2] / "models" / "lid.176.bin"))
@@ -31,6 +32,10 @@ L34_STAGES = [task.stage for task in layer3.TASKS + layer4.TASKS]
 PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL, L3_DONE, L3_TOTAL, L4_DONE, L4_TOTAL = range(FIELDS := 9)
 PHASES = ["loading", "layer1", "layer2", "layer3", "layer4", "done"]
 REFRESH_SECONDS = 2
+# Each engine initializes torch.distributed on a free port; engines started together could pick the same one
+# (EADDRINUSE), so engine N searches from VLLM_PORT base + N * PORTS_PER_ENGINE (vLLM moves up past busy ports).
+DEFAULT_VLLM_PORT_BASE = 40000
+PORTS_PER_ENGINE = 100
 LID_DOWNLOAD_TIMEOUT_SECONDS = 60  # per socket operation: a stalled download fails instead of hanging
 # vLLM engine settings. "original" is the setting this script always used; "best" mirrors
 # code/prod_deployment/best_qwen35_prod_server.sh (keep them in sync). None = vLLM's default (not passed).
@@ -281,6 +286,8 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
     while any(process.is_alive() for process in processes) and any(
             progress[rank * FIELDS + PHASE] == 0 for rank in range(engines)):
         mp.connection.wait([p.sentinel for p in processes if p.is_alive()], timeout=1)
+        if failed(processes):
+            return
     print(flush=True)
     # (bar, done field, total field, phase from which an engine's total is known)
     bars = [(tqdm(total=l1_total, desc="Layer 1", unit="window", position=0, dynamic_ncols=True), L1_DONE, None, 0),
@@ -288,7 +295,7 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
             (tqdm(total=0, desc="Layer 3", unit="call", position=2, dynamic_ncols=True), L3_DONE, L3_TOTAL, 3),
             (tqdm(total=0, desc="Layer 4", unit="call", position=3, dynamic_ncols=True), L4_DONE, L4_TOTAL, 5)]
     started = [False] * len(bars)
-    while any(process.is_alive() for process in processes):
+    while any(process.is_alive() for process in processes) and not failed(processes):
         mp.connection.wait([p.sentinel for p in processes if p.is_alive()], timeout=REFRESH_SECONDS)
         rows = [progress[rank * FIELDS:(rank + 1) * FIELDS] for rank in range(engines)]
         phases = Counter(PHASES[int(row[PHASE])] for row in rows)
@@ -312,6 +319,21 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
         bar.close()
 
 
+def failed(processes: list) -> list[tuple[int, int]]:
+    """(rank, exit code) of every engine that exited with an error."""
+    return [(rank, process.exitcode) for rank, process in enumerate(processes) if process.exitcode not in (None, 0)]
+
+
+def engine_main(rank: int, gpu: str, *args) -> None:
+    """run_engine with its error printed under a clear banner, so it is easy to find among the vLLM logs."""
+    try:
+        run_engine(rank, *args)
+    except BaseException:
+        print(f"\n===== vLLM engine {rank} (GPU {gpu}) failed =====\n{traceback.format_exc()}"
+              f"===== end of engine {rank} error =====\n", flush=True)
+        raise
+
+
 def run_engines(args: argparse.Namespace, windows: list, user_ids: list[str], dates: list[str]) -> list[dict]:
     """One spawned process per visible GPU; users are dealt round-robin so each user stays on one engine."""
     gpus = visible_gpus()
@@ -320,20 +342,35 @@ def run_engines(args: argparse.Namespace, windows: list, user_ids: list[str], da
     context = mp.get_context("spawn")
     progress = context.Array("d", FIELDS * len(gpus), lock=False)
     processes = []
+    original_port = os.environ.get("VLLM_PORT")
+    port_base = int(original_port) if original_port and original_port.isdigit() else DEFAULT_VLLM_PORT_BASE
     for rank, gpu in enumerate(gpus):
         users = user_ids[rank::len(gpus)]
         mine = set(users)
         os.environ["CUDA_VISIBLE_DEVICES"] = gpu  # a spawned process inherits the environment at start()
-        process = context.Process(target=run_engine, args=(
-            rank, args, users, [w for w in windows if w[0] in mine], dates, shard_dir / f"{rank}.jsonl", progress))
+        os.environ["VLLM_PORT"] = str(port_base + rank * PORTS_PER_ENGINE)
+        process = context.Process(target=engine_main, args=(
+            rank, gpu, args, users, [w for w in windows if w[0] in mine], dates, shard_dir / f"{rank}.jsonl", progress))
         process.start()
         processes.append(process)
     os.environ["CUDA_VISIBLE_DEVICES"] = ",".join(gpus)
+    if original_port is None:
+        os.environ.pop("VLLM_PORT")
+    else:
+        os.environ["VLLM_PORT"] = original_port
     show_progress(processes, progress, len(windows))
+    errors = failed(processes)
+    if errors:  # fail fast: the run is lost, so stop the other engines instead of letting them finish
+        for process in processes:
+            if process.is_alive():
+                process.terminate()
     for process in processes:
         process.join()
-    if any(process.exitcode for process in processes):
-        raise RuntimeError("A vLLM engine failed; see its log above")
+    errors = errors or failed(processes)
+    if errors:
+        details = ", ".join(f"engine {rank} (GPU {gpus[rank]}) exit code {code}" for rank, code in errors)
+        raise RuntimeError(f"vLLM engine failed: {details}. Its traceback is above, between "
+                           f"'===== vLLM engine N (GPU ...) failed =====' and '===== end of engine N error ====='")
     rows = [json.loads(line) for rank in range(len(gpus))
             for line in (shard_dir / f"{rank}.jsonl").open(encoding="utf-8")]
     shutil.rmtree(shard_dir)

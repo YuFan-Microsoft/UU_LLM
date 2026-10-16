@@ -44,7 +44,11 @@ python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir> --engine_
 After every engine has loaded its model (vLLM logs as usual), progress is shown as four tqdm bars over all engines
 (refreshed every 2 s), one per layer, in the order the layers run: `Layer 1` (user-windows), `Layer 2` (calls; the
 total is known once engines finish Layer 1), `Layer 3` (calls; one round, known when it starts) and `Layer 4` (calls;
-the total grows round by round: biography, commercial preference, hyper). Only first attempts are counted.
+the total grows round by round: biography, commercial preference, hyper). Only first attempts are counted. If an
+engine fails, the others are stopped at once and the run ends with an error naming the engine and GPU; its traceback
+is printed between `===== vLLM engine N (GPU ...) failed =====` and `===== end of engine N error =====`. Engine N
+looks for its torch.distributed port from `VLLM_PORT` + N * 100 (`VLLM_PORT` defaults to 40000), so engines started
+together never pick the same port (`EADDRINUSE`).
 
 Input rows, one per user (only `past_behaviors` is used; `future_behaviors` is held out):
 
