@@ -3,7 +3,7 @@
 import argparse
 from collections import Counter
 import csv
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 import json
 import os
 from pathlib import Path
@@ -562,7 +562,6 @@ class SearchIndex:
 @dataclass
 class EvaluationConfig:
     target: str
-    layer_key: str
     top_ks: list[int]
     query_batch_size: int
     search_chunk_size: int
@@ -598,20 +597,21 @@ def format_metrics_table(
     return "\n".join(lines)
 
 
-def retrieve_queries(
-    query_specs: list[tuple[str, str]],
+def retrieve_texts(
+    queries: list[str],
     search_index: SearchIndex,
     tokenizer: Any,
     model: Any,
     device: Any,
     config: EvaluationConfig,
+    top_k: int,
 ) -> list[list[int]]:
+    """The top_k action IDs of each query, encoding and searching config.query_batch_size queries at a time."""
     retrieved_ids = []
-
-    for start in range(0, len(query_specs), config.query_batch_size):
-        batch = query_specs[start : start + config.query_batch_size]
+    for start in range(0, len(queries), config.query_batch_size):
+        batch = queries[start : start + config.query_batch_size]
         query_embeddings = encode_query_batch(
-            [query for _, query in batch],
+            batch,
             config.instruction,
             tokenizer,
             model,
@@ -624,138 +624,12 @@ def retrieve_queries(
             search_index.valid_rows,
             search_index.valid_count,
             query_embeddings,
-            max(config.top_ks),
+            top_k,
             config.search_chunk_size,
         )
-
         for batch_index in range(len(batch)):
-            result_rows = rows[batch_index].tolist()
-            result_ids = [search_index.action_ids[row] for row in result_rows]
-            retrieved_ids.append(result_ids)
-
+            retrieved_ids.append([search_index.action_ids[row] for row in rows[batch_index].tolist()])
     return retrieved_ids
-
-
-def evaluate(
-    evaluation_path: Path,
-    output_path: Path,
-    skip_log_path: Path,
-    search_index: SearchIndex,
-    tokenizer: Any,
-    model: Any,
-    device: Any,
-    config: EvaluationConfig,
-) -> dict[str, Any]:
-    totals = {top_k: MetricTotals() for top_k in config.top_ks}
-    user_count = 0
-    skipped_user_count = 0
-    skip_reasons: Counter[str] = Counter()
-    skip_user_ids: dict[str, list[Any]] = {}
-    total_query_count = 0
-    total_interest_name_count = 0
-
-    progress = tqdm(iter_jsonl(evaluation_path), desc="Evaluating users", unit="users")
-    for record in progress:
-            if config.max_users is not None and user_count >= config.max_users:
-                break
-
-            target_action_ids = extract_action_ids(record, config.target)
-            query_specs, rejection_reasons = extract_predicted_queries(
-                record, config.layer_key
-            )
-            if not query_specs:
-                reason = build_no_valid_queries_reason(rejection_reasons)
-                skipped_user_count += 1
-                skip_reasons[reason] += 1
-                skip_user_ids.setdefault(reason, []).append(record.get("user_id"))
-                progress.set_postfix(
-                    evaluated=user_count,
-                    queries=total_query_count,
-                    skipped=skipped_user_count,
-                    refresh=True,
-                )
-                continue
-
-            retrieved_ids = retrieve_queries(
-                query_specs,
-                search_index,
-                tokenizer,
-                model,
-                device,
-                config,
-            )
-            metrics = calculate_user_metrics(
-                target_action_ids, retrieved_ids, config.top_ks
-            )
-            for top_k, values in totals.items():
-                values.update(
-                    metrics[str(top_k)], len(target_action_ids), len(query_specs)
-                )
-
-            user_count += 1
-            total_query_count += len(query_specs)
-            total_interest_name_count += count_interest_names(query_specs)
-            progress.set_postfix(
-                evaluated=user_count,
-                queries=total_query_count,
-                queries_per_user=f"{total_query_count / user_count:.2f}",
-                interest_names=total_interest_name_count,
-                interest_names_per_user=(
-                    f"{total_interest_name_count / user_count:.2f}"
-                ),
-                skipped=skipped_user_count,
-                refresh=True,
-            )
-            if user_count % config.metrics_print_interval == 0:
-                tqdm.write(
-                    format_metrics_table(
-                        totals,
-                        config.top_ks,
-                        user_count,
-                        total_query_count,
-                        total_interest_name_count,
-                        skipped_user_count,
-                    ),
-                    file=sys.stderr,
-                )
-
-    tqdm.write(
-        format_metrics_table(
-            totals,
-            config.top_ks,
-            user_count,
-            total_query_count,
-            total_interest_name_count,
-            skipped_user_count,
-        ),
-        file=sys.stderr,
-    )
-
-    summary = {
-        "target": config.target,
-        "layer_key": config.layer_key,
-        "user_count": user_count,
-        "query_count": total_query_count,
-        "average_queries_per_user": (
-            total_query_count / user_count if user_count else 0.0
-        ),
-        "interest_name_count": total_interest_name_count,
-        "average_interest_names_per_user": (
-            total_interest_name_count / user_count if user_count else 0.0
-        ),
-        "skipped_user_count": skipped_user_count,
-        "skip_reasons": dict(skip_reasons.most_common()),
-        "metrics": {
-            str(top_k): values.summary(config.target)
-            for top_k, values in totals.items()
-        },
-    }
-    output_path.write_text(
-        json.dumps(summary, ensure_ascii=False, indent=2) + "\n",
-        encoding="utf-8",
-    )
-    write_skip_log(skip_log_path, skip_reasons, skip_user_ids)
-    return summary
 
 
 def greedy_max_coverage(hits: list[frozenset], count: int) -> list[int]:
@@ -774,7 +648,91 @@ def greedy_max_coverage(hits: list[frozenset], count: int) -> list[int]:
     return chosen
 
 
-def evaluate_oracle(
+@dataclass
+class StrategyState:
+    """Running totals of one layer key (strategy)."""
+    totals: dict[int, MetricTotals]
+    user_count: int = 0
+    skipped_user_count: int = 0
+    query_count: int = 0
+    interest_name_count: int = 0
+
+    def __post_init__(self) -> None:
+        self.skip_reasons: Counter[str] = Counter()
+        self.skip_user_ids: dict[str, list[Any]] = {}
+
+    def skip(self, reason: str, user_id: Any) -> None:
+        self.skipped_user_count += 1
+        self.skip_reasons[reason] += 1
+        self.skip_user_ids.setdefault(reason, []).append(user_id)
+
+    def add(self, metrics: dict[str, dict[str, Any]], action_count: int, specs: list[tuple[str, str]]) -> None:
+        for top_k, values in self.totals.items():
+            values.update(metrics[str(top_k)], action_count, len(specs))
+        self.query_count += len(specs)
+        self.interest_name_count += count_interest_names(specs)
+
+    def summary(self, target: str, layer_key: str) -> dict[str, Any]:
+        users = self.user_count
+        summary = {"target": target, "layer_key": layer_key}
+        if layer_key in ORACLE_KEYS:
+            summary["selection"] = (
+                f"greedy maximum coverage of the {target} actions at recall@{ORACLE_SELECTION_TOP_K} over "
+                + (
+                    f"the distinct {ORACLE_POOL_KEY} queries, keeping {QUERY_ORACLE_COUNTS[layer_key]} (query oracle)"
+                    if layer_key in QUERY_ORACLE_COUNTS
+                    else f"the {ORACLE_POOL_KEY} interests, keeping {TOP_INTERESTS} with their first "
+                    f"{INTEREST_ORACLE_QUERIES_PER_INTEREST[layer_key]} queries (interest oracle)"
+                )
+            )
+        summary.update({
+            "user_count": users,
+            "query_count": self.query_count,
+            "average_queries_per_user": self.query_count / users if users else 0.0,
+            "interest_name_count": self.interest_name_count,
+            "average_interest_names_per_user": self.interest_name_count / users if users else 0.0,
+            "skipped_user_count": self.skipped_user_count,
+            "skip_reasons": dict(self.skip_reasons.most_common()),
+            "metrics": {str(top_k): values.summary(target) for top_k, values in self.totals.items()},
+        })
+        return summary
+
+
+def oracle_selections(
+    groups: list[tuple[str, list[str]]],
+    retrieved: dict[str, list[int]],
+    target_action_ids: set[int],
+    oracle_keys: list[str],
+) -> dict[str, list[tuple[str, str]]]:
+    """The (interest_name, query) specs each oracle key picks from the pool groups by greedy maximum coverage of the
+    target actions at recall@ORACLE_SELECTION_TOP_K:
+    - interest oracles: the TOP_INTERESTS interests whose first 1 / 3 queries (together) best cover the targets,
+      keeping those first 1 / 3 queries, i.e. layer3_top10 / layer3_top30 with an oracle interest ranking;
+    - query oracles: the 10 / 30 distinct queries that best cover the targets, regardless of their interest."""
+    position: dict[str, int] = {}
+    distinct = []  # first (highest-ranked interest) occurrence of each query, in pool order
+    for name, queries in groups:
+        for query in queries:
+            if query not in position:
+                position[query] = len(distinct)
+                distinct.append((name, query))
+    selection_hits = [frozenset(retrieved[query][:ORACLE_SELECTION_TOP_K]) & target_action_ids
+                      for _, query in distinct]
+    selections = {}
+    for key in oracle_keys:
+        if key in QUERY_ORACLE_COUNTS:
+            selections[key] = [distinct[index] for index in greedy_max_coverage(selection_hits,
+                                                                                 QUERY_ORACLE_COUNTS[key])]
+        else:
+            per_interest = INTEREST_ORACLE_QUERIES_PER_INTEREST[key]
+            interest_hits = [frozenset().union(*(selection_hits[position[query]] for query in queries[:per_interest]))
+                             for _, queries in groups]
+            selections[key] = [(groups[index][0], query) for index in greedy_max_coverage(interest_hits, TOP_INTERESTS)
+                               for query in groups[index][1][:per_interest]]
+    return selections
+
+
+def evaluate(
     evaluation_path: Path,
     paths: dict[str, tuple[Path, Path]],
     search_index: SearchIndex,
@@ -783,104 +741,94 @@ def evaluate_oracle(
     device: Any,
     config: EvaluationConfig,
 ) -> dict[str, dict[str, Any]]:
-    """Oracle strategies (ORACLE_KEYS in `paths`), chosen per user from ORACLE_POOL_KEY (the queries of the interests
-    kept by --min_commercial_score when --eval_data was built) by greedy maximum coverage
-    of the target actions at recall@ORACLE_SELECTION_TOP_K (using the ground truth, so a ceiling rather than a
-    deployable selection), then evaluated at every top_k like evaluate():
-    - interest oracles: the TOP_INTERESTS interests whose first 1 / 3 queries (together) best cover the targets,
-      keeping those first 1 / 3 queries, i.e. layer3_top10 / layer3_top30 with an oracle interest ranking;
-    - query oracles: the 10 / 30 distinct queries that best cover the targets, regardless of their interest.
-    One pass and one retrieval of the pool serve all of them."""
+    """Every layer key of `paths` in one pass over the users. The distinct queries of all the keys (and of the oracle
+    pool, ORACLE_POOL_KEY) are retrieved once, several users at a time so the search batches stay full, and every key
+    is scored from those shared results. Oracle keys (ORACLE_KEYS) are chosen per user from the pool with the ground
+    truth (see oracle_selections), so they are a ceiling rather than a deployable selection. Each key counts its own
+    evaluated and skipped users and stops after config.max_users evaluated users."""
     keys = list(paths)
-    totals = {key: {top_k: MetricTotals() for top_k in config.top_ks} for key in keys}
-    query_counts = Counter()
-    interest_name_counts = Counter()
-    retrieval_config = replace(config, top_ks=[*config.top_ks, ORACLE_SELECTION_TOP_K])
-    user_count = skipped_user_count = 0
-    skip_reasons: Counter[str] = Counter()
-    skip_user_ids: dict[str, list[Any]] = {}
+    plain_keys = [key for key in keys if key not in ORACLE_KEYS]
+    oracle_keys = [key for key in keys if key in ORACLE_KEYS]
+    retrieval_top_k = max([*config.top_ks, *([ORACLE_SELECTION_TOP_K] if oracle_keys else [])])
+    states = {key: StrategyState({top_k: MetricTotals() for top_k in config.top_ks}) for key in keys}
+    pending: list[tuple[set[int], dict[str, list[tuple[str, str]]], list[tuple[str, list[str]]] | None]] = []
+    pending_queries: dict[str, None] = {}  # distinct queries of the pending users, in first-seen order
+    read_count = retrieved_query_count = printed = 0
 
-    progress = tqdm(iter_jsonl(evaluation_path), desc="Evaluating oracle users", unit="users")
+    def full(key: str) -> bool:
+        return config.max_users is not None and states[key].user_count >= config.max_users
+
+    def flush() -> None:
+        nonlocal retrieved_query_count
+        queries = list(pending_queries)
+        retrieved = dict(zip(queries, retrieve_texts(queries, search_index, tokenizer, model, device, config,
+                                                     retrieval_top_k)))
+        retrieved_query_count += len(queries)
+        for target_action_ids, specs_by_key, groups in pending:
+            if groups is not None:
+                specs_by_key.update(oracle_selections(groups, retrieved, target_action_ids, oracle_keys))
+            for key, specs in specs_by_key.items():
+                metrics = calculate_user_metrics(target_action_ids, [retrieved[query] for _, query in specs],
+                                                 config.top_ks)
+                states[key].add(metrics, len(target_action_ids), specs)
+        pending.clear()
+        pending_queries.clear()
+
+    progress = tqdm(iter_jsonl(evaluation_path), desc="Evaluating users", unit="users")
     for record in progress:
-        if config.max_users is not None and user_count >= config.max_users:
+        if all(full(key) for key in keys):
             break
+        read_count += 1
+        user_id = record.get("user_id")
         target_action_ids = extract_action_ids(record, config.target)
-        query_specs, rejection_reasons = extract_predicted_queries(record, ORACLE_POOL_KEY)
-        if not query_specs:
-            reason = build_no_valid_queries_reason(rejection_reasons)
-            skipped_user_count += 1
-            skip_reasons[reason] += 1
-            skip_user_ids.setdefault(reason, []).append(record.get("user_id"))
-            continue
-
-        groups = interest_query_groups(record, ORACLE_POOL_KEY)
-        position: dict[str, int] = {}
-        distinct = []  # first (highest-ranked interest) occurrence of each query, in pool order
-        for name, queries in groups:
-            for query in queries:
-                if query not in position:
-                    position[query] = len(distinct)
-                    distinct.append((name, query))
-        retrieved_ids = retrieve_queries(distinct, search_index, tokenizer, model, device, retrieval_config)
-        selection_hits = [
-            frozenset(ids[:ORACLE_SELECTION_TOP_K]) & target_action_ids for ids in retrieved_ids
-        ]
-        for key in keys:
-            if key in QUERY_ORACLE_COUNTS:
-                chosen = greedy_max_coverage(selection_hits, QUERY_ORACLE_COUNTS[key])
-                chosen_specs = [distinct[index] for index in chosen]
+        specs_by_key: dict[str, list[tuple[str, str]]] = {}
+        for key in plain_keys:
+            if full(key):
+                continue
+            specs, rejection_reasons = extract_predicted_queries(record, key)
+            if specs:
+                specs_by_key[key] = specs
+                states[key].user_count += 1
             else:
-                per_interest = INTEREST_ORACLE_QUERIES_PER_INTEREST[key]
-                interest_hits = [
-                    frozenset().union(*(selection_hits[position[query]] for query in queries[:per_interest]))
-                    for _, queries in groups
-                ]
-                chosen = greedy_max_coverage(interest_hits, TOP_INTERESTS)
-                chosen_specs = [
-                    (groups[index][0], query) for index in chosen for query in groups[index][1][:per_interest]
-                ]
-            metrics = calculate_user_metrics(
-                target_action_ids, [retrieved_ids[position[query]] for _, query in chosen_specs], config.top_ks
-            )
-            for top_k, values in totals[key].items():
-                values.update(metrics[str(top_k)], len(target_action_ids), len(chosen_specs))
-            query_counts[key] += len(chosen_specs)
-            interest_name_counts[key] += count_interest_names(chosen_specs)
-
-        user_count += 1
-        progress.set_postfix(evaluated=user_count, skipped=skipped_user_count, refresh=True)
-        if user_count % config.metrics_print_interval == 0:
-            for key in keys:
-                tqdm.write(f"[{key}] " + format_metrics_table(totals[key], config.top_ks, user_count,
-                           query_counts[key], interest_name_counts[key], skipped_user_count), file=sys.stderr)
+                states[key].skip(build_no_valid_queries_reason(rejection_reasons), user_id)
+        groups = None
+        active_oracles = [key for key in oracle_keys if not full(key)]
+        if active_oracles:
+            pool_specs, rejection_reasons = extract_predicted_queries(record, ORACLE_POOL_KEY)
+            if pool_specs:
+                groups = interest_query_groups(record, ORACLE_POOL_KEY)
+                for key in active_oracles:
+                    states[key].user_count += 1
+            else:
+                for key in active_oracles:
+                    states[key].skip(build_no_valid_queries_reason(rejection_reasons), user_id)
+        if not specs_by_key and groups is None:
+            continue
+        for specs in specs_by_key.values():
+            pending_queries.update(dict.fromkeys(query for _, query in specs))
+        for _, queries in groups or []:
+            pending_queries.update(dict.fromkeys(queries))
+        pending.append((target_action_ids, specs_by_key, groups))
+        if len(pending_queries) >= config.query_batch_size:
+            flush()
+            progress.set_postfix(retrieved_queries=retrieved_query_count, refresh=False)
+            if read_count // config.metrics_print_interval > printed // config.metrics_print_interval:
+                printed = read_count
+                tqdm.write(f"After {read_count:,} users:\n" + format_strategy_table(
+                    {key: states[key].summary(config.target, key) for key in keys}, config.top_ks), file=sys.stderr)
+    if pending:
+        flush()
 
     summaries = {}
     for key, (output_path, skip_log_path) in paths.items():
-        tqdm.write(f"[{key}] " + format_metrics_table(totals[key], config.top_ks, user_count, query_counts[key],
-                   interest_name_counts[key], skipped_user_count), file=sys.stderr)
-        summaries[key] = {
-            "target": config.target,
-            "layer_key": key,
-            "selection": (
-                f"greedy maximum coverage of the {config.target} actions at recall@{ORACLE_SELECTION_TOP_K} over "
-                + (
-                    f"the distinct {ORACLE_POOL_KEY} queries, keeping {QUERY_ORACLE_COUNTS[key]} (query oracle)"
-                    if key in QUERY_ORACLE_COUNTS
-                    else f"the {ORACLE_POOL_KEY} interests, keeping {TOP_INTERESTS} with their first "
-                    f"{INTEREST_ORACLE_QUERIES_PER_INTEREST[key]} queries (interest oracle)"
-                )
-            ),
-            "user_count": user_count,
-            "query_count": query_counts[key],
-            "average_queries_per_user": query_counts[key] / user_count if user_count else 0.0,
-            "interest_name_count": interest_name_counts[key],
-            "average_interest_names_per_user": interest_name_counts[key] / user_count if user_count else 0.0,
-            "skipped_user_count": skipped_user_count,
-            "skip_reasons": dict(skip_reasons.most_common()),
-            "metrics": {str(top_k): values.summary(config.target) for top_k, values in totals[key].items()},
-        }
+        state = states[key]
+        tqdm.write(f"[{key}] " + format_metrics_table(state.totals, config.top_ks, state.user_count,
+                   state.query_count, state.interest_name_count, state.skipped_user_count), file=sys.stderr)
+        summaries[key] = state.summary(config.target, key)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
         output_path.write_text(json.dumps(summaries[key], ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        write_skip_log(skip_log_path, skip_reasons, skip_user_ids)
+        write_skip_log(skip_log_path, state.skip_reasons, state.skip_user_ids)
+    print(f"Retrieved {retrieved_query_count:,} distinct queries for {read_count:,} users", file=sys.stderr)
     return summaries
 
 
@@ -926,8 +874,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hf_split",
-        default="user_12000",
-        help="User_Profile_TestSet split for --layer3: user_1200 or user_12000 (needs HF_TOKEN; default: user_12000)",
+        default="user_1200",
+        help="User_Profile_TestSet split for --layer3: user_1200 or user_12000 (needs HF_TOKEN; default: user_1200)",
     )
     parser.add_argument(
         "--dataset_jsonl",
@@ -1148,46 +1096,18 @@ def main() -> int:
         search_index, search_chunk_size = load_search_index(
             args, embedding_path, device
         )
-        summaries = {}
-        for layer_key, (output_path, skip_log_path) in paths.items():
-            if layer_key in summaries:
-                continue
-            print(f"Evaluating {layer_key} against {args.target} behaviors")
-            config = EvaluationConfig(
-                target=args.target,
-                layer_key=layer_key,
-                top_ks=top_ks,
-                query_batch_size=args.query_batch_size,
-                search_chunk_size=search_chunk_size,
-                max_length=args.max_length,
-                instruction=args.instruction,
-                max_users=args.max_users,
-                metrics_print_interval=args.metrics_print_interval,
-            )
-
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            if layer_key in ORACLE_KEYS:
-                # One pass (one retrieval of the pool) for every requested oracle strategy.
-                summaries.update(evaluate_oracle(
-                    args.eval_data,
-                    {key: value for key, value in paths.items() if key in ORACLE_KEYS},
-                    search_index,
-                    tokenizer,
-                    model,
-                    device,
-                    config,
-                ))
-                continue
-            summaries[layer_key] = evaluate(
-                args.eval_data,
-                output_path,
-                skip_log_path,
-                search_index,
-                tokenizer,
-                model,
-                device,
-                config,
-            )
+        print(f"Evaluating {', '.join(paths)} against {args.target} behaviors in one pass")
+        config = EvaluationConfig(
+            target=args.target,
+            top_ks=top_ks,
+            query_batch_size=args.query_batch_size,
+            search_chunk_size=search_chunk_size,
+            max_length=args.max_length,
+            instruction=args.instruction,
+            max_users=args.max_users,
+            metrics_print_interval=args.metrics_print_interval,
+        )
+        summaries = evaluate(args.eval_data, paths, search_index, tokenizer, model, device, config)
     except (OSError, RuntimeError, ValueError) as error:
         print(f"Error: {error}", file=sys.stderr)
         return 1
