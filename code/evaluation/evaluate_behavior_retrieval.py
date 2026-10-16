@@ -24,21 +24,21 @@ DEFAULT_TOP_K = [1, 5, 10, 20, 50, 100]
 DEFAULT_INDEX_PATHS = {
     "future": Path(
         "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
-        "test_1200/ann_evaluation/future_index.jsonl"
+        "test_12000/ann_evaluation/future_index.jsonl"
     ),
     "past": Path(
         "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
-        "test_1200/ann_evaluation/history_index.jsonl"
+        "test_12000/ann_evaluation/history_index.jsonl"
     ),
 }
 DEFAULT_EMBEDDING_PATHS = {
     "future": Path(
         "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
-        "test_1200/ann_evaluation/future_index_qwen_0.6B_emb.pt"
+        "test_12000/ann_evaluation/future_index_qwen_0.6B_emb.pt"
     ),
     "past": Path(
         "/msn//shares/UDC/RnR/MaiProfileV3/UU_SLM/EnStar/EvalSet/"
-        "test_1200/ann_evaluation/history_index_qwen_0.6B_emb.pt"
+        "test_12000/ann_evaluation/history_index_qwen_0.6B_emb.pt"
     ),
 }
 STREAMING_SEARCH_CHUNK_SIZE = 500_000
@@ -170,7 +170,7 @@ def build_eval_data(
     }
     behaviors_by_user: dict[str, dict[str, list[dict[str, Any]]]] = {}
     missing_action_ids = 0
-    for row in dataset_rows:
+    for row in tqdm(dataset_rows, desc="Reading dataset behaviors", unit="users"):
         user_id = str(row["user_id"])
         if user_id not in layers_by_user or user_id in behaviors_by_user:
             continue
@@ -892,8 +892,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hf_split",
-        default="user_1200",
-        help="User_Profile_TestSet split for --layer3: user_1200 or user_12000 (needs HF_TOKEN)",
+        default="user_12000",
+        help="User_Profile_TestSet split for --layer3: user_1200 or user_12000 (needs HF_TOKEN; default: user_12000)",
     )
     parser.add_argument(
         "--dataset_jsonl",
