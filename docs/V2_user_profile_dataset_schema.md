@@ -15,7 +15,7 @@ For every config this guide shows what the model reads (**Input**) and what it m
 | `V2_User_Profile_L2_gpt56` | Existing profile + new interests → merge / add decisions | 259,918 | 5,199 |
 | `V2_User_Profile_L3_Commercial_gpt56` | Interests → commercial label, brands, search queries | 145,277 | 7,059 |
 | `V2_User_Profile_L3_Persona_gpt56` | Interests → persona + category | 77,312 | 3,780 |
-| `V2_User_Profile_L4_Biography_gpt56_NoAgeSignals` | Interests + facts → life stage, attributes, biography | 161,793 | 8,103 |
+| `V2_User_Profile_L4_Biography_gpt56` | Interests + facts → life stage, attributes, biography | 161,793 | 8,103 |
 | `V2_User_Profile_L4_CommercialPreference_gpt56` | Commercial interests → shopping preferences | 141,250 | 7,093 |
 | `V2_User_Profile_L4_Hyper_gpt56` | Commercial interests + context → ad missions + new queries | 94,514 | 4,843 |
 
@@ -280,12 +280,11 @@ and search queries.
 
 ## L4 Biography — Life Stage, Attributes, Biography
 
-`V2_User_Profile_L4_Biography_gpt56_NoAgeSignals` · Infer the user's life stage and attributes, and write a short
-biography.
+`V2_User_Profile_L4_Biography_gpt56` · Infer the user's life stage and attributes, and write a short biography.
 
-Same rows, users, and split as `V2_User_Profile_L4_Biography_gpt56` (169,896 rows, 20,861 users: 19,873 train / 988
-test, no overlap). The only difference is that `user_attributes.age_group.signals` has been removed from the output
-(it was in 115,429 rows, 67.9%: every row whose `age_group` was not declared). Everything else is byte-identical.
+169,896 rows, 20,861 users (19,873 train / 988 test, no overlap). The GPT-5.6 `user_attributes.age_group.signals`
+field has been removed from the output (it was in 115,429 rows, 67.9%: every row whose `age_group` was not declared).
+Nothing else in the output was changed.
 
 **Input**
 
@@ -527,19 +526,28 @@ search queries.
     source_interests: string[],                  // exact input interest names
     scenarios: ("shopping" | "travel" | "technology" | "hobbies" | "learning" | "fitness" | "dining")[],
     predicted_brands: string[],                  // ≤ 3 new brands
-    predicted_queries: [{                        // 1–4
-      query: string,                             // 1–8 words (median 4), in query_language
-      value_type: "explore" | "refine" | "advance",
-      source_query_refs: string[],               // Existing queries it improves on
-      delta_source: "commercial_preference" | "source_interest" | "personal_context"
-                  | "cross_interest" | "professional_context",
-      delta_evidence: string,
-      decision_change: string
-    }],
-    enrichment_sources: ("commercial_preference" | "personal_context" | "cross_interest" | "professional_context")[]
+    predicted_queries: string[]                  // 1–4 queries, each 1–8 words (median 4), in query_language
   }]
 }
 ```
+
+**Output statistics** (99,357 rows, 1,016,271 missions, 2,213,233 queries)
+
+- Missions per row: 0–17, mean 10.2, median 12. Queries per mission: 1–4, mean 2.18, median 2.
+- `scenarios` (a mission can have several; share of missions): shopping 81.3%, travel 19.2%, technology 15.5%,
+  hobbies 12.1%, learning 6.6%, fitness 3.7%, dining 2.9%.
+- `predicted_brands` per mission: 0 74.4%, 1 16.6%, 2 5.7%, 3 3.2%.
+- Full chat length (Qwen3.5-4B chat template, thinking disabled): mean 6,414, P50 5,879, P90 11,846, P99 15,026,
+  max 17,511 tokens.
+
+**Notes**
+
+- Each query is now a plain string. The per-query `value_type`, `source_query_refs`, `delta_source`,
+  `delta_evidence`, and `decision_change` fields and the per-mission `enrichment_sources` field have been removed
+  from every row (2,213,233 queries in 1,016,271 missions). This cuts 74% of the output characters; the
+  full chat length drops from a mean of 8,137 to 6,414 tokens.
+- The prompt was **not** changed: it still asks the model to label, cite, and source each query, and its JSON template
+  still shows the removed fields, so the prompt and the output no longer match.
 
 ---
 
