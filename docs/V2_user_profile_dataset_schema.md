@@ -526,7 +526,7 @@ search queries.
     source_interests: string[],                  // exact input interest names
     scenarios: ("shopping" | "travel" | "technology" | "hobbies" | "learning" | "fitness" | "dining")[],
     predicted_brands: string[],                  // ≤ 3 new brands
-    predicted_queries: string[]                  // 1–4 queries, each 1–8 words (median 4), in query_language
+    predicted_queries: string[]                  // observed: 1–4 queries, each 1–8 words (median 4), in query_language
   }]
 }
 ```
@@ -548,12 +548,15 @@ search queries.
   full chat length drops from a mean of 8,137 to 6,414 tokens.
 - The prompt was updated to match: it no longer asks the model to label, cite, or source each query, and its JSON
   template shows `predicted_queries` as a list of strings, without `enrichment_sources`.
+- Query counts and word lengths above are observed dataset statistics, not prompt constraints. The prompt has
+  no numeric limit on query count or word length; existing inputs and outputs are unchanged. The token-length
+  statistics above predate this prompt-only update.
 
 ---
 
 ## Appendix — Input completeness audit (empty vs. missing)
 
-Every row of all 47 V2 files (1,758,247 rows, train + test) was scanned, one file at a time, from L4 back to L1. For
+Every row of all 43 V2 files (1,758,247 rows, train + test) was scanned, one file at a time, from L4 back to L1. For
 each input path we counted whether the **key is missing** or the key is present with an **empty value** (`{}`, `[]`,
 `""`). L4 Hyper's JSON-string and Markdown fields were parsed again and counted line by line.
 
