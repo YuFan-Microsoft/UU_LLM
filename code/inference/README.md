@@ -141,11 +141,11 @@ Payloads follow the V2 SFT data (`docs/V2_user_profile_dataset_schema.md`) with 
 the V2 rows without user context: `{}` for declared attributes and facts, `""` for the personal / professional
 context. The query language is `resolve_query_language` without a user Market: the snapshot's
 `predicted_content_locale`, else `en`. A hyper answer is accepted (else retried) only when every mission's source
-interests are input interests and every `source_query_refs` entry is an Existing query of those interests (the
-production enhancement retries otherwise, and the V2 cleaning drops such rows). Each mission then keeps its resolved
-source interests and valid scenarios, the queries that pass the V2 cleaning rules (2-7 words except ja / zh / th, no
-question mark, not an Existing query, a valid value type and delta source, evidence and decision change; the text is
-kept as written, the V2 prompt does not ask for lowercase), at most 3 new brands, a category and enrichment sources;
+interests are input interests (the production enhancement retries otherwise, and the V2 cleaning drops such rows). Each
+mission then keeps its resolved source interests and valid scenarios, the queries that pass the V2 cleaning rules (2-7
+words except ja / zh / th, no question mark, not an Existing query, not repeated; the text is kept as written, the V2
+prompt does not ask for lowercase), at most 3 new brands, a category and enrichment sources (only `cross_interest`,
+when a mission has several source interests: the V2 answer is plain-string queries without per-query provenance);
 missions without a query and repeated names / queries across missions are dropped. If a prompt is too long, the
 lowest-confidence interests are left out of that call.
 
@@ -175,7 +175,7 @@ come from replacing the LLM calls with a 25600-token model trained on the V2 dat
   user without missions and marks the hyper record with `_failed`.
 - The hyper input's `commercial_preferences` follows the current maiprofilev3dev projection
   (`hyper_preferences.project_commercial_preferences`): preferences with a `confidence_score` below 0.3 and empty
-  containers are left out, and `commercial_preference` is an allowed delta source only when something is left. This
+  containers are left out. This
   has not been checked against the V2 hyper rows (built from MAIProfile_Official runs).
 - There is no user context, world knowledge or negative feedback: declared attributes and facts are `{}`, the
   personal / professional context is `""`, the event filter is not called, `negative_interests` is `[]` and the

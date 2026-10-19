@@ -212,11 +212,8 @@ def l4_commercial_preference_keys_valid(output):
     return matches(output, L4P_SCHEMA)
 
 
-L4H_QUERY_SCHEMA = {"query": str, "value_type": str, "source_query_refs": ListOf(str), "delta_source": str,
-                    "delta_evidence": str, "decision_change": str}
 L4H_MISSION_SCHEMA = {"mission_name": str, "source_interests": ListOf(str), "scenarios": ListOf(str),
-                      "predicted_brands": ListOf(str), "predicted_queries": ListOf(L4H_QUERY_SCHEMA),
-                      "enrichment_sources": ListOf(str)}
+                      "predicted_brands": ListOf(str), "predicted_queries": ListOf(str)}
 
 
 def l4_hyper_keys_valid(output):

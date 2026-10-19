@@ -15,8 +15,6 @@ from task import Task, UserProfile, emit_record, normalize_category, output
 from utils import (dumps, l4_biography_keys_valid, l4_commercial_preference_keys_valid, l4_hyper_keys_valid)
 
 SCENARIOS = {"shopping", "dining", "learning", "travel", "hobbies", "fitness", "technology"}
-ENRICHMENT_SOURCES = ("cross_interest", "commercial_preference", "personal_context", "professional_context")
-DELTA_SOURCES = {"source_interest", *ENRICHMENT_SOURCES}
 MIN_HYPER_CONFIDENCE = 0.3  # hyper_preferences: preferences below this confidence are not shown to the hyper call
 # user_attributes.project_interest limits of the biography input (layer4_biography: _BIO_MAX_TOPICS, and 6 entities)
 BIO_MAX_TOPICS = 8
@@ -284,19 +282,10 @@ def _values(raw) -> list[str]:
     return result
 
 
-def _resolve_enrichment_sources(mission: dict, allowed: set | None = None) -> list[str]:
-    """The mission's enrichment sources: its own tags (within `allowed`) plus the delta sources of its queries;
-    cross_interest exactly when it has several source interests."""
-    values = {v for v in mission.get("enrichment_sources", []) or [] if v in ENRICHMENT_SOURCES}
-    if allowed is not None:
-        values &= allowed | {"cross_interest"}
-    values.update(p.get("delta_source") for p in mission.get("query_delta_provenance", []) or []
-                  if isinstance(p, dict) and p.get("delta_source") in ENRICHMENT_SOURCES)
-    if len(mission.get("source_interests", []) or []) > 1:
-        values.add("cross_interest")
-    else:
-        values.discard("cross_interest")
-    return [v for v in ENRICHMENT_SOURCES if v in values]
+def _resolve_enrichment_sources(mission: dict) -> list[str]:
+    """The mission's enrichment sources. The V2 answer no longer tags its queries' sources, so only cross_interest
+    is known: exactly when the mission has several source interests."""
+    return ["cross_interest"] if len(mission.get("source_interests", []) or []) > 1 else []
 
 
 class Hyper(Task):
@@ -304,7 +293,6 @@ class Hyper(Task):
     new search queries (discovery and enhancement of the production pipeline, merged in the V2 data)."""
     stage, layer, prompt_file = "l4_hyper", "layer4_hyper_commercial_interest", "prompt_l4_hyper.md"
     MAX_BRANDS = 3
-    VALUE_TYPES = {"explore", "refine", "advance"}
 
     def keys_valid(self, output: dict) -> bool:
         return l4_hyper_keys_valid(output)
@@ -347,13 +335,11 @@ class Hyper(Task):
                 for query in _values(interest.get("predicted_queries"))}
 
     def references_valid(self, answer: dict, catalog: dict) -> bool:
-        """Every source interest names one input interest and every source_query_ref is an Existing query of the
-        mission's sources (the production enhancement retries otherwise; the V2 cleaning drops such rows)."""
+        """Every source interest names one input interest (the production enhancement retries otherwise; the V2
+        cleaning drops such rows)."""
         for mission in answer["missions"]:
             names, invalid = _resolve_sources(mission["source_interests"], catalog)
-            existing = self.existing_queries(names, catalog)
-            if invalid or not names or any(_name_key(ref) not in existing for query in mission["predicted_queries"]
-                                           for ref in query["source_query_refs"]):
+            if invalid or not names:
                 return False
         return True
 
@@ -376,35 +362,23 @@ class Hyper(Task):
             common.append(parts[0])
         return f"/{'/'.join(common)}" if common else ""
 
-    def _queries(self, mission: dict, names: list[str], catalog: dict, allowed: set, language: str) -> None:
-        """Valid new queries with their provenance, as the V2 cleaning requires: 2-7 words (any length for ja / zh /
-        th), no question mark, not an Existing query, a known value type, a delta source the input supports, refs to
-        Existing queries, evidence and a decision change. The query text is kept as written (the V2 prompt does not
-        ask for lowercase)."""
+    def _queries(self, mission: dict, names: list[str], catalog: dict, language: str) -> None:
+        """Valid new queries, as the V2 cleaning requires: 2-7 words (any length for ja / zh / th), no question mark,
+        not an Existing query, not repeated. The query text is kept as written (the V2 prompt does not ask for
+        lowercase)."""
         existing = self.existing_queries(names, catalog)
-        merged = len(names) > 1
-        queries, provenance = [], []
+        queries = []
         for item in mission.get("predicted_queries", []) or []:
-            value = _text(item.get("query"))
+            value = _text(item)
             words = len(value.split())
-            refs = [existing[_name_key(ref)] for ref in item.get("source_query_refs", []) if _name_key(ref) in existing]
-            delta_source, value_type = item.get("delta_source"), str(item.get("value_type") or "").strip().casefold()
             if (not value or value.endswith(("?", "？")) or _name_key(value) in existing
                     or _name_key(value) in {_name_key(q) for q in queries}
-                    or not (language in UNSPACED_LANGUAGES or 2 <= words <= 7)
-                    or value_type not in self.VALUE_TYPES or delta_source not in DELTA_SOURCES
-                    or (delta_source == "cross_interest" and not merged)
-                    or (delta_source not in {"source_interest", "cross_interest"} and delta_source not in allowed)
-                    or not _text(item.get("delta_evidence")) or not _text(item.get("decision_change"))):
+                    or not (language in UNSPACED_LANGUAGES or 2 <= words <= 7)):
                 continue
             queries.append(value)
-            provenance.append({"query": value, "source_query_refs": list(dict.fromkeys(refs)),
-                               "delta_evidence": _text(item.get("delta_evidence")),
-                               "decision_change": _text(item.get("decision_change")), "delta_source": delta_source,
-                               "value_type": value_type})
-        mission["predicted_queries"], mission["query_delta_provenance"] = queries, provenance
+        mission["predicted_queries"] = queries
 
-    def missions(self, answer: dict, catalog: dict, allowed: set, language: str) -> list[dict]:
+    def missions(self, answer: dict, catalog: dict, language: str) -> list[dict]:
         """The answer's missions with resolved source interests and scenarios, valid queries (see _queries), new
         brands only (at most 3), a category and enrichment sources; missions left without a query are dropped."""
         records = {str(i.get("interest_name") or "").strip(): i for i in catalog["ordered"] if i.get("interest_name")}
@@ -415,11 +389,9 @@ class Hyper(Task):
             scenarios = _scenarios(raw.get("scenarios"))
             if not name or not names or not scenarios:
                 continue
-            mission_allowed = set(allowed) | ({"cross_interest"} if len(names) > 1 else set())
             mission = {"mission_name": name, "interest_name": name, "source_interests": names, "scenarios": scenarios,
-                       "predicted_queries": raw.get("predicted_queries", []),
-                       "enrichment_sources": [t for t in raw.get("enrichment_sources", []) if t in mission_allowed]}
-            self._queries(mission, names, catalog, allowed, language)
+                       "predicted_queries": raw.get("predicted_queries", [])}
+            self._queries(mission, names, catalog, language)
             if not mission["predicted_queries"]:
                 continue
             known = {_name_key(b) for n in names for i in catalog["by_name"].get(_name_key(n), [])
@@ -427,7 +399,7 @@ class Hyper(Task):
             mission["predicted_brands"] = [b for b in _clean_brands(raw.get("predicted_brands"))
                                            if _name_key(b) not in known][:self.MAX_BRANDS]
             mission["category"] = self._category(mission, records)
-            mission["enrichment_sources"] = _resolve_enrichment_sources(mission, mission_allowed)
+            mission["enrichment_sources"] = _resolve_enrichment_sources(mission)
             accepted.append(mission)
         return accepted
 
@@ -438,7 +410,6 @@ def _dedupe_missions(missions: list[dict]) -> list[dict]:
     for mission in missions:
         if _name_key(mission.get("mission_name")) in seen_names:
             continue
-        by_query = {p.get("query"): p for p in mission.get("query_delta_provenance", []) or [] if isinstance(p, dict)}
         queries = []
         for query in mission.get("predicted_queries", []) or []:
             if _name_key(query) not in seen_queries:
@@ -447,8 +418,7 @@ def _dedupe_missions(missions: list[dict]) -> list[dict]:
         if not queries:
             continue
         seen_names.add(_name_key(mission.get("mission_name")))
-        result.append({"mission_id": f"mission_{len(result) + 1}", **mission, "predicted_queries": queries,
-                       "query_delta_provenance": [by_query[q] for q in queries if q in by_query]})
+        result.append({"mission_id": f"mission_{len(result) + 1}", **mission, "predicted_queries": queries})
     return result
 
 
@@ -536,9 +506,7 @@ def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
 
     for p in profiles:
         item = items[p.user_id]
-        # commercial_preference is a usable delta source only when the hyper input shows some preference.
-        allowed = {"commercial_preference"} if preferences[p.user_id] else set()
-        missions = HYPER.missions(item["output"], catalogs[p.user_id], allowed, p.language["locale"]) \
+        missions = HYPER.missions(item["output"], catalogs[p.user_id], p.language["locale"]) \
             if output(item) else []
         hyper = hyper_record(p, missions, failed=bool(item) and item["output"] is None)
         emit_record(emit, p, hyper, item)

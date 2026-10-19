@@ -546,8 +546,8 @@ search queries.
   `delta_evidence`, and `decision_change` fields and the per-mission `enrichment_sources` field have been removed
   from every row (2,213,233 queries in 1,016,271 missions). This cuts 74% of the output characters; the
   full chat length drops from a mean of 8,137 to 6,414 tokens.
-- The prompt was **not** changed: it still asks the model to label, cite, and source each query, and its JSON template
-  still shows the removed fields, so the prompt and the output no longer match.
+- The prompt was updated to match: it no longer asks the model to label, cite, or source each query, and its JSON
+  template shows `predicted_queries` as a list of strings, without `enrichment_sources`.
 
 ---
 

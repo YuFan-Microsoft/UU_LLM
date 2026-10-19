@@ -737,19 +737,13 @@ def check_l4_commercial_preference(payload, output):
 
 
 # L4 Hyper: {"missions": [{"mission_name", "source_interests", "scenarios", "predicted_brands",
-#                          "predicted_queries": [...], "enrichment_sources"}]}, mirroring
-#            layer4_hyper_step3_rule_based_clean.py (without its 2-7 word query rule). An empty missions list is valid.
+#                          "predicted_queries": [str]}]}, mirroring layer4_hyper_step3_rule_based_clean.py (without
+#            its 2-7 word query rule; the V2 data keeps each query as a plain string, without its provenance fields).
+#            An empty missions list is valid.
 L4H_MAX_BRANDS = 3
 L4H_MAX_QUERIES = 4
-L4H_VALUE_TYPES = {"explore", "refine", "advance"}
-L4H_ENRICHMENT_SOURCES = {"cross_interest", "commercial_preference", "personal_context", "professional_context",
-                          "world_knowledge"}
-L4H_DELTA_SOURCES = L4H_ENRICHMENT_SOURCES | {"source_interest"}
-L4H_QUERY_SCHEMA = {"query": str, "value_type": str, "source_query_refs": ListOf(str), "delta_source": str,
-                    "delta_evidence": str, "decision_change": str}
 L4H_MISSION_SCHEMA = {"mission_name": str, "source_interests": ListOf(str), "scenarios": ListOf(str),
-                      "predicted_brands": ListOf(str), "predicted_queries": ListOf(L4H_QUERY_SCHEMA),
-                      "enrichment_sources": ListOf(str)}
+                      "predicted_brands": ListOf(str), "predicted_queries": ListOf(str)}
 L4H_INTEREST_HEADING = re.compile(r"(?m)^### Interest \d+: (.+)$")
 L4H_KNOWN_BRANDS = re.compile(r"(?m)^\s*- Brands: (.+)$")
 
@@ -786,10 +780,7 @@ def l4h_mission_valid(mission):
     return (has_text(mission["mission_name"]) and string_list(mission["source_interests"], allow_empty=False)
             and bool(mission["scenarios"]) and all(one_of(s, L4_SCENARIOS) for s in mission["scenarios"])
             and string_list(brands) and len(brands) <= L4H_MAX_BRANDS and 1 <= len(queries) <= L4H_MAX_QUERIES
-            and all(one_of(s, L4H_ENRICHMENT_SOURCES) for s in mission["enrichment_sources"])
-            and all(has_text(q[key]) for q in queries for key in ("query", "delta_evidence", "decision_change"))
-            and all(one_of(q["value_type"], L4H_VALUE_TYPES) and one_of(q["delta_source"], L4H_DELTA_SOURCES)
-                    and string_list(q["source_query_refs"]) for q in queries))
+            and all(has_text(q) for q in queries))
 
 
 def check_l4_hyper(payload, output):
@@ -806,11 +797,10 @@ def check_l4_hyper(payload, output):
         existing = set().union(*(blocks.get(s, (set(), set()))[0] for s in sources))
         known_brands = set().union(*(blocks.get(s, (set(), set()))[1] for s in sources))
         existing_folded = {e.casefold() for e in existing}
-        texts = [q["query"].strip() for q in mission["predicted_queries"]]
+        texts = [q.strip() for q in mission["predicted_queries"]]
         all_queries.extend(texts)
-        # Copy the sources from the input, cite only their Existing queries, add only new brands and queries.
+        # Copy the sources from the input, add only new brands and queries.
         if (not set(sources) <= set(blocks)
-                or any(ref not in existing for q in mission["predicted_queries"] for ref in q["source_query_refs"])
                 or any(b.strip().casefold() in known_brands for b in mission["predicted_brands"])
                 or any(text.casefold() in existing_folded for text in texts)):
             violations.add("input_mismatch")
