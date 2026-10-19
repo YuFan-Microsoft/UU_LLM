@@ -188,7 +188,7 @@ type Signal = "strong" | "moderate" | "weak";
 }
 ```
 
-**Output** — one decision per `delta` interest, in the same order (66 rows, 0.02%, list them in another order)
+**Output** — one decision per `delta` interest, in the same order
 
 ```ts
 {
