@@ -91,24 +91,26 @@ def run(profiles: list[UserProfile], encode, run_round, emit, seed: int = 0) -> 
     """One Ranker round on every user's layer3_postprocessing (profile.layer3, set by layer3.run); adds
     "ranked_interests" to it and writes the record with the ranker call.
 
-    A user with fewer than RANKER_TOP_K candidates (or whose prompt only fits fewer) gets no call. Its
-    "ranked_interests" is [], as is that of a user whose answer never validated. Layer 4 reads only "interests", so
-    the ranking does not change its inputs."""
+    Only a user with more than RANKER_TOP_K candidates gets a call (with exactly RANKER_TOP_K the model could only
+    reorder them). A user with at most RANKER_TOP_K candidates, or whose prompt only fits that many, gets no call: its
+    "ranked_interests" are the first RANKER_TOP_K candidates in confidence order. That of a user whose answer never
+    validated is []. Layer 4 reads only "interests", so the ranking does not change its inputs."""
     requests = {}
     for profile in profiles:
         candidates = RANKER.candidates(profile.layer3)
         item = None
-        if len(candidates) >= RANKER_TOP_K:
+        if len(candidates) > RANKER_TOP_K:
             # Too long a prompt leaves out the lowest-confidence candidates before the shuffle.
             item = RANKER.request(profile, lambda k: RANKER.payload(candidates[:k], profile.user_id, seed),
                                   len(candidates), encode, make_check=RANKER.check)
-            if item and item["kept"] < RANKER_TOP_K:
+            if item and item["kept"] <= RANKER_TOP_K:
                 item = None
         requests[profile.user_id] = (candidates, item)
     run_round([item for _, item in requests.values() if item])
 
     for profile in profiles:
         candidates, item = requests[profile.user_id]
-        profile.layer3["ranked_interests"] = RANKER.ranked(
-            output(item), candidates[:item["kept"]], profile.user_id, seed) if item else []
+        profile.layer3["ranked_interests"] = (
+            RANKER.ranked(output(item), candidates[:item["kept"]], profile.user_id, seed) if item
+            else [dict(interest) for interest in candidates[:RANKER_TOP_K]])
         emit_record(emit, profile, profile.layer3, item)

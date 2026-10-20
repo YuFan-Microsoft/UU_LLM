@@ -42,9 +42,9 @@ python run_inference.py --checkpoint <ckpt_dir> --input users.jsonl --output_dir
 python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir> --engine_preset best
 ```
 
-After every engine has loaded its model (vLLM logs as usual), progress is shown as four tqdm bars over all engines
-(refreshed every 2 s), one per layer, in the order the layers run: `Layer 1` (user-windows), `Layer 2` (calls; the
-total is known once engines finish Layer 1), `Layer 3` (calls; the total grows round by round: persona + commercial, ranker) and `Layer 4` (calls;
+After every engine has loaded its model (vLLM logs as usual), progress is shown as five tqdm bars over all engines
+(refreshed every 2 s), in the order the steps run: `Layer 1` (user-windows), `Layer 2` (calls; the
+total is known once engines finish Layer 1), `Layer 3` (calls: persona + commercial), `Ranker` (calls) and `Layer 4` (calls;
 the total grows round by round: biography, commercial preference, hyper). Only first attempts are counted. If an
 engine fails, the others are stopped at once and the run ends with an error naming the engine and GPU; its traceback
 is printed between `===== vLLM engine N (GPU ...) failed =====` and `===== end of engine N error =====`. Engine N
@@ -133,7 +133,7 @@ the two postprocessing records copy the snapshot, so they keep its `date` (the u
 | 1 | `layer3_persona` | `{"interests"}`: interests with confidence ≥ 0.2: name, activity, intent, topic names (no `facts`) | no such interest |
 | 1 | `layer3_commercial_interests` | same interests with sorted `sources` and per-topic evidence `actions`; `query_language`. Like the V2 data (at most 30 interests per row), a user with more than 30 is split into near-equal contiguous chunks (103 -> 26 + 26 + 26 + 25), one call each, and the answers are concatenated in order | no such interest |
 | — | `layer3_postprocessing` | rule: persona / category and commercial fields merged by exact name into the gated interests, sorted by confidence | — |
-| 2 | Ranker (`layer_ranker.py`, `V2_User_Profile_Ranker`, written into `layer3_postprocessing`) | JSON array of the candidate interests, exactly as `code/evaluation/ranker_data_generation.py` builds the training data: the `layer3_postprocessing` interests with `commercial` true, `commercial_score` medium / high and a non-blank predicted query, shuffled once by (`--seed`, user id), each `{idx, interest_name, actual_activity, inferred_intent, brands, retailers, products, predicted_queries, first_detect_date, last_detect_date, topics: [{topic}]}` (no evidence). The answer's `output_idx` (retried unless exactly 10 distinct candidate idx) is mapped back to the interests and stored, best first, as `ranked_interests` (full interest objects); `interests` keeps its order, so Layer 4 inputs do not change | fewer than 10 candidates (`ranked_interests` is `[]`, as when the answer never validates) |
+| 2 | Ranker (`layer_ranker.py`, `V2_User_Profile_Ranker`, written into `layer3_postprocessing`) | JSON array of the candidate interests, exactly as `code/evaluation/ranker_data_generation.py` builds the training data: the `layer3_postprocessing` interests with `commercial` true, `commercial_score` medium / high and a non-blank predicted query, shuffled once by (`--seed`, user id), each `{idx, interest_name, actual_activity, inferred_intent, brands, retailers, products, predicted_queries, first_detect_date, last_detect_date, topics: [{topic}]}` (no evidence). The answer's `output_idx` (retried unless exactly 10 distinct candidate idx) is mapped back to the interests and stored, best first, as `ranked_interests` (full interest objects); `interests` keeps its order, so Layer 4 inputs do not change | at most 10 candidates (or a prompt that fits only that many): no call, `ranked_interests` are the candidates in confidence order (`[]` only when the answer never validates or there is no candidate) |
 | 3 | `layer4_biography` | `{"declared_attributes": {}, "facts": {}, "interests"}`: the Layer-3 interests highest `count` first, then highest confidence (name, activity, intent, persona, confidence, count, dates, source, at most 8 distinct topic names with the most frequent first, and for commercial interests at most 6 distinct brands / products / predicted queries each, as production's `project_interest`) | no interest |
 | 4 | `layer4_commercial_preference` | `life_stage` from the biography (`{"value": "unknown", "confidence": "low", "evidence": []}` when the biography failed), commercial interests (persona, brands, retailers, products, topics with evidence actions), non-commercial names; then the rule-based `confidence_score`s and defaults | no commercial interest |
 | 5 | `layer4_hyper_commercial_interest` (discovery + enhancement in one call) | `personal_context` / `professional_context` `""`, `commercial_preferences` (JSON string of the short form, as production's `project_commercial_preferences`: each dimension, shopper type and dining restriction with a known value and `confidence_score` >= 0.3 as `{value, confidence_score}`, the product categories, no empty containers; `""` when nothing is left), the `### Interest N` blocks of the commercial interests, `query_language` | no commercial interest |
@@ -190,7 +190,9 @@ come from replacing the LLM calls with a 25600-token model trained on the V2 dat
 ## Decoding
 
 Temperature 0.6 / top-p 0.8 by default, the same as `evaluate_user_profile_vllm.py` and the in-training rollout
-(`--temperature 0` for greedy). Answers that are not valid JSON with the expected keys (and, for the missions, that
+(`--temperature 0` for greedy). The Ranker has its own `--ranker_temperature`, default 0 (greedy, retries included):
+it picks and orders 10 idx toward a deterministic oracle ranking, so sampling only adds noise to the order (its
+`recall_at_10` is therefore not directly comparable with the in-training rollout's, sampled at 0.6 / 0.8). Answers that are not valid JSON with the expected keys (and, for the missions, that
 fail the official validation) are regenerated up to `--max_retries` (2) times. Every request has its own seed
 derived from (stage, user, window, attempt), so results do not depend on sharding. Other arguments:
 `--window_days` (7), `--grid_start_date`, `--seed`.

@@ -30,8 +30,9 @@ from utils import (MAX_MODEL_LEN, SPEC_FIELDS, SPEC_PER_POS, build_grid, build_p
 LAYERS = ["layer1_postprocessing", "layer2_postmerge"]  # written for every window
 L34_STAGES = [task.stage for task in layer3.TASKS + layer_ranker.TASKS + layer4.TASKS]
 # Per-engine progress in a shared array: phase and the requests done / total of each layer.
-PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL, L3_DONE, L3_TOTAL, L4_DONE, L4_TOTAL = range(FIELDS := 9)
-PHASES = ["loading", "layer1", "layer2", "layer3", "layer4", "done"]
+(PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL, L3_DONE, L3_TOTAL, LR_DONE, LR_TOTAL, L4_DONE,
+ L4_TOTAL) = range(FIELDS := 11)
+PHASES = ["loading", "layer1", "layer2", "layer3", "ranker", "layer4", "done"]
 REFRESH_SECONDS = 2
 # Each engine initializes torch.distributed on a free port; engines started together could pick the same one
 # (EADDRINUSE), so engine N searches from VLLM_PORT base + N * PORTS_PER_ENGINE (vLLM moves up past busy ports).
@@ -60,6 +61,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid_start_date", type=date.fromisoformat, help="Default: the earliest behavior date")
     parser.add_argument("--window_days", type=int, default=7)
     parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--ranker_temperature", type=float, default=0.0,
+                        help="Temperature of the Ranker calls, retries included (0 = greedy); --top_p still applies")
     parser.add_argument("--top_p", type=float, default=0.8)
     parser.add_argument("--max_retries", type=int, default=2, help="Regenerations of an invalid answer")
     parser.add_argument("--seed", type=int, default=0)
@@ -250,14 +253,16 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
                     emit(kind="record", layer="layer2_postmerge", date=date_str, record=snapshots[user_id])
         progress[base + L2_TOTAL] = l2_done
 
-        def round_runner(done_field: int, total_field: int):
-            """Generates one round of a layer's requests; the layer's total grows by each round's size."""
+        def round_runner(done_field: int, total_field: int, **overrides):
+            """Generates one round of a layer's requests (sampling settings optionally overridden); the layer's total
+            grows by each round's size."""
             done = 0
+            round_sampling = {**sampling, **overrides}
 
             def run_round(items: list[dict]) -> None:
                 nonlocal done
                 progress[base + total_field] += len(items)
-                generate(llm, items, None, "l34", progress_bar=counter(done_field), **sampling)
+                generate(llm, items, None, "l34", progress_bar=counter(done_field), **round_sampling)
                 for item in items:
                     item["score"] = score(item)
                 done += len(items)
@@ -267,22 +272,24 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
         # Layers 3 and 4 on each user's final snapshot (carried forward if idle at the end), with the ranker between.
         profiles = [UserProfile(user_id, snapshot, dates[-1]) for user_id, snapshot in snapshots.items()]
         progress[base + PHASE] = 3
-        layer3_round = round_runner(L3_DONE, L3_TOTAL)  # the ranker round counts in the Layer-3 bar
-        layer3.run(profiles, encode, layer3_round, emit)
-        layer_ranker.run(profiles, encode, layer3_round, emit, seed=args.seed)
+        layer3.run(profiles, encode, round_runner(L3_DONE, L3_TOTAL), emit)
         progress[base + PHASE] = 4
+        layer_ranker.run(profiles, encode, round_runner(LR_DONE, LR_TOTAL, temperature=args.ranker_temperature), emit,
+                         seed=args.seed)
+        progress[base + PHASE] = 5
         layer4.run(profiles, encode, round_runner(L4_DONE, L4_TOTAL), emit)
         if speculative:
             emit(kind="spec", rank=rank, **spec_counters(llm))
-    progress[base + PHASE] = 5
+    progress[base + PHASE] = 6
 
 
 def show_progress(processes: list, progress, l1_total: int) -> None:
-    """One progress bar per layer over all engines until every engine exits. They start once every engine has loaded
-    its model, so vLLM's loading logs come first. Each bar's clock (rate / ETA) starts at its layer's first finished
-    call. Totals: Layer 1 is known up front; Layer 2 once an engine finishes Layer 1 (each user-window with Layer-1
-    interests after the user's first one is one call); Layers 3 and 4 grow round by round (Layer 3: persona +
-    commercial, then ranker; Layer 4: biography, commercial preference, hyper). Only first attempts are counted."""
+    """One progress bar per layer (and one for the Ranker) over all engines until every engine exits. They start once
+    every engine has loaded its model, so vLLM's loading logs come first. Each bar's clock (rate / ETA) starts at its
+    layer's first finished call. Totals: Layer 1 is known up front; Layer 2 once an engine finishes Layer 1 (each
+    user-window with Layer-1 interests after the user's first one is one call); Layer 3 (persona + commercial) and the
+    Ranker are one round each; Layer 4 grows round by round (biography, commercial preference, hyper). Only first
+    attempts are counted."""
     from tqdm import tqdm
 
     engines = len(processes)
@@ -296,7 +303,8 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
     bars = [(tqdm(total=l1_total, desc="Layer 1", unit="window", position=0, dynamic_ncols=True), L1_DONE, None, 0),
             (tqdm(total=0, desc="Layer 2", unit="call", position=1, dynamic_ncols=True), L2_DONE, L2_TOTAL, 2),
             (tqdm(total=0, desc="Layer 3", unit="call", position=2, dynamic_ncols=True), L3_DONE, L3_TOTAL, 4),
-            (tqdm(total=0, desc="Layer 4", unit="call", position=3, dynamic_ncols=True), L4_DONE, L4_TOTAL, 5)]
+            (tqdm(total=0, desc="Ranker", unit="call", position=3, dynamic_ncols=True), LR_DONE, LR_TOTAL, 5),
+            (tqdm(total=0, desc="Layer 4", unit="call", position=4, dynamic_ncols=True), L4_DONE, L4_TOTAL, 6)]
     started = [False] * len(bars)
     while any(process.is_alive() for process in processes) and not failed(processes):
         mp.connection.wait([p.sentinel for p in processes if p.is_alive()], timeout=REFRESH_SECONDS)

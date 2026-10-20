@@ -17,8 +17,9 @@ Per user:
 - gains: the number of new target actions each output interest adds, aligned with output_idx.
 
 --hits_output writes one line per kept user, line-aligned with --output:
-{"user_id": ..., "interest_hits": {interest_name: [hit target action texts, in behavior order]}} over every input
-interest in input order (a repeated or missing interest_name is keyed "<name> #<input index>").
+{"user_id": ..., "interest_hits": {interest_name: {"hits": [hit target action texts], "query_hits": {query: [its hit
+target action texts]}}}} over every input interest in input order and every query of each interest, actions in
+behavior order (a repeated or missing interest_name is keyed "<name> #<input index>").
 
 Users missing from the dataset, without target actions, with fewer than --top_interests candidate interests, or whose
 greedy oracle stops adding hits before --top_interests picks are dropped, so every output_idx has exactly --top_interests
@@ -104,15 +105,27 @@ def row_target_actions(row: dict[str, Any], target: str) -> dict[Any, Any]:
 
 
 def interest_hit_actions(
-    candidates: list[dict[str, Any]], hits: list[frozenset], target_actions: dict[Any, Any]
-) -> dict[str, list[Any]]:
-    """{interest_name: hit action texts in behavior order} for every candidate in input order; a repeated or missing
-    interest_name is keyed "<name> #<input index>"."""
-    result: dict[str, list[Any]] = {}
-    for index, (interest, interest_hits) in enumerate(zip(candidates, hits)):
+    candidates: list[dict[str, Any]],
+    interest_queries: list[list[str]],
+    retrieved: dict[str, list[Any]],
+    selection_top_k: int,
+    target_actions: dict[Any, Any],
+) -> dict[str, dict[str, Any]]:
+    """{interest_name: {"hits": all hit action texts, "query_hits": {query: its hit action texts}}} for every
+    candidate in input order, actions in behavior order; a repeated or missing interest_name is keyed
+    "<name> #<input index>"."""
+    def hit_texts(action_ids: set[Any]) -> list[Any]:
+        return [action for action_id, action in target_actions.items() if action_id in action_ids]
+
+    result: dict[str, dict[str, Any]] = {}
+    for index, (interest, queries) in enumerate(zip(candidates, interest_queries)):
         name = interest.get("interest_name")
         key = name if isinstance(name, str) and name and name not in result else f"{name} #{index}"
-        result[key] = [action for action_id, action in target_actions.items() if action_id in interest_hits]
+        query_hits = {query: set(retrieved[query][:selection_top_k]) & target_actions.keys() for query in queries}
+        result[key] = {
+            "hits": hit_texts(set().union(*query_hits.values())),
+            "query_hits": {query: hit_texts(action_ids) for query, action_ids in query_hits.items()},
+        }
     return result
 
 
@@ -184,7 +197,9 @@ def generate(args: argparse.Namespace) -> int:
                 ensure_ascii=False,
             ) + "\n")
             hits_output.write(json.dumps(
-                {"user_id": user_id, "interest_hits": interest_hit_actions(candidates, hits, target_actions)},
+                {"user_id": user_id, "interest_hits": interest_hit_actions(
+                    candidates, interest_queries, retrieved, args.selection_top_k, target_actions
+                )},
                 ensure_ascii=False,
             ) + "\n")
             stats["users"] += 1
@@ -256,7 +271,7 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--hits_output", type=Path,
-        help="Per-user {interest_name: hit action texts} JSONL, line-aligned with --output "
+        help="Per-user {interest_name: {hits, query_hits}} hit action texts JSONL, line-aligned with --output "
              "(default: <output stem>.hits.jsonl)",
     )
     parser.add_argument(
