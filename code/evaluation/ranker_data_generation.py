@@ -6,8 +6,7 @@ Per user:
   have a non-blank predicted query, shuffled per user (seeded by --random_seed and user_id, so confidence_score
   order does not leak into the input), each with "idx" (its position in input) and INPUT_FIELDS (interest_name,
   actual_activity, inferred_intent, brands, retailers, products, predicted_queries, first_detect_date,
-  last_detect_date, topics). All topics are kept, each with only "topic" and its original "evidence" minus each
-  evidence's "detailed_source";
+  last_detect_date, topics). All topics are kept, each with only "topic"; raw activity evidence is omitted;
 - output_idx: the idx values of the --top_interests (default 10) oracle interests, in greedy order (ties go to
   the earliest index, i.e. at random). Each
   interest retrieves all its queries from the Qwen3 embedding index of the --target actions; the oracle is the greedy
@@ -71,16 +70,11 @@ INPUT_FIELDS = ("interest_name", "actual_activity", "inferred_intent", "brands",
 
 
 def project_interest(interest: dict[str, Any]) -> dict[str, Any]:
-    """Project input fields, clean queries, and keep every topic with only its name and original evidence (without
-    each evidence's detailed_source)."""
+    """Project input fields, clean queries, and keep all topic names without raw activity evidence."""
     projected = {key: interest.get(key) for key in INPUT_FIELDS}
     projected["predicted_queries"] = clean_queries(interest.get("predicted_queries"))
     projected["topics"] = [
-        {"topic": topic.get("topic"), "evidence": [
-            {key: value for key, value in evidence.items() if key != "detailed_source"}
-            if isinstance(evidence, dict) else evidence
-            for evidence in topic.get("evidence") or []
-        ]}
+        {"topic": topic.get("topic")}
         for topic in interest.get("topics") or []
     ]
     return projected
