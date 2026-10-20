@@ -44,7 +44,8 @@ DEFAULT_EMBEDDING_PATHS = {
 STREAMING_SEARCH_CHUNK_SIZE = 500_000
 TOP_INTERESTS = 10
 TOP30_QUERIES_PER_INTEREST = 3
-LAYER3_TOPK_KEYS = ["layer3_top10", "layer3_random10", "layer3_top30", "layer3_random30", "layer3_all"]
+LAYER3_TOPK_KEYS = ["layer3_top10", "layer3_random10", "layer3_top30", "layer3_random30", "layer3_ranker10",
+                    "layer3_ranker30", "layer3_all"]
 RANDOM_QUERY_COUNTS = {"layer3_random10": 10, "layer3_random30": 30}
 # Oracle strategies are not stored in --eval_data: they pick, per user and with the ground truth, from layer3_all
 # (so only among the interests kept by --min_commercial_score, by default commercial with a medium or high
@@ -60,6 +61,7 @@ QUERY_ORACLE_COUNTS = {"layer3_query_oracle10": 10, "layer3_query_oracle30": 30}
 ORACLE_KEYS = [*INTEREST_ORACLE_QUERIES_PER_INTEREST, *QUERY_ORACLE_COUNTS]
 ORACLE_SELECTION_TOP_K = 50
 LAYER3_EVAL_KEYS = ["layer3_random10", "layer3_random30", "layer3_top10", "layer3_top30",
+                    "layer3_ranker10", "layer3_ranker30",
                     "layer3_interest_oracle10", "layer3_interest_oracle30",
                     "layer3_query_oracle10", "layer3_query_oracle30", "layer3_all"]
 # --min_commercial_score: the interests whose queries are evaluated. "any" keeps every interest with a query; the
@@ -110,7 +112,10 @@ def build_topk_layers(
     min_commercial_score: str = DEFAULT_MIN_COMMERCIAL_SCORE,
 ) -> dict[str, list[dict[str, Any]]]:
     """layer3_top10: the first query of each of the top-10 interests by confidence_score; layer3_top30: the first 3
-    queries of each of those interests; layer3_all: every query of every interest; layer3_random10 / _random30: 10 /
+    queries of each of those interests; layer3_ranker10 / _ranker30: the same with the interests of the inference
+    Ranker (record["ranked_interests"], best first) instead, falling back to the top-10 interests by confidence_score
+    when the record has no ranked interest (fewer than 10 candidates, or the ranker failed), so every strategy covers
+    the same users; layer3_all: every query of every interest; layer3_random10 / _random30: 10 /
     30 queries drawn at random (all of them if fewer) from the distinct queries of layer3_all. The random draw is one
     shuffle per user seeded by (random_seed, user_id), so random10 is a prefix of random30. Only interests that pass
     min_commercial_score (default: commercial with a medium or high commercial_score) and have a non-blank predicted
@@ -135,6 +140,19 @@ def build_topk_layers(
     ]
     every = [{"interest_name": name, "predicted_queries": queries} for name, queries in all_interests]
 
+    ranker_interests = []
+    for interest in record.get("ranked_interests") or []:
+        if isinstance(interest, dict) and commercial_interest_kept(interest, min_commercial_score):
+            queries = clean_queries(interest.get("predicted_queries"))
+            if queries:
+                ranker_interests.append((str(interest.get("interest_name") or ""), queries))
+    ranker_interests = ranker_interests[:TOP_INTERESTS] or interests
+    ranker10 = [{"interest_name": name, "predicted_queries": queries[:1]} for name, queries in ranker_interests]
+    ranker30 = [
+        {"interest_name": name, "predicted_queries": queries[:TOP30_QUERIES_PER_INTEREST]}
+        for name, queries in ranker_interests
+    ]
+
     pool = {}  # distinct query -> its (highest-ranked) interest
     for name, queries in all_interests:
         for query in queries:
@@ -145,7 +163,8 @@ def build_topk_layers(
         key: [{"interest_name": name, "predicted_queries": [query]} for query, name in shuffled[:count]]
         for key, count in RANDOM_QUERY_COUNTS.items()
     }
-    return {"layer3_top10": top10, "layer3_top30": top30, "layer3_all": every, **randoms}
+    return {"layer3_top10": top10, "layer3_top30": top30, "layer3_ranker10": ranker10, "layer3_ranker30": ranker30,
+            "layer3_all": every, **randoms}
 
 
 def read_dataset_rows(
@@ -853,7 +872,8 @@ def parse_args() -> argparse.Namespace:
         help=(
             "run_inference.py layer3_postprocessing.jsonl: build --eval_data from "
             "it and the dataset behaviors, then evaluate layer3_random10, layer3_random30, layer3_top10, "
-            "layer3_top30, layer3_interest_oracle10, layer3_interest_oracle30, layer3_query_oracle10, "
+            "layer3_top30, layer3_ranker10, layer3_ranker30 (record ranked_interests), layer3_interest_oracle10, "
+            "layer3_interest_oracle30, layer3_query_oracle10, "
             "layer3_query_oracle30 and layer3_all"
         ),
     )
@@ -904,7 +924,7 @@ def parse_args() -> argparse.Namespace:
         nargs="+",
         help=(
             "Record key(s) containing predicted_queries, evaluated one after another "
-            "(default: layer3, or the nine layer3_* strategies with --layer3); "
+            "(default: layer3, or the eleven layer3_* strategies with --layer3); "
             f"{', '.join(ORACLE_KEYS)} select from {ORACLE_POOL_KEY} with the ground truth"
         ),
     )
@@ -1122,6 +1142,7 @@ def main() -> int:
 
 STRATEGY_NAMES = {"layer3_random10": "Random_10", "layer3_random30": "Random_30",
                   "layer3_top10": "Confidence_Score_Top_10", "layer3_top30": "Confidence_Score_Top_30",
+                  "layer3_ranker10": "Ranker_Top_10", "layer3_ranker30": "Ranker_Top_30",
                   "layer3_interest_oracle10": "Interest_Oracle_10", "layer3_interest_oracle30": "Interest_Oracle_30",
                   "layer3_query_oracle10": "Query_Oracle_10", "layer3_query_oracle30": "Query_Oracle_30",
                   "layer3_all": "All"}
