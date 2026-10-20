@@ -156,29 +156,15 @@ def l3_commercial_keys_valid(output):
 
 L4B_ATTRIBUTES = ("age_group", "gender", "estimated_income_level", "home_location", "occupation", "company",
                   "career_stage", "education_area")
-L4B_SIGNAL_FLAGS = ("later_life_status", "children_content", "own_current_study", "own_high_school",
-                    "household_signals", "news_heavy", "youth_culture_top5")
+# V2 data has no age_group.signals (removed from the GPT-5.6 output), so every attribute has exactly these keys.
 L4B_ATTRIBUTE_SCHEMA = {"evidence": ListOf(str), "value": str, "confidence": str, "source": str}
-L4B_SIGNALS_SCHEMA = {**dict.fromkeys(L4B_SIGNAL_FLAGS, bool), "later_life_clusters": ListOf(str),
-                      "early_adult_events": ListOf(str)}
-
-
-def l4b_signals_shape(signals):
-    optional = {"linkedin_min_age": (int, NULL)} if isinstance(signals, dict) and "linkedin_min_age" in signals else {}
-    return matches(signals, {**L4B_SIGNALS_SCHEMA, **optional})
-
-
-def l4b_age_group_shape(attribute):
-    optional = {"signals": l4b_signals_shape} if isinstance(attribute, dict) and "signals" in attribute else {}
-    return matches(attribute, {**L4B_ATTRIBUTE_SCHEMA, **optional})
 
 
 L4B_SCHEMA = {
     "life_stage": {"value": str, "confidence": str, "evidence": ListOf(str)},
     "user_attributes": {
-        "age_group": l4b_age_group_shape,
         "gender": {"lean": {"male": ListOf(str), "female": ListOf(str)}, **L4B_ATTRIBUTE_SCHEMA},
-        **dict.fromkeys(L4B_ATTRIBUTES[2:], L4B_ATTRIBUTE_SCHEMA),
+        **{name: L4B_ATTRIBUTE_SCHEMA for name in L4B_ATTRIBUTES if name != "gender"},
     },
     "biography": str,
 }
@@ -218,6 +204,13 @@ L4H_MISSION_SCHEMA = {"mission_name": str, "source_interests": ListOf(str), "sce
 
 def l4_hyper_keys_valid(output):
     return matches(output, {"missions": ListOf(L4H_MISSION_SCHEMA)})
+
+
+RANKER_TOP_K = 10
+
+
+def ranker_keys_valid(output):
+    return matches(output, {"output_idx": ListOf(int)})
 
 
 def build_prompt_ids(tokenizer, messages: list[dict]) -> list[int]:

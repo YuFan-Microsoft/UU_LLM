@@ -266,7 +266,7 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
         # Layers 3 and 4 on each user's final snapshot (carried forward if idle at the end).
         profiles = [UserProfile(user_id, snapshot, dates[-1]) for user_id, snapshot in snapshots.items()]
         progress[base + PHASE] = 3
-        layer3.run(profiles, encode, round_runner(L3_DONE, L3_TOTAL), emit)
+        layer3.run(profiles, encode, round_runner(L3_DONE, L3_TOTAL), emit, seed=args.seed)
         progress[base + PHASE] = 4
         layer4.run(profiles, encode, round_runner(L4_DONE, L4_TOTAL), emit)
         if speculative:
@@ -278,8 +278,8 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
     """One progress bar per layer over all engines until every engine exits. They start once every engine has loaded
     its model, so vLLM's loading logs come first. Each bar's clock (rate / ETA) starts at its layer's first finished
     call. Totals: Layer 1 is known up front; Layer 2 once an engine finishes Layer 1 (each user-window with Layer-1
-    interests after the user's first one is one call); Layer 3 once an engine starts it (one round); Layer 4 grows
-    round by round (biography, commercial preference, hyper). Only first attempts are counted."""
+    interests after the user's first one is one call); Layers 3 and 4 grow round by round (Layer 3: persona +
+    commercial, then ranker; Layer 4: biography, commercial preference, hyper). Only first attempts are counted."""
     from tqdm import tqdm
 
     engines = len(processes)
@@ -292,7 +292,7 @@ def show_progress(processes: list, progress, l1_total: int) -> None:
     # (bar, done field, total field, phase from which an engine's total is known)
     bars = [(tqdm(total=l1_total, desc="Layer 1", unit="window", position=0, dynamic_ncols=True), L1_DONE, None, 0),
             (tqdm(total=0, desc="Layer 2", unit="call", position=1, dynamic_ncols=True), L2_DONE, L2_TOTAL, 2),
-            (tqdm(total=0, desc="Layer 3", unit="call", position=2, dynamic_ncols=True), L3_DONE, L3_TOTAL, 3),
+            (tqdm(total=0, desc="Layer 3", unit="call", position=2, dynamic_ncols=True), L3_DONE, L3_TOTAL, 4),
             (tqdm(total=0, desc="Layer 4", unit="call", position=3, dynamic_ncols=True), L4_DONE, L4_TOTAL, 5)]
     started = [False] * len(bars)
     while any(process.is_alive() for process in processes) and not failed(processes):
@@ -399,8 +399,8 @@ def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], 
                          final: dict[str, dict]) -> None:
     """final_profiles.jsonl: per user, the raw past / future behaviors and the final profile, the user's
     layer4_postprocessing record (Layer-3-enriched interests with confidence >= 0.2 plus the hyper-commercial
-    missions, biography, life stage, user attributes and commercial preferences); empty if the user never had a
-    Layer-1 interest."""
+    missions, the Ranker's ranked_interests, biography, life stage, user attributes and commercial preferences); empty
+    if the user never had a Layer-1 interest."""
     wanted = set(user_ids)
     with raw_path.open(encoding="utf-8") as source, (output_dir / "final_profiles.jsonl").open("w", encoding="utf-8") as out:
         for line in source:
@@ -417,6 +417,7 @@ def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], 
                 "future_behaviors": raw["future_behaviors"],
                 "predicted_content_locale": profile.get("predicted_content_locale"),
                 "interests": profile.get("interests", []),
+                "ranked_interests": profile.get("ranked_interests", []),
                 "biography": profile.get("biography", ""),
                 "life_stage": profile.get("life_stage", {}),
                 "user_attributes": profile.get("user_attributes", {}),
@@ -474,6 +475,7 @@ def main() -> None:
                "actions": dict(sum((Counter(c["actions"]) for c in l2_calls), Counter()))},
         **{stage: call_stats([c for c in calls if c["stage"] == stage]) for stage in L34_STAGES},
         "final_profiles": len(final),
+        "ranked_profiles": sum(bool(r.get("ranked_interests")) for r in final.values()),
         "final_avg_interests": (
             sum(sum(i.get("interest_type") != "hyper_commercial" for i in r["interests"]) for r in final.values())
             / len(final) if final else None),

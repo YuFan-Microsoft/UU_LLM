@@ -20,8 +20,6 @@ MIN_HYPER_CONFIDENCE = 0.3  # hyper_preferences: preferences below this confiden
 BIO_MAX_TOPICS = 8
 BIO_MAX_COMMERCIAL_VALUES = 6
 _NULL_LIKE = {"", "-", "#null#", "null", "none", "nan", "n/a", "na", "unknown"}  # user_attributes._NULL_LIKE
-# Query languages written without spaces between words; their query word counts are not checked.
-UNSPACED_LANGUAGES = {"ja", "zh", "zh-Hans", "zh-Hant", "th"}
 UNKNOWN_LIFE_STAGE = {"value": "unknown", "confidence": "low", "evidence": []}
 
 
@@ -282,12 +280,6 @@ def _values(raw) -> list[str]:
     return result
 
 
-def _resolve_enrichment_sources(mission: dict) -> list[str]:
-    """The mission's enrichment sources. The V2 answer no longer tags its queries' sources, so only cross_interest
-    is known: exactly when the mission has several source interests."""
-    return ["cross_interest"] if len(mission.get("source_interests", []) or []) > 1 else []
-
-
 class Hyper(Task):
     """layer4_hyper_commercial_interest in one call: group the commercial interests into shopping missions, each with
     new search queries (discovery and enhancement of the production pipeline, merged in the V2 data)."""
@@ -362,25 +354,23 @@ class Hyper(Task):
             common.append(parts[0])
         return f"/{'/'.join(common)}" if common else ""
 
-    def _queries(self, mission: dict, names: list[str], catalog: dict, language: str) -> None:
-        """Valid new queries, as the V2 cleaning requires: 2-7 words (any length for ja / zh / th), no question mark,
-        not an Existing query, not repeated. The query text is kept as written (the V2 prompt does not ask for
-        lowercase)."""
+    def _queries(self, mission: dict, names: list[str], catalog: dict) -> None:
+        """Valid new queries, as the trainer's rollout rules check them (no word-count or query-count limit, like the
+        V2 prompt and data): non-empty, no question mark, not an Existing query, not repeated. The query text is kept
+        as written (the V2 prompt does not ask for lowercase)."""
         existing = self.existing_queries(names, catalog)
         queries = []
         for item in mission.get("predicted_queries", []) or []:
             value = _text(item)
-            words = len(value.split())
             if (not value or value.endswith(("?", "？")) or _name_key(value) in existing
-                    or _name_key(value) in {_name_key(q) for q in queries}
-                    or not (language in UNSPACED_LANGUAGES or 2 <= words <= 7)):
+                    or _name_key(value) in {_name_key(q) for q in queries}):
                 continue
             queries.append(value)
         mission["predicted_queries"] = queries
 
-    def missions(self, answer: dict, catalog: dict, language: str) -> list[dict]:
+    def missions(self, answer: dict, catalog: dict) -> list[dict]:
         """The answer's missions with resolved source interests and scenarios, valid queries (see _queries), new
-        brands only (at most 3), a category and enrichment sources; missions left without a query are dropped."""
+        brands only (at most 3) and a category; missions left without a query are dropped."""
         records = {str(i.get("interest_name") or "").strip(): i for i in catalog["ordered"] if i.get("interest_name")}
         accepted = []
         for raw in answer.get("missions", []):
@@ -391,7 +381,7 @@ class Hyper(Task):
                 continue
             mission = {"mission_name": name, "interest_name": name, "source_interests": names, "scenarios": scenarios,
                        "predicted_queries": raw.get("predicted_queries", [])}
-            self._queries(mission, names, catalog, language)
+            self._queries(mission, names, catalog)
             if not mission["predicted_queries"]:
                 continue
             known = {_name_key(b) for n in names for i in catalog["by_name"].get(_name_key(n), [])
@@ -399,7 +389,6 @@ class Hyper(Task):
             mission["predicted_brands"] = [b for b in _clean_brands(raw.get("predicted_brands"))
                                            if _name_key(b) not in known][:self.MAX_BRANDS]
             mission["category"] = self._category(mission, records)
-            mission["enrichment_sources"] = _resolve_enrichment_sources(mission)
             accepted.append(mission)
         return accepted
 
@@ -426,7 +415,7 @@ def _mission_to_interest(mission: dict) -> dict:
     """_mission_to_interest_schema: one hyper_commercial interest for the final interests list."""
     return {
         "interest_name": mission.get("mission_name") or mission.get("interest_name", ""),
-        "interest_type": "hyper_commercial", "enrichment_sources": _resolve_enrichment_sources(mission),
+        "interest_type": "hyper_commercial",
         "category": normalize_category(mission.get("category")),
         "children": list(mission.get("source_interests", []) or []), "commercial": True, "persona": "",
         "predicted_queries": list(dict.fromkeys(q for q in mission.get("predicted_queries", []) or [] if q)),
@@ -506,8 +495,7 @@ def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
 
     for p in profiles:
         item = items[p.user_id]
-        missions = HYPER.missions(item["output"], catalogs[p.user_id], p.language["locale"]) \
-            if output(item) else []
+        missions = HYPER.missions(item["output"], catalogs[p.user_id]) if output(item) else []
         hyper = hyper_record(p, missions, failed=bool(item) and item["output"] is None)
         emit_record(emit, p, hyper, item)
         emit_record(emit, p, postprocess(p.layer3, p.biography, p.preference, hyper))
