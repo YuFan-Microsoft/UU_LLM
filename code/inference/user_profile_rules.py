@@ -28,6 +28,8 @@ Metrics:
     L4 Commercial Preference: value_detail_consistent_ratio (every value agrees with its details)
     L4 Hyper: input_match_ratio (source interests from the input, predicted brands and queries not already in it),
         query_language_match_ratio
+    Ranker: only json_valid_ratio ({"output_idx": [int]}) and recall_at_10 (share of the reference idx in the first
+        10 predicted idx), both over every sample
 """
 
 import json
@@ -106,7 +108,8 @@ def read_layer1_activities(text):
 
 
 def read_input(messages):
-    """Return (stage, payload) from the user prompt; stage is "layer1", "layer2", a TASK_CHECKERS key or "unknown"."""
+    """Return (stage, payload) from the user prompt; stage is "layer1", "layer2", "ranker", a TASK_CHECKERS key or
+    "unknown"."""
     user_content = next(m["content"] for m in reversed(messages) if m["role"] == "user")
     if INPUT_MARKER not in user_content:
         return "unknown", None
@@ -121,6 +124,10 @@ def read_input(messages):
         payload = json.loads(raw_input)
     except json.JSONDecodeError:
         return "unknown", None
+    if isinstance(payload, list) and payload and all(
+            isinstance(candidate, dict) and "idx" in candidate and "predicted_queries" in candidate
+            for candidate in payload):
+        return "ranker", {"candidates": payload}
     if not isinstance(payload, dict):
         return "unknown", None
     if "days" in payload and "columns" in payload:
@@ -853,6 +860,36 @@ TASK_CHECKERS = {
 }
 
 
+# Ranker: {"output_idx": [int]}, exactly RANKER_TOP_K unique idx of the input candidates, best first. Scored against
+# the reference ranking (the behavior-retrieval oracle label), not by rules.
+RANKER_TOP_K = 10
+
+
+def ranker_keys_valid(output):
+    return matches(output, {"output_idx": ListOf(int)})
+
+
+def check_ranker(payload, output, reference):
+    """Returns (violations, stats) for one Ranker output, None when it is not JSON-valid. stats has recall_at_10:
+    the share of the reference idx found in the first 10 predicted idx (0 for invalid JSON), when the reference
+    answer is available."""
+    violations, stats = set(), {}
+    predicted = output["output_idx"] if output is not None else []
+    if output is not None:
+        candidate_idx = {candidate.get("idx") for candidate in payload["candidates"]}
+        if len(predicted) != RANKER_TOP_K:
+            violations.add("invalid_value")
+        if not set(predicted) <= candidate_idx:
+            violations.add("input_mismatch")
+        if has_duplicates(predicted):
+            violations.add("inconsistent")
+    reference = parse_json_object(reference) if isinstance(reference, str) else None
+    if reference is not None and ranker_keys_valid(reference) and reference["output_idx"]:
+        expected = set(reference["output_idx"])
+        stats["recall_at_10"] = len(set(predicted[:RANKER_TOP_K]) & expected) / len(expected)
+    return violations, stats
+
+
 # ---------------------------------------------------------------------------
 # Language (fastText lid.176, same vote as the data cleaning): each distinct non-URL text with probability
 # >= 0.5 votes and Chinese is split into zh-Hans / zh-Hant with OpenCC.
@@ -967,12 +1004,17 @@ def same_language(detected, requested):
 # ---------------------------------------------------------------------------
 
 def score_example(messages, generated_text):
-    """Score one rollout. Only the user prompt in `messages` is used, not the reference answer."""
+    """Score one rollout. Only the user prompt in `messages` is used, not the reference answer, except for Ranker,
+    whose recall_at_10 compares with the reference (the last message, when it is the assistant's)."""
     stage, payload = read_input(messages)
     output = parse_json_object(generated_text)
     json_valid = output is not None
     violations, stats = set(), {}
-    if output is not None and stage == "layer1":
+    if stage == "ranker":
+        json_valid = output is not None and ranker_keys_valid(output)
+        reference = messages[-1]["content"] if messages[-1]["role"] == "assistant" else None
+        violations, stats = check_ranker(payload, output if json_valid else None, reference)
+    elif output is not None and stage == "layer1":
         # JSON-valid also requires exactly the expected keys at every level.
         json_valid = layer1_keys_valid(output)
         violations, stats = check_layer1(payload, output)
@@ -1012,7 +1054,8 @@ def ratio(numerator, denominator):
 
 def summarize_records(records):
     """Metrics per dataset config, keyed "<config>/<metric>". json_valid_ratio, rule_based_pass_ratio and
-    truncated_ratio are over all samples; the other ratios are over JSON-valid outputs only."""
+    truncated_ratio are over all samples; the other ratios are over JSON-valid outputs only. Ranker logs only
+    json_valid_ratio and recall_at_10, both over all samples (invalid JSON counts as recall 0)."""
     records_by_config = defaultdict(list)
     for record in records:
         if not record.get("skipped"):
@@ -1021,6 +1064,12 @@ def summarize_records(records):
     metrics = {}
     for config, items in records_by_config.items():
         valid = [r for r in items if r["json_valid"]]
+        if items[0]["stage"] == "ranker":
+            scored = [r["stats"]["recall_at_10"] for r in items if "recall_at_10" in r["stats"]]
+            values = {"json_valid_ratio": ratio(len(valid), len(items)),
+                      "recall_at_10": ratio(sum(scored), len(scored))}
+            metrics.update({f"{config}/{name}": value for name, value in values.items() if value is not None})
+            continue
         totals = Counter()
         for r in valid:
             totals.update(r["stats"])

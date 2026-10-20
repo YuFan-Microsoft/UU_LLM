@@ -33,6 +33,7 @@ DEFAULT_CONFIGS = [
     "V2_User_Profile_L4_Biography_gpt56",
     "V2_User_Profile_L4_CommercialPreference_gpt56",
     "V2_User_Profile_L4_Hyper_gpt56",
+    "V2_User_Profile_Ranker",
 ]
 
 

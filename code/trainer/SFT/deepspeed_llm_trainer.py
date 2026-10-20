@@ -131,9 +131,14 @@ class MixedEpochLLMDataset(Dataset):
     wrapping around, so a large config sees fresh rows every epoch until it is exhausted and a small config is
     repeated about quota / size times per epoch. The epoch's rows are then shuffled together. The epoch length is
     constant, so the LR schedule is unchanged. Call set_epoch(epoch) on every rank before each epoch.
+
+    augmenters maps a config name to fn(messages, rng) -> messages, applied to that config's rows on every access
+    with an rng seeded by (seed, epoch, position in the epoch): every repeat of a row gets its own variant, the
+    same on every rank and run. A variant longer than max_seq_len falls back to the original row.
     """
 
-    def __init__(self, config_datasets, config_names, tokenizer, max_seq_len, alpha, seed, weights=None) -> None:
+    def __init__(self, config_datasets, config_names, tokenizer, max_seq_len, alpha, seed, weights=None,
+                 augmenters=None) -> None:
         super().__init__()
         self.dataset = concatenate_datasets(config_datasets)
         self.tokenizer = tokenizer
@@ -145,17 +150,19 @@ class MixedEpochLLMDataset(Dataset):
         rng = np.random.default_rng(seed)
         self.orders = [rng.permutation(size) for size in self.sizes]
         self.config_names = config_names
+        self.augmenters = [(augmenters or {}).get(name) for name in config_names]
         self.set_epoch(0)
 
     def describe(self):
         total = sum(self.quotas)
         return [
             {"config": name, "rows": size, "rows_per_epoch": quota, "share": round(quota / total, 4),
-             "passes_per_epoch": round(quota / size, 2)}
-            for name, size, quota in zip(self.config_names, self.sizes, self.quotas)
+             "passes_per_epoch": round(quota / size, 2), "augmented": augmenter is not None}
+            for name, size, quota, augmenter in zip(self.config_names, self.sizes, self.quotas, self.augmenters)
         ]
 
     def set_epoch(self, epoch):
+        self.epoch = epoch
         parts = [
             offset + order[(epoch * quota + np.arange(quota)) % size]
             for offset, order, size, quota in zip(self.offsets, self.orders, self.sizes, self.quotas)
@@ -168,7 +175,14 @@ class MixedEpochLLMDataset(Dataset):
         return len(self.indices)
 
     def __getitem__(self, idx):
-        messages = self.dataset[int(self.indices[idx])]["messages"]
+        row_index = int(self.indices[idx])
+        messages = self.dataset[row_index]["messages"]
+        augmenter = self.augmenters[int(np.searchsorted(self.offsets, row_index, side="right")) - 1]
+        if augmenter is not None:
+            rng = np.random.default_rng((self.seed, self.epoch, idx))
+            input_ids, labels, _ = encode_sft_example(augmenter(messages, rng), self.tokenizer, None)
+            if not self.max_seq_len or len(input_ids) <= self.max_seq_len:
+                return {"input_ids": input_ids.tolist(), "labels": labels.tolist()}
         input_ids, labels, _ = encode_sft_example(messages, self.tokenizer, self.max_seq_len)
         return {"input_ids": input_ids.tolist(),
             "labels": labels.tolist()}
@@ -181,7 +195,8 @@ def create_dataset(dataset_name,
                    hf_token=None,
                    shuffle_seed=42,
                    mixing_alpha=None,
-                   mixing_weights=None):
+                   mixing_weights=None,
+                   augmenters=None):
     load_kwargs = {"token": hf_token} if hf_token else {}
     if dataset_configs:
         config_datasets = [
@@ -204,12 +219,15 @@ def create_dataset(dataset_name,
     if dataset_configs and (mixing_alpha is not None or mixing_weights):
         train_llm_dataset = MixedEpochLLMDataset(
             [config_dataset["train"] for config_dataset in config_datasets], list(dataset_configs),
-            tokenizer, max_seq_len, mixing_alpha, shuffle_seed, mixing_weights)
+            tokenizer, max_seq_len, mixing_alpha, shuffle_seed, mixing_weights, augmenters)
         if torch.distributed.get_rank() == 0:
             mixing = f"weights={mixing_weights}" if mixing_weights else f"alpha={mixing_alpha}"
             print(f"Train mixture ({mixing}, {len(train_llm_dataset)} rows per epoch): "
                   f"{json.dumps(train_llm_dataset.describe(), indent=2)}", flush=True)
     else:
+        if augmenters and torch.distributed.get_rank() == 0:
+            print(f"Warning: train augmentation of {sorted(augmenters)} needs --dataset_mixing_weights or "
+                  "--dataset_mixing_alpha; training on the original rows", flush=True)
         train_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "train")
     test_llm_dataset = LLMDataset(dataset, tokenizer, max_seq_len, "test",
                                   list(dataset_configs) if dataset_configs else None)
@@ -456,6 +474,8 @@ def parse_args(argument_defaults=None):
     parser.add_argument('--num_train_steps', type=int, default=-1)
     parser.add_argument('--num_warmup_steps', type=int, default=-1)
     parser.add_argument('--checkpoint_steps', type=int, default=5000)
+    parser.add_argument('--save_checkpoints', action=argparse.BooleanOptionalAction, default=True,
+                        help="--no-save_checkpoints still evaluates every --checkpoint_steps but never writes a model")
     parser.add_argument('--logging_steps', type=int, default=1)
 
     parser.add_argument('--per_device_train_batch_size', type=int, default=16)
@@ -486,6 +506,8 @@ def parse_args(argument_defaults=None):
     parser.add_argument('--rollout_eval_split', type=str, default='test')
     parser.add_argument('--rollout_eval_samples', type=int, default=256,
                         help="Fixed number of examples per config (<=0 for the whole split)")
+    parser.add_argument('--rollout_eval_fraction', type=float, default=None,
+                        help="Share (0-1] of every config's split to roll out, e.g. 0.1; overrides --rollout_eval_samples")
     parser.add_argument('--rollout_max_model_len', type=int, default=15360)
     parser.add_argument('--rollout_max_tokens', type=int, default=8192)
     parser.add_argument('--rollout_gpu_memory_utilization', type=float, default=0.3)
@@ -512,6 +534,8 @@ def parse_args(argument_defaults=None):
     return args
 
 def save_checkpoint(args, model, processor, epoch, step, ppl):
+    if not args.save_checkpoints:
+        return
     ppl = round(ppl, 4)
     tag = f"epoch_{epoch}_step_{step}_ppl_{ppl}"
     cur_save_path = os.path.join(args.output_dir, tag)
@@ -733,6 +757,7 @@ def create_rollout_evaluator(args, tokenizer, rollout_scorer):
         args.rollout_eval_samples,
         args.dataset_shuffle_seed,
         args.hf_token,
+        fraction=args.rollout_eval_fraction,
     )
     rollout = ColocatedVLLMRollout(
         args.model_name_or_path,
@@ -787,15 +812,16 @@ def rollout_evaluation(args, rollout, examples, rollout_scorer, model, tokenizer
         wandb_module.log(log)
 
 
-TASK_DISPLAY_NAMES = {"L1": "L1_Interest", "L2": "L2_Merge"}
+TASK_DISPLAY_NAMES = {"L1": "L1_Interest", "L2": "L2_Merge", "Ranker": "L5_Ranker"}
 
 
 def task_name(config):
     """Short task name of a dataset config: "V2_User_Profile_L1_gpt56" -> "L1_Interest",
     "V2_User_Profile_L1_Negative_gpt56" -> "L1_Negative", "V2_User_Profile_L2_gpt56" -> "L2_Merge",
-    "V2_User_Profile_L3_Persona_gpt56" -> "L3_Persona" (V1 "_gpt54" configs map the same way)."""
+    "V2_User_Profile_L3_Persona_gpt56" -> "L3_Persona", "V2_User_Profile_Ranker" -> "L5_Ranker"
+    (V1 "_gpt54" configs map the same way)."""
     match = re.search(r"(?:^|_)(L\d+(?:_[A-Za-z]+)?)_gpt5\d(?:_|$)", config or "") \
-        or re.search(r"(?:^|_)(L\d+)(?:_|$)", config or "")
+        or re.search(r"(?:^|_)(L\d+|Ranker)(?:_|$)", config or "")
     if not match:
         return config or "all"
     return TASK_DISPLAY_NAMES.get(match.group(1), match.group(1))
@@ -831,7 +857,8 @@ def require_linear_attention_kernels():
         )
 
 
-def main(argument_defaults=None, rollout_scorer=None):
+def main(argument_defaults=None, rollout_scorer=None, train_augmenters=None):
+    """train_augmenters: {dataset config: fn(messages, rng) -> messages}, see MixedEpochLLMDataset."""
     args = parse_args(argument_defaults)
     if args.require_linear_attention_kernels:
         require_linear_attention_kernels()
@@ -847,6 +874,7 @@ def main(argument_defaults=None, rollout_scorer=None):
         shuffle_seed=args.dataset_shuffle_seed,
         mixing_alpha=args.dataset_mixing_alpha,
         mixing_weights=args.dataset_mixing_weights,
+        augmenters=train_augmenters,
     )
     rollout, rollout_examples = None, None
     if args.rollout_eval:

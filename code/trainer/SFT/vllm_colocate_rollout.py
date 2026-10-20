@@ -216,16 +216,19 @@ def load_rollout_eval_examples(
     samples_per_config: int,
     seed: int,
     hf_token: str | None,
+    fraction: float | None = None,
 ) -> list[dict]:
-    """Load a fixed, deterministic evaluation subset (the same examples at every eval step)."""
+    """Load a fixed, deterministic evaluation subset (the same examples at every eval step). fraction (0-1], when
+    given, takes that share of every config's split (at least 1 row) instead of samples_per_config rows."""
     from datasets import load_dataset
 
     load_kwargs = {"token": hf_token} if hf_token else {}
     examples = []
     for config in configs:
         dataset = load_dataset(dataset_name, config, split=split, **load_kwargs)
-        if 0 < samples_per_config < len(dataset):
-            dataset = dataset.shuffle(seed=seed).select(range(samples_per_config))
+        samples = max(1, round(fraction * len(dataset))) if fraction else samples_per_config
+        if 0 < samples < len(dataset):
+            dataset = dataset.shuffle(seed=seed).select(range(samples))
         for index, row in enumerate(dataset):
             examples.append({
                 "config": config or dataset_name,

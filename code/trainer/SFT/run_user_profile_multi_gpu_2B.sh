@@ -14,7 +14,7 @@ if [ "${ROLLOUT_EVAL:-1}" = "1" ]; then
    ROLLOUT_ARGS="--rollout_eval --rollout_eval_samples ${ROLLOUT_EVAL_SAMPLES:--1} --rollout_max_model_len 25600 --rollout_max_tokens 16384 --rollout_gpu_memory_utilization 0.7 --no-rollout_enforce_eager --rollout_temperature 0.6 --rollout_top_p 0.8"
 fi
 
-# Trains on the 8 V2 configs (USER_PROFILE_DEFAULTS in deepspeed_user_profile_trainer.py). Perplexity is evaluated on the
+# Trains on the 9 V2 configs, incl. Ranker with shuffled candidates (USER_PROFILE_DEFAULTS in deepspeed_user_profile_trainer.py). Perplexity is evaluated on the
 # whole test split (no --max_eval_steps); eval + checkpoint every 2000 steps.
 mkdir -p ./output/qwen3_5_2B_sft_user_profile_v2/
 deepspeed deepspeed_user_profile_trainer.py --hf_token "$HF_TOKEN" \
