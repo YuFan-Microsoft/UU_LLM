@@ -21,13 +21,14 @@ import layer1  # noqa: E402
 import layer2  # noqa: E402
 import layer3  # noqa: E402
 import layer4  # noqa: E402
+import layer_ranker  # noqa: E402
 import user_profile_rules  # noqa: E402
 from task import UserProfile  # noqa: E402
 from utils import (MAX_MODEL_LEN, SPEC_FIELDS, SPEC_PER_POS, build_grid, build_prompt_ids, build_windows, dumps,  # noqa: E402
                    generate, load_users, new_item, read_rows, spec_counters, spec_summary, visible_gpus)
 
 LAYERS = ["layer1_postprocessing", "layer2_postmerge"]  # written for every window
-L34_STAGES = [task.stage for task in layer3.TASKS + layer4.TASKS]
+L34_STAGES = [task.stage for task in layer3.TASKS + layer_ranker.TASKS + layer4.TASKS]
 # Per-engine progress in a shared array: phase and the requests done / total of each layer.
 PHASE, L1_DONE, L1_TOTAL, L2_DONE, L2_TOTAL, L3_DONE, L3_TOTAL, L4_DONE, L4_TOTAL = range(FIELDS := 9)
 PHASES = ["loading", "layer1", "layer2", "layer3", "layer4", "done"]
@@ -263,10 +264,12 @@ def run_engine(rank: int, args: argparse.Namespace, user_ids: list[str], windows
                 progress[base + done_field] = done
             return run_round
 
-        # Layers 3 and 4 on each user's final snapshot (carried forward if idle at the end).
+        # Layers 3 and 4 on each user's final snapshot (carried forward if idle at the end), with the ranker between.
         profiles = [UserProfile(user_id, snapshot, dates[-1]) for user_id, snapshot in snapshots.items()]
         progress[base + PHASE] = 3
-        layer3.run(profiles, encode, round_runner(L3_DONE, L3_TOTAL), emit, seed=args.seed)
+        layer3_round = round_runner(L3_DONE, L3_TOTAL)  # the ranker round counts in the Layer-3 bar
+        layer3.run(profiles, encode, layer3_round, emit)
+        layer_ranker.run(profiles, encode, layer3_round, emit, seed=args.seed)
         progress[base + PHASE] = 4
         layer4.run(profiles, encode, round_runner(L4_DONE, L4_TOTAL), emit)
         if speculative:
