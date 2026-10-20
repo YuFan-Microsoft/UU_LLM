@@ -469,7 +469,7 @@ One section per V2 task: every section has the 4 shared charts plus 1-2 task cha
 | Task | Metric | Meaning |
 | --- | --- | --- |
 | All | `token_ppl` | Token-level eval perplexity of the task's test split (see "Eval perplexity") |
-| All | `json_valid_ratio` | Outputs that (1) parse as a JSON object, (2) have exactly the task's keys at every level, in any order (L2: per decision, the keys of its `action`, which must be `merge` or `add`; L4 Biography: `age_group.signals` and `signals.linkedin_min_age` are optional), and (3) have the expected value type everywhere (string, int, bool, null, list, object; e.g. L1 `evidence` is a list of ints, L3 Commercial `commercial_score` a string or null). Enum values, empty text and counts are rules, not JSON validity |
+| All | `json_valid_ratio` | Outputs that (1) parse as a JSON object, (2) have exactly the task's keys at every level, in any order (L2: per decision, the keys of its `action`, which must be `merge` or `add`), and (3) have the expected value type everywhere (string, int, bool, null, list, object; e.g. L1 `evidence` is a list of ints, L3 Commercial `commercial_score` a string or null). Enum values, empty text and counts are rules, not JSON validity |
 | All | `rule_based_pass_ratio` | Outputs that are JSON-valid and break no rule (L1 / L2 cleaning rules, or the categories below) |
 | All | `truncated_ratio` | Generations that hit `--rollout_max_tokens` (`finish_reason == "length"`); these usually also fail `json_valid_ratio` |
 | L1 | `topic_evidence_valid_ratio` | Topics whose evidence idx all exist in the input and whose `source` equals their evidence sources |
@@ -482,8 +482,8 @@ One section per V2 task: every section has the 4 shared charts plus 1-2 task cha
 | L3 Commercial | `query_language_match_ratio_en` | Outputs whose queries are in the requested `query_language` (fastText, below), over rows requesting `en` |
 | L3 Commercial | `query_language_match_ratio_glb` | Same, over rows requesting any other language |
 | L3 Commercial | `avg_query_num` | Predicted queries per commercial interest (prompt allows 1-3) |
-| L4 Biography | `declared_match_ratio` | Outputs that copy every declared attribute verbatim with source `declared`, use `declared` for nothing else, and give `age_group.signals` only for an inferred age group |
-| L4 Biography | `source_grounded_ratio` | Outputs whose `linkedin` / `location_data` sources have that fact in the input (and LinkedIn occupation / company / education_area the field they copy, unless a status such as Self-Employed), with `signals.linkedin_min_age` exactly when there is a LinkedIn profile |
+| L4 Biography | `declared_match_ratio` | Outputs that copy every declared attribute verbatim with source `declared` and use `declared` for nothing else |
+| L4 Biography | `source_grounded_ratio` | Outputs whose `linkedin` / `location_data` sources have that fact in the input (and LinkedIn occupation / company / education_area the field they copy, unless a status such as Self-Employed) |
 | L4 Commercial Preference | `value_detail_consistent_ratio` | Outputs whose sensitivity / affinity values are Unknown exactly without details and otherwise within the range of their detail levels, whose shopper types and dining restrictions equal their details, and whose product categories do not repeat |
 | L4 Hyper | `query_language_match_ratio` | Outputs whose queries are in the requested `query_language` (fastText, below), over all checked rows |
 
@@ -491,13 +491,13 @@ L1 Negative / L3 / L4 rule categories (mirroring `pyscript/data_cleaning/*_rule_
 
 | Category | Rules |
 | --- | --- |
-| `invalid_value` | Bad enum (category path, score, funnel stage, life stage, attribute values / confidence / source, sensitivity level, shopper type, Ads Vertical, scenario), empty required text, wrong count (1-3 L3 queries, > 3 attribute evidence, > 3 brands, 1-4 Hyper queries), L3 commercial=false with non-null fields, L1 Negative `reliability_score` outside 0-1 |
-| `input_mismatch` | Interest names not exactly the input names once each (L3); evidence idx missing from the input or an uncited signal (L1 Negative); declared attributes or fact sources not matching the input (L4 Biography); source interests not in the input, query refs not Existing queries of the sources, or brands / queries already in the input (L4 Hyper) |
+| `invalid_value` | Bad enum (category path, score, funnel stage, life stage, attribute values / confidence / source, sensitivity level, shopper type, Ads Vertical, scenario), empty required text, wrong count (1-3 L3 queries, > 3 attribute evidence, > 3 brands, no Hyper query), L3 commercial=false with non-null fields, L1 Negative `reliability_score` outside 0-1 |
+| `input_mismatch` | Interest names not exactly the input names once each (L3); evidence idx missing from the input or an uncited signal (L1 Negative); declared attributes or fact sources not matching the input (L4 Biography); source interests not in the input, or brands / queries already in the input (L4 Hyper) |
 | `inconsistent` | Duplicate personas, entities, queries, evidence, keywords or categories; category spelled two ways; L1 Negative `signal_type` / `source` / `detailed_source` not those of the cited signals; L4 Biography Unknown values without source unknown (or the reverse), known values without evidence, or pronouns contradicting gender; Commercial Preference values disagreeing with their details |
 | `text_quality` | Query ending in `?` (L3, L4 Hyper) or outside 2-10 words (L3, skipped for ja/zh/th); JSON fragments in L4 Biography text |
 | `wrong_language` | L3 Commercial and L4 Hyper: the predicted queries are not in the input `query_language`. L4 Biography and L4 Commercial Preference: the free text (biography and evidence; descriptions, areas and evidence) is not English |
 
-Not checked, by design: L1 Negative keyword length, case and reaction words, and L4 Hyper query word counts.
+Not checked, by design: L1 Negative keyword length, case and reaction words, and L4 Hyper query counts and word counts.
 
 Closed vs open vocabulary: fields with a fixed label set (enums above, and L1 `predicted_content_locale`, which must be
 one of the V2 content locales `en`, `de`, `fr`, `es`, `ja`, `pt`, `nl`, `it`, `sv`, `pl`, `zh-Hans`, `zh-Hant` or `mix`;

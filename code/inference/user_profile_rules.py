@@ -26,7 +26,8 @@ Metrics:
     L4 Biography: declared_match_ratio (declared attributes copied verbatim with source declared),
         source_grounded_ratio (linkedin / location_data sources backed by those facts)
     L4 Commercial Preference: value_detail_consistent_ratio (every value agrees with its details)
-    L4 Hyper: input_match_ratio (sources, query refs and brands match the input), query_language_match_ratio
+    L4 Hyper: input_match_ratio (source interests from the input, predicted brands and queries not already in it),
+        query_language_match_ratio
 """
 
 import json
@@ -536,37 +537,20 @@ L4B_LINKEDIN_FIELDS = {"occupation": ("titles", "current_roles"), "company": ("c
                        "education_area": ("fieldOfStudy", "areas")}
 # Values that may come from an explicit LinkedIn status rather than the copied field.
 L4B_STATUS_VALUES = {"Unknown", "Self-Employed", "Retired", "Student", "Homemaker", "Not in Workforce"}
-L4B_SIGNAL_FLAGS = ("later_life_status", "children_content", "own_current_study", "own_high_school",
-                    "household_signals", "news_heavy", "youth_culture_top5")
-L4B_LATER_LIFE_CLUSTERS = {"health_aging", "savings_income", "grandchildren", "leisure_travel_clubs", "classic_media",
-                           "home_garden", "heritage_hobbies"}
 L4B_JSON_ARTIFACT = re.compile(r'[{}`]|"(?:life_stage|user_attributes|biography|value|confidence|confidence_score|'
                                r'evidence|source|signals|lean)"\s*:')
 L4B_MALE_PRONOUN = re.compile(r"\b(?:he|him|his|himself)\b", re.IGNORECASE)
 L4B_FEMALE_PRONOUN = re.compile(r"\b(?:she|her|hers|herself)\b", re.IGNORECASE)
 
+# V2 data has no age_group.signals (removed from the GPT-5.6 output), so every attribute has exactly these keys.
 L4B_ATTRIBUTE_SCHEMA = {"evidence": ListOf(str), "value": str, "confidence": str, "source": str}
-L4B_SIGNALS_SCHEMA = {**dict.fromkeys(L4B_SIGNAL_FLAGS, bool), "later_life_clusters": ListOf(str),
-                      "early_adult_events": ListOf(str)}
-
-
-def l4b_signals_shape(signals):
-    """age_group.signals: the fixed signal keys, plus linkedin_min_age (int or null) when present."""
-    optional = {"linkedin_min_age": (int, NULL)} if isinstance(signals, dict) and "linkedin_min_age" in signals else {}
-    return matches(signals, {**L4B_SIGNALS_SCHEMA, **optional})
-
-
-def l4b_age_group_shape(attribute):
-    optional = {"signals": l4b_signals_shape} if isinstance(attribute, dict) and "signals" in attribute else {}
-    return matches(attribute, {**L4B_ATTRIBUTE_SCHEMA, **optional})
 
 
 L4B_SCHEMA = {
     "life_stage": {"value": str, "confidence": str, "evidence": ListOf(str)},
     "user_attributes": {
-        "age_group": l4b_age_group_shape,
         "gender": {"lean": {"male": ListOf(str), "female": ListOf(str)}, **L4B_ATTRIBUTE_SCHEMA},
-        **dict.fromkeys(L4B_ATTRIBUTES[2:], L4B_ATTRIBUTE_SCHEMA),
+        **{name: L4B_ATTRIBUTE_SCHEMA for name in L4B_ATTRIBUTES if name != "gender"},
     },
     "biography": str,
 }
@@ -579,7 +563,6 @@ def l4_biography_keys_valid(output):
 def l4b_values_valid(output):
     """Enums, non-empty text and evidence counts; the shape is already checked by L4B_SCHEMA."""
     life_stage, attributes = output["life_stage"], output["user_attributes"]
-    signals = attributes["age_group"].get("signals")
     if not (one_of(life_stage["value"], L4B_LIFE_STAGES) and one_of(life_stage["confidence"], L4B_CONFIDENCES)
             and string_list(life_stage["evidence"], allow_empty=False) and has_text(output["biography"])):
         return False
@@ -591,10 +574,7 @@ def l4b_values_valid(output):
                 and string_list(attribute["evidence"]) and len(attribute["evidence"]) <= L4B_MAX_EVIDENCE):
             return False
     gender_lean = attributes["gender"]["lean"]
-    return (string_list(gender_lean["male"]) and string_list(gender_lean["female"])
-            and (signals is None or (all(one_of(c, L4B_LATER_LIFE_CLUSTERS) for c in signals["later_life_clusters"])
-                                     and not has_duplicates(signals["later_life_clusters"])
-                                     and string_list(signals["early_adult_events"]))))
+    return string_list(gender_lean["male"]) and string_list(gender_lean["female"])
 
 
 def check_l4_biography(payload, output):
@@ -622,12 +602,6 @@ def check_l4_biography(payload, output):
         unknown = attribute["value"] == "Unknown"
         if unknown != (source == "unknown") or (not unknown and not attribute["evidence"]):
             violations.add("inconsistent")
-    # age_group.signals only for an inferred age_group; linkedin_min_age exactly when there is a LinkedIn profile.
-    signals = attributes["age_group"].get("signals")
-    if (signals is not None) == ("age_group" in declared):
-        declared_ok = False
-    if signals is not None and ("linkedin_min_age" in signals) != ("linkedin_profile" in facts):
-        grounded_ok = False
     if not (declared_ok and grounded_ok):
         violations.add("input_mismatch")
 
@@ -738,10 +712,9 @@ def check_l4_commercial_preference(payload, output):
 
 # L4 Hyper: {"missions": [{"mission_name", "source_interests", "scenarios", "predicted_brands",
 #                          "predicted_queries": [str]}]}, mirroring layer4_hyper_step3_rule_based_clean.py (without
-#            its 2-7 word query rule; the V2 data keeps each query as a plain string, without its provenance fields).
-#            An empty missions list is valid.
+#            its 2-7 word query rule and query count limit; the V2 data keeps each query as a plain string, without its
+#            provenance fields). An empty missions list is valid.
 L4H_MAX_BRANDS = 3
-L4H_MAX_QUERIES = 4
 L4H_MISSION_SCHEMA = {"mission_name": str, "source_interests": ListOf(str), "scenarios": ListOf(str),
                       "predicted_brands": ListOf(str), "predicted_queries": ListOf(str)}
 L4H_INTEREST_HEADING = re.compile(r"(?m)^### Interest \d+: (.+)$")
@@ -779,7 +752,7 @@ def l4h_mission_valid(mission):
     queries, brands = mission["predicted_queries"], mission["predicted_brands"]
     return (has_text(mission["mission_name"]) and string_list(mission["source_interests"], allow_empty=False)
             and bool(mission["scenarios"]) and all(one_of(s, L4_SCENARIOS) for s in mission["scenarios"])
-            and string_list(brands) and len(brands) <= L4H_MAX_BRANDS and 1 <= len(queries) <= L4H_MAX_QUERIES
+            and string_list(brands) and len(brands) <= L4H_MAX_BRANDS and bool(queries)
             and all(has_text(q) for q in queries))
 
 
@@ -904,8 +877,9 @@ QUERY_GETTERS = {
         if isinstance(entry.get("predicted_queries"), list)
         for query in entry["predicted_queries"] if isinstance(query, str)],
     "l4_hyper": lambda output: [
-        query.get("query") for mission in dicts(output.get("missions"))
-        for query in dicts(mission.get("predicted_queries")) if isinstance(query.get("query"), str)],
+        query for mission in dicts(output.get("missions"))
+        if isinstance(mission.get("predicted_queries"), list)
+        for query in mission["predicted_queries"] if isinstance(query, str)],
 }
 
 # Units that carry queries, for avg_query_num: commercial interests (L3 Commercial).
