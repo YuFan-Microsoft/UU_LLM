@@ -10,12 +10,11 @@ import zlib
 
 HERE = Path(__file__).resolve().parent
 
-# MAIProfile_Official settings of the GPT-5.6 run the V2 SFT data comes from (--signal-source-priority
-# MSN,Bing,Ads,Shopping,Uet,Edge,ChromeImports --max-user-actions 200; the V2 L1 inputs have exactly these sources and
-# at most 200 signals).
+# maiprofilev3dev default signal_source_priority (config.py): every production source. The V2 SFT data comes from a run
+# restricted to MSN,Bing,Ads,Shopping,Uet,Edge,ChromeImports, so Copilot / LinkedIn / LinkedInCA are unseen in training.
 SOURCE_RANK = {source: rank for rank, source in enumerate(  # signal_source_priority, best first
-    ["MSN", "Bing", "Ads", "Shopping", "Uet", "Edge", "ChromeImports"])}
-MAX_SIGNAL_ACTIONS = 200        # max_signal_actions (production --max-user-actions)
+    ["MSN", "Bing", "Copilot", "Ads", "Shopping", "Uet", "Edge", "ChromeImports", "LinkedIn", "LinkedInCA"])}
+MAX_SIGNAL_ACTIONS = 200        # max_signal_actions (--max-user-actions of the V2 SFT run; production default 1000)
 MAX_ACTION_CHARS = 128          # data_reader.clean_signals
 MIN_VALID_DATE = "2025-01-01"   # data_reader.MIN_VALID_DATE
 

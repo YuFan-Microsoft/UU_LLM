@@ -72,12 +72,13 @@ Only `past_behaviors` is used. Loading follows `data_reader.load_signals` (Actio
 before 2025-01-01 dropped, users sorted by id, behaviors stably sorted by date). Behaviors are split into one global
 grid of non-overlapping 7-day windows (`--window_days`, anchored at the earliest date across all users or
 `--grid_start_date`, same as maiprofilev3dev `build_delta_grid`; the last window shrinks to the last date). Per
-window the script keeps only the production run's sources (`--signal-source-priority
-MSN,Bing,Ads,Shopping,Uet,Edge,ChromeImports`: Copilot, Xbox, LinkedIn, ... are dropped), dedupes by action (latest
-date wins) and caps at 200 signals by source priority then recency (`--max-user-actions 200`), like
-`Layer1Delta._filter_signals`; a window with no allowed source gets no Layer-1 record, as in maiprofilev3dev. These
-are the settings of the run the SFT data comes from (the V2 L1 inputs have exactly these sources and at most 200
-signals; maiprofilev3dev's own defaults add Copilot / LinkedIn and allow 1000). The user message is
+window the script keeps maiprofilev3dev's default sources (`signal_source_priority`
+MSN,Bing,Copilot,Ads,Shopping,Uet,Edge,ChromeImports,LinkedIn,LinkedInCA: Xbox and any other source are dropped),
+dedupes by action (latest date wins) and caps at 200 signals by source priority then recency
+(`--max-user-actions 200`), like `Layer1Delta._filter_signals`; a window with no allowed source gets no Layer-1
+record, as in maiprofilev3dev. The 200 cap is the setting of the run the SFT data comes from (maiprofilev3dev's own
+default allows 1000); that run kept only MSN,Bing,Ads,Shopping,Uet,Edge,ChromeImports, so Copilot / LinkedIn /
+LinkedInCA signals were never seen in training. The user message is
 `prompt_l1.md + "\nInput:\n"` followed by one minified JSON object per signal and line,
 `{"idx":0,"date":"YYYY-MM-DD","source":"Bing","action":"..."}`, with the signals sorted by date and numbered from 0,
 exactly as the SFT data. The behaviors' `intent` is not used: the model does not see it (the V2 input has none) and,
