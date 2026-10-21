@@ -366,10 +366,14 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
   L3 Commercial, L4 Biography, L4 Commercial Preference, L4 Hyper; GPT-5.6, each with its simplified task prompt, rows
   ≤ 25,600 Qwen3.5-4B tokens). Rollout scoring rules exist for all eight configs (see the rollout metrics below).
 - The train split is mixed with `--dataset_mixing_weights` (`V2_MIXTURE` in `deepspeed_user_profile_trainer.py`):
-  each epoch has the rows of one natural epoch (1,705,608), split across configs by these shares: L1 20.1%, L1
-  Negative 13.9%, L2 19.5%, L3 Persona 5.8%, L3 Commercial 10.9%, L4 Biography 12.1%, L4 Commercial Preference 10.6%,
-  L4 Hyper 7.1%. Every config is seen ~1.28 times per epoch, except L1 Negative (~0.43 passes: short and highly
-  redundant, 74% single-signal rows). `--dataset_mixing_alpha` (shares proportional to `rows ** alpha`) is the alternative when
+  each epoch has the rows of one natural epoch (1,705,608), split across configs by these shares: L1 21%, L1
+  Negative 5%, L2 21%, L3 Persona 5%, L3 Commercial 15%, L4 Biography 11%, L4 Commercial Preference 10%, L4 Hyper
+  12%. Passes per epoch: L1 1.34, L2 1.38, L3 Persona 1.10, L3 Commercial 1.76, L4 Biography 1.16, L4 Commercial
+  Preference 1.21, L4 Hyper 2.17, L1 Negative 0.15. The loss is a token mean, so a config's share of the gradient
+  follows its share of answer tokens rather than rows (L3 Persona's long answers give it ~14% at a 5% row share; L4
+  Hyper had only ~4.6% at the natural mix). The shares favor L3 Commercial (its predicted queries drive behavior
+  retrieval) and L4 Hyper (the hardest task), and cut L1 Negative (short, highly redundant: 74% single-signal rows;
+  not used at inference). `--dataset_mixing_alpha` (shares proportional to `rows ** alpha`) is the alternative when
   no weights are given. The test split is not mixed. The per-config quotas, shares and passes are printed at startup.
 - The chat template is applied with `enable_thinking=False`. Loss is computed only on the assistant answer
   (through its final EOS); the prompt tokens are masked with `-100`.
