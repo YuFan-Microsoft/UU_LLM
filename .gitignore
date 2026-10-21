@@ -4,3 +4,4 @@ __pycache__/
 *.py[cod]
 /models/
 /data/
+/code/trainer/GRPO/l1_reward_probe/outputs/
