@@ -17,11 +17,15 @@ import hashlib
 import heapq
 import json
 import math
+import multiprocessing as mp
 import os
 from pathlib import Path
+import shutil
 import statistics
 import sys
 import tempfile
+import time
+import traceback
 
 HERE = Path(__file__).resolve().parent
 UU_LLM = HERE.parents[3]
@@ -145,56 +149,115 @@ def read_jsonl(path: Path) -> list[dict]:
         return [json.loads(line) for line in source if line.strip()]
 
 
+def rollout_engine(rank: int, gpu: str, args: argparse.Namespace, prompts: list[dict], shard_path: Path) -> None:
+    """One vLLM engine on one GPU: renders the Layer-1 input of its prompts and samples --n answers for each."""
+    try:
+        from transformers import AutoProcessor
+        from transformers.tokenization_utils_base import PreTrainedTokenizerBase
+        from vllm import LLM, SamplingParams
+
+        import run_inference
+
+        if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):  # transformers 5 + vLLM 0.24
+            PreTrainedTokenizerBase.all_special_tokens_extended = property(lambda self: list(self.all_special_tokens))
+        tokenizer = AutoProcessor.from_pretrained(args.checkpoint, trust_remote_code=True).tokenizer
+
+        def encode(content: str) -> list[int]:
+            return build_prompt_ids(tokenizer, [{"role": "user", "content": content}])
+
+        items = []
+        for prompt in prompts:
+            kept, prompt_ids = layer1.fit_prompt(prompt["signals"], encode)
+            item = new_item(f"{prompt['user_id']}|{prompt['prompt_id']}", prompt_ids)
+            if args.max_tokens:
+                item["budget"] = min(item["budget"], args.max_tokens)
+            items.append({**item, "prompt": prompt, "kept": kept})
+
+        llm = LLM(model=args.checkpoint, hf_overrides={"architectures": ["Qwen3_5ForConditionalGeneration"]},
+                  dtype="bfloat16", max_model_len=MAX_MODEL_LEN, seed=args.seed + rank, trust_remote_code=True,
+                  disable_log_stats=True, **run_inference.engine_kwargs(args))
+        # Seeded by prompt, so the samples do not depend on how prompts are sharded over GPUs.
+        params = [SamplingParams(n=args.n, max_tokens=item["budget"], temperature=args.temperature,
+                                 top_p=args.top_p, seed=args.seed + item["prompt"]["prompt_id"]) for item in items]
+        outputs = llm.generate([{"prompt_token_ids": item["prompt_ids"]} for item in items], params,
+                               use_tqdm=rank == 0)
+
+        with shard_path.open("w", encoding="utf-8") as sink:
+            for item, output in zip(items, outputs):
+                prompt = item["prompt"]
+                sink.write(dumps({
+                    "prompt_id": prompt["prompt_id"], "user_id": prompt["user_id"],
+                    "content": layer1.build_message(item["kept"]), "signals": item["kept"],
+                    "model_input": tokenizer.decode(item["prompt_ids"]),
+                    "signals_dropped": len(prompt["signals"]) - len(item["kept"]), "future": prompt["future"],
+                    "prompt_tokens": len(item["prompt_ids"]), "max_tokens": item["budget"],
+                    "samples": [{"text": sample.text, "finish_reason": sample.finish_reason,
+                                 "output_tokens": len(sample.token_ids)} for sample in output.outputs],
+                }) + "\n")
+    except BaseException:
+        print(f"\n===== vLLM engine {rank} (GPU {gpu}) failed =====\n{traceback.format_exc()}"
+              f"===== end of engine {rank} error =====\n", flush=True)
+        raise
+
+
 def rollout(args: argparse.Namespace) -> None:
-    from transformers import AutoProcessor
-    from transformers.tokenization_utils_base import PreTrainedTokenizerBase
-    from vllm import LLM, SamplingParams
-
+    """One spawned engine per visible GPU (as run_inference.py), prompts dealt round-robin; shards are merged in
+    prompt order into rollouts.jsonl."""
     import run_inference
-
-    prompts = read_jsonl(args.output_dir / "prompts.jsonl")
-    if not hasattr(PreTrainedTokenizerBase, "all_special_tokens_extended"):  # transformers 5 + vLLM 0.24
-        PreTrainedTokenizerBase.all_special_tokens_extended = property(lambda self: list(self.all_special_tokens))
-    tokenizer = AutoProcessor.from_pretrained(args.checkpoint, trust_remote_code=True).tokenizer
-
-    def encode(content: str) -> list[int]:
-        return build_prompt_ids(tokenizer, [{"role": "user", "content": content}])
-
-    items = []
-    for prompt in prompts:
-        kept, prompt_ids = layer1.fit_prompt(prompt["signals"], encode)
-        item = new_item(f"{prompt['user_id']}|{prompt['prompt_id']}", prompt_ids)
-        if args.max_tokens:
-            item["budget"] = min(item["budget"], args.max_tokens)
-        items.append({**item, "prompt": prompt, "kept": kept})
+    from utils import visible_gpus
 
     for key, value in run_inference.ENGINE_PRESETS[args.engine_preset].items():
         if getattr(args, key, None) is None:
             setattr(args, key, value)
-    llm = LLM(model=args.checkpoint, hf_overrides={"architectures": ["Qwen3_5ForConditionalGeneration"]},
-              dtype="bfloat16", max_model_len=MAX_MODEL_LEN, seed=args.seed, trust_remote_code=True,
-              tensor_parallel_size=args.tensor_parallel_size, disable_log_stats=True,
-              **run_inference.engine_kwargs(args))
-    params = [SamplingParams(n=args.n, max_tokens=item["budget"], temperature=args.temperature, top_p=args.top_p,
-                             seed=args.seed + index) for index, item in enumerate(items)]
-    outputs = llm.generate([{"prompt_token_ids": item["prompt_ids"]} for item in items], params, use_tqdm=True)
+    prompts = read_jsonl(args.output_dir / "prompts.jsonl")
+    gpus = visible_gpus()[:args.num_gpus or None][:len(prompts)]
+    print(f"Rolling out {len(prompts)} prompts x {args.n} samples on {len(gpus)} GPU(s): {','.join(gpus)} "
+          f"(engine preset {args.engine_preset}; progress shown for engine 0)", flush=True)
+    shard_dir = args.output_dir / "rollout_shards"
+    shard_dir.mkdir(parents=True, exist_ok=True)
+    context = mp.get_context("spawn")
+    original_devices, original_port = os.environ.get("CUDA_VISIBLE_DEVICES"), os.environ.get("VLLM_PORT")
+    port_base = int(original_port) if original_port and original_port.isdigit() else run_inference.DEFAULT_VLLM_PORT_BASE
+    processes = []
+    for rank, gpu in enumerate(gpus):
+        os.environ["CUDA_VISIBLE_DEVICES"] = gpu  # a spawned process inherits the environment at start()
+        os.environ["VLLM_PORT"] = str(port_base + rank * run_inference.PORTS_PER_ENGINE)
+        process = context.Process(target=rollout_engine,
+                                  args=(rank, gpu, args, prompts[rank::len(gpus)], shard_dir / f"{rank}.jsonl"))
+        process.start()
+        processes.append(process)
+    for name, value in (("CUDA_VISIBLE_DEVICES", original_devices), ("VLLM_PORT", original_port)):
+        if value is None:
+            os.environ.pop(name, None)
+        else:
+            os.environ[name] = value
 
+    while any(process.is_alive() for process in processes):
+        if any(process.exitcode not in (None, 0) for process in processes):
+            for process in processes:  # fail fast: stop the other engines
+                if process.is_alive():
+                    process.terminate()
+            break
+        time.sleep(2)
+    for process in processes:
+        process.join()
+    errors = [(rank, process.exitcode) for rank, process in enumerate(processes) if process.exitcode != 0]
+    if errors:
+        raise RuntimeError("vLLM engine failed: " + ", ".join(f"engine {rank} (GPU {gpus[rank]}) exit code {code}"
+                                                                for rank, code in errors)
+                           + ". See the '===== vLLM engine N (GPU ...) failed =====' traceback above")
+
+    rows = sorted((row for rank in range(len(gpus)) for row in read_jsonl(shard_dir / f"{rank}.jsonl")),
+                  key=lambda row: row["prompt_id"])
     with (args.output_dir / "rollouts.jsonl").open("w", encoding="utf-8") as sink:
-        for item, output in zip(items, outputs):
-            prompt = item["prompt"]
-            sink.write(dumps({
-                "prompt_id": prompt["prompt_id"], "user_id": prompt["user_id"],
-                "content": layer1.build_message(item["kept"]), "signals": item["kept"],
-                "model_input": tokenizer.decode(item["prompt_ids"]),
-                "signals_dropped": len(prompt["signals"]) - len(item["kept"]), "future": prompt["future"],
-                "prompt_tokens": len(item["prompt_ids"]), "max_tokens": item["budget"],
-                "samples": [{"text": sample.text, "finish_reason": sample.finish_reason,
-                             "output_tokens": len(sample.token_ids)} for sample in output.outputs],
-            }) + "\n")
+        for row in rows:
+            sink.write(dumps(row) + "\n")
+    shutil.rmtree(shard_dir)
     settings = {"checkpoint": args.checkpoint, "n": args.n, "temperature": args.temperature, "top_p": args.top_p,
-                "max_tokens": args.max_tokens, "seed": args.seed, "engine_preset": args.engine_preset}
+                "max_tokens": args.max_tokens, "seed": args.seed, "engine_preset": args.engine_preset,
+                "gpus": len(gpus)}
     (args.output_dir / "rollout_settings.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
-    print(f"Wrote {len(items)} prompts x {args.n} samples -> {args.output_dir / 'rollouts.jsonl'}")
+    print(f"Wrote {len(rows)} prompts x {args.n} samples -> {args.output_dir / 'rollouts.jsonl'}")
 
 
 # ---------------------------------------------------------------------------
@@ -464,8 +527,10 @@ def parse_args() -> argparse.Namespace:
     r.add_argument("--temperature", type=float, default=1.0, help="GRPO rollout default; inference uses 0.6")
     r.add_argument("--top_p", type=float, default=1.0, help="GRPO rollout default; inference uses 0.8")
     r.add_argument("--max_tokens", type=int, default=0, help="Cap on generated tokens (0 = inference budget)")
-    r.add_argument("--engine_preset", choices=["original", "best"], default="original")
-    r.add_argument("--tensor_parallel_size", type=int, default=1)
+    r.add_argument("--engine_preset", choices=["original", "best"], default="best",
+                   help="vLLM settings of run_inference.py; best = code/prod_deployment/best_qwen35_prod_server.sh")
+    r.add_argument("--num_gpus", type=int, default=0,
+                   help="Engines, one per visible GPU (CUDA_VISIBLE_DEVICES); 0 = every visible GPU")
     r.add_argument("--gpu_memory_utilization", type=float)
     r.add_argument("--max_num_seqs", type=int)
 

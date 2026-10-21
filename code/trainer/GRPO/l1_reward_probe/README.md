@@ -6,7 +6,7 @@ are generated once; `score` can be re-run as the reward definition changes.
 
 ## Requirements
 
-- One GPU, inside the project Docker image (`UU_LLM/Dockerfile`: torch 2.11, vLLM 0.24, transformers 5,
+- One or more GPUs (one vLLM engine per visible GPU), inside the project Docker image (`UU_LLM/Dockerfile`: torch 2.11, vLLM 0.24, transformers 5,
   `huggingface_hub`), the same environment as `code/inference/run_inference.py`.
 - The SFT checkpoint directory (full `Qwen3_5ForConditionalGeneration` checkpoint with its processor).
 - Access to the gated `yufan/user_profile_dataset`: `HF_TOKEN`, else `UU_LLM/hf_token.txt`.
@@ -38,9 +38,12 @@ independent of the file order and location) and cleans both weeks as `run_infere
 
 **rollout** renders the Layer-1 input exactly as inference: `layer1.fit_prompt` / `build_message` (`prompt_l1.md`,
 `\nInput:\n`, one `{"idx","date","source","action"}` line per signal, the 200-signal cap and context trim), then the
-chat template without thinking (`build_prompt_ids`). It samples `--n` (16) answers per prompt with vLLM, with the
-engine settings of `run_inference.py` (`--engine_preset`). Sampling defaults to temperature 1.0 / top-p 1.0, the
-usual GRPO rollout setting (inference uses 0.6 / 0.8). There are no retries: every sample is kept as generated.
+chat template without thinking (`build_prompt_ids`). It samples `--n` (16) answers per prompt with vLLM, one engine
+per visible GPU like `run_inference.py` (prompts dealt round-robin, each prompt seeded by its id so the samples do
+not depend on the number of GPUs; `--num_gpus` or `CUDA_VISIBLE_DEVICES` to limit; progress is shown for engine 0),
+with the `best` engine preset of `run_inference.py` by default (`--engine_preset original` for the old setting).
+Sampling defaults to temperature 1.0 / top-p 1.0, the usual GRPO rollout setting (inference uses 0.6 / 0.8). There
+are no retries: every sample is kept as generated.
 
 **score** writes per-sample signals (`scores.jsonl`), their summary (`summary.json`, also printed), `report.md` and
 `report.html`. Open `report.html` in a browser (self-contained, works offline, follows light / dark mode) to read
