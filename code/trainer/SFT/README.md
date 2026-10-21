@@ -323,8 +323,6 @@ Raw logs: `user_logs/training_speed_baseline_zero3.log`,
 | `evaluate_user_profile_vllm.py` | Standalone vLLM evaluation of a saved checkpoint |
 | `run_user_profile_multi_gpu.sh` | Launch script for user-profile SFT |
 | `run_user_profile_multi_gpu_2B.sh` | Same run with Qwen3.5-2B (only the model path, output directory and W&B run name differ) |
-| `run_user_profile_multi_gpu_debug.sh` | Debug run (`_debug` output dir and W&B run name): no perplexity eval, no saved model, rollout eval only, every 20 steps on a fixed 20% of every test split (`CHECKPOINT_STEPS`, `ROLLOUT_EVAL_FRACTION`) |
-| `run_multi_gpu.sh` | Launch script for generic SFT (UltraData Chinese) |
 
 ## Environment
 
@@ -343,7 +341,6 @@ sh run_user_profile_multi_gpu.sh                  # perplexity + vLLM rollout ev
 ROLLOUT_EVAL=0 sh run_user_profile_multi_gpu.sh   # perplexity eval only
 ROLLOUT_EVAL_SAMPLES=256 sh run_user_profile_multi_gpu.sh   # roll out 256 examples per task (debug)
 sh run_user_profile_multi_gpu_2B.sh               # the same run with Qwen3.5-2B
-sh run_user_profile_multi_gpu_debug.sh            # debug: rollout eval only (every 20 steps, 20% of each test split), no ppl, no checkpoints
 ```
 
 The script evaluates on the whole V2 test split (52,639 rows over the 8 configs) every 2000 steps
@@ -352,7 +349,7 @@ The script evaluates on the whole V2 test split (52,639 rows over the 8 configs)
 the end of training. A full rollout generates up to 16,384 tokens for each of the ~52.6k examples, so every eval takes
 much longer than the training steps between evals; pass `--max_eval_steps` or set `ROLLOUT_EVAL_SAMPLES` to subsample.
 
-Generic SFT on another dataset uses the base trainer directly (see `run_multi_gpu.sh`):
+Generic SFT on another dataset uses the base trainer directly:
 
 ```bash
 deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_path <model_dir> ...
@@ -411,7 +408,7 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 | `--gradient_checkpointing` | off | Needed for long sequences |
 | `--zero_stage` | 3 | ZeRO-3 with tuned communication (500M reduce/prefetch buckets, 1e9 max live parameters, overlapped communication, contiguous gradients, reduce-scatter) |
 | `--checkpoint_steps` | 5000 | Eval + checkpoint interval |
-| `--save_checkpoints` | on | `--no-save_checkpoints` keeps the evaluations but never writes a model (debug script) |
+| `--save_checkpoints` | on | `--no-save_checkpoints` keeps the evaluations but never writes a model |
 | `--do_eval` / `--max_eval_steps` | 1 / -1 | Perplexity on the test split |
 | `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `Train/*`, `Eval/*`, `<Task>_Evaluation/*` |
 
@@ -529,7 +526,7 @@ outputs, so read them together with `json_valid_ratio`. Per-example results (pre
 | Argument | Default | Notes |
 | --- | --- | --- |
 | `--rollout_eval_samples` | 256 | Per config; `<= 0` = whole split. The script uses `ROLLOUT_EVAL_SAMPLES` (default -1 = the whole split; e.g. 256 to debug) |
-| `--rollout_eval_fraction` | None | Share (0-1] of every config's split instead of a fixed count, e.g. 0.2 (debug script); overrides `--rollout_eval_samples` |
+| `--rollout_eval_fraction` | None | Share (0-1] of every config's split instead of a fixed count, e.g. 0.2; overrides `--rollout_eval_samples` |
 | `--rollout_max_model_len` | 15360 | Prompt + generation; the script uses 25600 |
 | `--rollout_max_tokens` | 8192 | Max generated tokens; the script uses 16384 (L3 Persona answers reach ~14k tokens) |
 | `--rollout_gpu_memory_utilization` | 0.3 | vLLM share of total GPU memory while awake (the script uses 0.7 on 80 GB); lower it on OOM |
