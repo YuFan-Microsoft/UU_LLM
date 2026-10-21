@@ -3,7 +3,7 @@
 # Usage: sh run_l1_quick_test.sh [checkpoint_dir]   (default: DEFAULT_CHECKPOINT below)
 # Optional: OUTPUT_DIR, NUM_PROMPTS (64), N (16), TEMPERATURE (1.0), TOP_P (1.0), SEED (0), HF_TOKEN,
 #           EMBEDDING_MODEL (Qwen3-Embedding-0.6B path, or none), CUDA_VISIBLE_DEVICES (one GPU is enough).
-set -euo pipefail
+set -eu
 cd "$(dirname "$0")"
 
 DEFAULT_CHECKPOINT=/yufan/MAI_Profile/checkpoints/unified_slm_V3/epoch_0_step_6000_ppl_1.337
