@@ -6,13 +6,12 @@
 | `layer1.py` | Layer-1 prompt (fit to the context) and answer -> `layer1_postprocessing` record |
 | `layer2.py` | Layer-2 prompt (fit to the context), answer -> merge decisions, and `postmerge` (port of the production `layer2_postmerge`) |
 | `layer3.py` | Layer 3: `Persona` and `Commercial` task classes, `postprocess` (= `layer3_postprocessing`) and `run` (one round of calls) |
-| `layer_ranker.py` | Ranker after `layer3_postprocessing`: `Ranker` task class (candidates, the exact training input, answer check, `output_idx` -> interests) and `run` (one round; adds `ranked_interests` and writes the `layer3_postprocessing` record) |
 | `layer4.py` | Layer 4: `Biography`, `CommercialPreference` and `Hyper` task classes (payloads, answer checks, records, mission validation), `postprocess` (= `layer4_postprocessing`) and `run` (three rounds of calls) |
 | `task.py` | `Task` base class (prompt, answer key check, trimmed request, record) and `UserProfile` (one user's final snapshot and its Layer-3 / Layer-4 records) |
 | `utils.py` | Input loading and cleaning, weekly windows, signal dedupe / cap, query language, the answer key checks of every task, `generate()` with retries, MTP acceptance counters |
 | `user_profile_rules.py` | Copy of `code/trainer/SFT/user_profile_rules.py` (keep it identical): the rollout checks that score every call's first sample for `rule_metrics` |
 | `merge_official_mtp.py` | Adds the official Qwen3.5 MTP head (`mtp.*`) to an SFT checkpoint saved without it (see [MTP speculative decoding](#mtp-speculative-decoding)) |
-| `prompts/` | The prompts (`prompt_l1.md` ... `prompt_l4_hyper.md`, `prompt_lr.md` for the Ranker, plus `prompt_negative.md`, kept in sync but not used: the input has no negative feedback), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V2 SFT configs) |
+| `prompts/` | The prompts (`prompt_l1.md` ... `prompt_l4_hyper.md`, plus `prompt_negative.md`, kept in sync but not used: the input has no negative feedback), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V2 SFT configs) |
 
 The prompt files are read as-is (line endings normalized to `\n`); the script builds each user message as
 `prompt + "\nInput:\n" + input`, exactly like the V2 SFT data: rebuilt from their own inputs, every
@@ -42,9 +41,9 @@ python run_inference.py --checkpoint <ckpt_dir> --input users.jsonl --output_dir
 python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir> --engine_preset best
 ```
 
-After every engine has loaded its model (vLLM logs as usual), progress is shown as five tqdm bars over all engines
-(refreshed every 2 s), in the order the steps run: `Layer 1` (user-windows), `Layer 2` (calls; the
-total is known once engines finish Layer 1), `Layer 3` (calls: persona + commercial), `Ranker` (calls) and `Layer 4` (calls;
+After every engine has loaded its model (vLLM logs as usual), progress is shown as four tqdm bars over all engines
+(refreshed every 2 s), one per layer, in the order the layers run: `Layer 1` (user-windows), `Layer 2` (calls; the
+total is known once engines finish Layer 1), `Layer 3` (calls; one round, known when it starts) and `Layer 4` (calls;
 the total grows round by round: biography, commercial preference, hyper). Only first attempts are counted. If an
 engine fails, the others are stopped at once and the run ends with an error naming the engine and GPU; its traceback
 is printed between `===== vLLM engine N (GPU ...) failed =====` and `===== end of engine N error =====`. Engine N
@@ -57,7 +56,7 @@ Input rows, one per user (only `past_behaviors` is used; `future_behaviors` is h
 {"user_id": "...", "past_behaviors": [{"source": "Bing", "action": "...", "intent": "...", "date": "2026-02-06T00:00:00", "action_id": 0}], "future_behaviors": [...]}
 ```
 
-One checkpoint serves all eight tasks (seven profile tasks plus the Ranker). The V2 SFT data were distilled from GPT-5.6 runs of the production pipeline
+One checkpoint serves all seven tasks. The V2 SFT data were distilled from GPT-5.6 runs of the production pipeline
 (MAIProfile_Official, the successor of maiprofilev3dev, whose step logic this script ports). With the Layer-1 prompt
 the model produces in one call what maiprofilev3dev builds with `layer1_delta` -> `layer1_actual` -> `layer1_intent`
 -> `layer1_postprocessing`. With the Layer-2 prompt it replaces `layer2_merge` (merge/add decisions; there is no
@@ -133,10 +132,9 @@ the two postprocessing records copy the snapshot, so they keep its `date` (the u
 | 1 | `layer3_persona` | `{"interests"}`: interests with confidence ≥ 0.2: name, activity, intent, topic names (no `facts`) | no such interest |
 | 1 | `layer3_commercial_interests` | same interests with sorted `sources` and per-topic evidence `actions`; `query_language`. Like the V2 data (at most 30 interests per row), a user with more than 30 is split into near-equal contiguous chunks (103 -> 26 + 26 + 26 + 25), one call each, and the answers are concatenated in order | no such interest |
 | — | `layer3_postprocessing` | rule: persona / category and commercial fields merged by exact name into the gated interests, sorted by confidence | — |
-| 2 | Ranker (`layer_ranker.py`, `V2_User_Profile_Ranker`, written into `layer3_postprocessing`) | JSON array of the candidate interests, exactly as `code/evaluation/ranker_data_generation.py` builds the training data: the `layer3_postprocessing` interests with `commercial` true, `commercial_score` medium / high and a non-blank predicted query, shuffled once by (`--seed`, user id), each `{idx, interest_name, actual_activity, inferred_intent, brands, retailers, products, predicted_queries, first_detect_date, last_detect_date, topics: [{topic}]}` (no evidence). The answer's `output_idx` (retried unless exactly 10 distinct candidate idx) is mapped back to the interests and stored, best first, as `ranked_interests` (full interest objects); `interests` keeps its order, so Layer 4 inputs do not change | at most 10 candidates (or a prompt that fits only that many): no call, `ranked_interests` are the candidates in confidence order (`[]` only when the answer never validates or there is no candidate) |
-| 3 | `layer4_biography` | `{"declared_attributes": {}, "facts": {}, "interests"}`: the Layer-3 interests highest `count` first, then highest confidence (name, activity, intent, persona, confidence, count, dates, source, at most 8 distinct topic names with the most frequent first, and for commercial interests at most 6 distinct brands / products / predicted queries each, as production's `project_interest`) | no interest |
-| 4 | `layer4_commercial_preference` | `life_stage` from the biography (`{"value": "unknown", "confidence": "low", "evidence": []}` when the biography failed), commercial interests (persona, brands, retailers, products, topics with evidence actions), non-commercial names; then the rule-based `confidence_score`s and defaults | no commercial interest |
-| 5 | `layer4_hyper_commercial_interest` (discovery + enhancement in one call) | `personal_context` / `professional_context` `""`, `commercial_preferences` (JSON string of the short form, as production's `project_commercial_preferences`: each dimension, shopper type and dining restriction with a known value and `confidence_score` >= 0.3 as `{value, confidence_score}`, the product categories, no empty containers; `""` when nothing is left), the `### Interest N` blocks of the commercial interests, `query_language` | no commercial interest |
+| 2 | `layer4_biography` | `{"declared_attributes": {}, "facts": {}, "interests"}`: the Layer-3 interests highest `count` first, then highest confidence (name, activity, intent, persona, confidence, count, dates, source, at most 8 distinct topic names with the most frequent first, and for commercial interests at most 6 distinct brands / products / predicted queries each, as production's `project_interest`) | no interest |
+| 3 | `layer4_commercial_preference` | `life_stage` from the biography (`{"value": "unknown", "confidence": "low", "evidence": []}` when the biography failed), commercial interests (persona, brands, retailers, products, topics with evidence actions), non-commercial names; then the rule-based `confidence_score`s and defaults | no commercial interest |
+| 4 | `layer4_hyper_commercial_interest` (discovery + enhancement in one call) | `personal_context` / `professional_context` `""`, `commercial_preferences` (JSON string of the short form, as production's `project_commercial_preferences`: each dimension, shopper type and dining restriction with a known value and `confidence_score` >= 0.3 as `{value, confidence_score}`, the product categories, no empty containers; `""` when nothing is left), the `### Interest N` blocks of the commercial interests, `query_language` | no commercial interest |
 | — | `layer4_postprocessing` | rule: Layer-3 snapshot + biography, life stage, `user_attributes`, commercial preferences, `enriched_commercial_interests`, and the missions appended to `interests` as `hyper_commercial` | — |
 
 Payloads follow the V2 SFT data (`docs/V2_user_profile_dataset_schema.md`) with the user-context fields empty, as in
@@ -190,9 +188,7 @@ come from replacing the LLM calls with a 25600-token model trained on the V2 dat
 ## Decoding
 
 Temperature 0.6 / top-p 0.8 by default, the same as `evaluate_user_profile_vllm.py` and the in-training rollout
-(`--temperature 0` for greedy). The Ranker has its own `--ranker_temperature`, default 0 (greedy, retries included):
-it picks and orders 10 idx toward a deterministic oracle ranking, so sampling only adds noise to the order (its
-`recall_at_10` is therefore not directly comparable with the in-training rollout's, sampled at 0.6 / 0.8). Answers that are not valid JSON with the expected keys (and, for the missions, that
+(`--temperature 0` for greedy). Answers that are not valid JSON with the expected keys (and, for the missions, that
 fail the official validation) are regenerated up to `--max_retries` (2) times. Every request has its own seed
 derived from (stage, user, window, attempt), so results do not depend on sharding. Other arguments:
 `--window_days` (7), `--grid_start_date`, `--seed`.
@@ -266,17 +262,15 @@ For the windows where some user's final snapshot was built: `layer3_persona`, `l
 `user_id`, `profile_date` (last grid window), `last_update` (window of the user's last profile update), the raw
 `past_behaviors` and `future_behaviors` from the input, and the user's `layer4_postprocessing` profile:
 `predicted_content_locale`, `interests` (the Layer-2 interests with confidence ≥ 0.2, enriched with persona,
-category and commercial fields, followed by the `hyper_commercial` missions), `ranked_interests` (the Ranker's top 10
-of `layer3_postprocessing`, best first; `[]` when skipped or invalid), `biography`, `life_stage`,
+category and commercial fields, followed by the `hyper_commercial` missions), `biography`, `life_stage`,
 `user_attributes`, `commercial_preferences` and `enriched_commercial_interests`. Everything is empty if the user never
 had a Layer-1 interest. The ungated Layer-2 snapshot stays in `layer2_postmerge.jsonl`.
 
 Plus `<out_dir>/predictions.jsonl` (one record per model call: `stage`, user, window, `attempts`, `valid`, raw
-`text`; L2 also has `mode`, `snapshot_dropped` and merge/add `actions`; L3/L4 and the ranker have `dropped`, the
+`text`; L2 also has `mode`, `snapshot_dropped` and merge/add `actions`; L3/L4 have `dropped`, the
 interests left out of the prompt) and `<out_dir>/inference_summary.json` (arguments, grid, valid ratios per stage, L2
-modes and actions, average final profile size and missions, `ranked_profiles` (users with a ranking), users whose
-missions failed validation, and `rule_metrics`; the ranker has only `json_valid_ratio`, as there is no reference
-ranking). Every
+modes and actions, average final profile size and missions, users whose
+missions failed validation, and `rule_metrics`). Every
 call's first sample is also scored with the in-training rollout rules (`user_profile_rules.score_example`, the
 `score` of each `predictions.jsonl` call); `rule_metrics` summarizes them per task with `summarize_records`, the
 same metrics as W&B `<Task>_Evaluation/*` during training: `json_valid_ratio`, `rule_based_pass_ratio`,

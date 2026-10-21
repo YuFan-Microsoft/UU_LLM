@@ -812,16 +812,15 @@ def rollout_evaluation(args, rollout, examples, rollout_scorer, model, tokenizer
         wandb_module.log(log)
 
 
-TASK_DISPLAY_NAMES = {"L1": "L1_Interest", "L2": "L2_Merge", "Ranker": "L5_Ranker"}
+TASK_DISPLAY_NAMES = {"L1": "L1_Interest", "L2": "L2_Merge"}
 
 
 def task_name(config):
     """Short task name of a dataset config: "V2_User_Profile_L1_gpt56" -> "L1_Interest",
     "V2_User_Profile_L1_Negative_gpt56" -> "L1_Negative", "V2_User_Profile_L2_gpt56" -> "L2_Merge",
-    "V2_User_Profile_L3_Persona_gpt56" -> "L3_Persona", "V2_User_Profile_Ranker" -> "L5_Ranker"
-    (V1 "_gpt54" configs map the same way)."""
+    "V2_User_Profile_L3_Persona_gpt56" -> "L3_Persona" (V1 "_gpt54" configs map the same way)."""
     match = re.search(r"(?:^|_)(L\d+(?:_[A-Za-z]+)?)_gpt5\d(?:_|$)", config or "") \
-        or re.search(r"(?:^|_)(L\d+|Ranker)(?:_|$)", config or "")
+        or re.search(r"(?:^|_)(L\d+)(?:_|$)", config or "")
     if not match:
         return config or "all"
     return TASK_DISPLAY_NAMES.get(match.group(1), match.group(1))

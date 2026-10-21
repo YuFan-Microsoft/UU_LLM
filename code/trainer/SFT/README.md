@@ -362,25 +362,14 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 
 - Hugging Face dataset with `train` / `test` splits and a `messages` column
   (`[{"role": "user", ...}, {"role": "assistant", ...}]`).
-- User-profile SFT loads `yufan/user_profile_dataset` with nine `V2_` configs: the eight profile tasks (L1, L1
-  Negative, L2, L3 Persona, L3 Commercial, L4 Biography, L4 Commercial Preference, L4 Hyper; GPT-5.6, each with its
-  simplified task prompt) and `V2_User_Profile_Ranker` (rank candidate interests, answer
-  `{"output_idx": [10 input idx]}`; labels from a behavior-retrieval oracle). All rows are ≤ 25,600 Qwen3.5-4B
-  tokens (the 2 longer Ranker train rows were removed from the HF dataset). Rollout scoring rules exist for all nine
-  configs (see the rollout metrics below).
-- Ranker augmentation (`shuffle_ranker_candidates` in `deepspeed_user_profile_trainer.py`): every time a Ranker train
-  row is used, its candidates are shown in a new random order, `idx` is renumbered by the new positions and
-  `output_idx` is mapped to the new idx (same interests, same ranking). The order is seeded by (seed, epoch, position
-  in the epoch), so each repeat differs but runs are reproducible; a variant that would exceed `--max_seq_len` falls
-  back to the original row. It also removes a weak shortcut in the source order (38.5% of the labels sit in the first
-  third of the candidates). Test rows keep their original order. Augmentation needs the mixed train set below.
+- User-profile SFT loads `yufan/user_profile_dataset` with the eight `V2_` configs (L1, L1 Negative, L2, L3 Persona,
+  L3 Commercial, L4 Biography, L4 Commercial Preference, L4 Hyper; GPT-5.6, each with its simplified task prompt, rows
+  ≤ 25,600 Qwen3.5-4B tokens). Rollout scoring rules exist for all eight configs (see the rollout metrics below).
 - The train split is mixed with `--dataset_mixing_weights` (`V2_MIXTURE` in `deepspeed_user_profile_trainer.py`):
-  each epoch has the rows of one natural epoch (1,708,545), split across configs by these shares: L1 20.0%, L1
-  Negative 13.8%, L2 19.4%, L3 Persona 5.8%, L3 Commercial 10.8%, L4 Biography 12.0%, L4 Commercial Preference 10.5%,
-  L4 Hyper 7.1%, Ranker 0.7%. Every profile config is seen ~1.27 times per epoch, except L1 Negative (~0.42 passes:
-  short and highly redundant, 74% single-signal rows). Ranker (2,937 rows, ~11.9k per epoch) gets ~4 passes, each
-  with a new candidate order; more would start to memorize its labels. `--dataset_mixing_alpha` (shares
-  proportional to `rows ** alpha`) is the alternative when
+  each epoch has the rows of one natural epoch (1,705,608), split across configs by these shares: L1 20.1%, L1
+  Negative 13.9%, L2 19.5%, L3 Persona 5.8%, L3 Commercial 10.9%, L4 Biography 12.1%, L4 Commercial Preference 10.6%,
+  L4 Hyper 7.1%. Every config is seen ~1.28 times per epoch, except L1 Negative (~0.43 passes: short and highly
+  redundant, 74% single-signal rows). `--dataset_mixing_alpha` (shares proportional to `rows ** alpha`) is the alternative when
   no weights are given. The test split is not mixed. The per-config quotas, shares and passes are printed at startup.
 - The chat template is applied with `enable_thinking=False`. Loss is computed only on the assistant answer
   (through its final EOS); the prompt tokens are masked with `-100`.
@@ -467,8 +456,7 @@ Saved under `--output_dir` as `epoch_<e>_step_<s>_ppl_<ppl>/`:
   gen tok/s, prompts/s, outputs that hit `max_tokens`).
 
 **Metrics** (wandb `<Task>_Evaluation/<metric>`, next to the task's eval perplexity `token_ppl`, x-axis `eval_step`).
-One section per V2 task: every profile section has the 4 shared charts plus 1-2 task charts (L3 Commercial: 4);
-`L5_Ranker` has only `token_ppl`, `json_valid_ratio` and `recall_at_10`.
+One section per V2 task: every section has the 4 shared charts plus 1-2 task charts (L3 Commercial: 4).
 
 | Section (config) | Charts |
 | --- | --- |
@@ -480,7 +468,6 @@ One section per V2 task: every profile section has the 4 shared charts plus 1-2 
 | `L4_Biography` (`V2_User_Profile_L4_Biography_gpt56`) | shared + `declared_match_ratio`, `source_grounded_ratio` |
 | `L4_CommercialPreference` (`V2_User_Profile_L4_CommercialPreference_gpt56`) | shared + `value_detail_consistent_ratio` |
 | `L4_Hyper` (`V2_User_Profile_L4_Hyper_gpt56`) | shared + `input_match_ratio`, `query_language_match_ratio` |
-| `L5_Ranker` (`V2_User_Profile_Ranker`) | `token_ppl`, `json_valid_ratio`, `recall_at_10` |
 
 | Task | Metric | Meaning |
 | --- | --- | --- |
@@ -502,8 +489,6 @@ One section per V2 task: every profile section has the 4 shared charts plus 1-2 
 | L4 Biography | `source_grounded_ratio` | Outputs whose `linkedin` / `location_data` sources have that fact in the input (and LinkedIn occupation / company / education_area the field they copy, unless a status such as Self-Employed) |
 | L4 Commercial Preference | `value_detail_consistent_ratio` | Outputs whose sensitivity / affinity values are Unknown exactly without details and otherwise within the range of their detail levels, whose shopper types and dining restrictions equal their details, and whose product categories do not repeat |
 | L4 Hyper | `query_language_match_ratio` | Outputs whose queries are in the requested `query_language` (fastText, below), over all checked rows |
-| Ranker | `json_valid_ratio` | Outputs that parse as exactly `{"output_idx": [int, ...]}` |
-| Ranker | `recall_at_10` | Share of the 10 reference idx found in the first 10 predicted idx, averaged over all samples (invalid JSON = 0) |
 
 L1 Negative / L3 / L4 rule categories (mirroring `pyscript/data_cleaning/*_rule_based_clean.py`):
 

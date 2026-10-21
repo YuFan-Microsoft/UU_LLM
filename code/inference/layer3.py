@@ -1,6 +1,5 @@
 """Layer 3 on each user's final Layer-2 snapshot: Persona and Commercial (one model call each, independent), then
-layer3_postprocessing merges both into the gated interests (layer_ranker.py then adds "ranked_interests" and writes
-the record).
+layer3_postprocessing merges both into the gated interests.
 
 Payloads are built as the production layer3_persona.py / layer3_commercial_interests.py build their user messages,
 in the layouts of the V2 SFT data (layer3_persona_step3 / layer3_commercial_step4_build_sft_data.py).
@@ -113,8 +112,7 @@ def postprocess(snapshot: dict, persona: dict, commercial: dict) -> dict:
 
 def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
     """One round with both tasks for every user (Commercial once per chunk of at most 30 interests, the answers
-    concatenated in input order); writes the persona / commercial records and sets profile.layer3. The
-    layer3_postprocessing record itself is written by layer_ranker.run, once it holds "ranked_interests"."""
+    concatenated in input order); sets profile.layer3."""
     requests = {}
     for profile in profiles:
         interests = active_interests(profile.snapshot)
@@ -138,4 +136,4 @@ def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
         emit_record(emit, profile, persona, persona_item)
         emit_record(emit, profile, commercial, *commercial_items)
         profile.layer3 = postprocess(profile.snapshot, persona, commercial)
-
+        emit_record(emit, profile, profile.layer3)

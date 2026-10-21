@@ -206,13 +206,6 @@ def l4_hyper_keys_valid(output):
     return matches(output, {"missions": ListOf(L4H_MISSION_SCHEMA)})
 
 
-RANKER_TOP_K = 10
-
-
-def ranker_keys_valid(output):
-    return matches(output, {"output_idx": ListOf(int)})
-
-
 def build_prompt_ids(tokenizer, messages: list[dict]) -> list[int]:
     """vllm_colocate_rollout.build_prompt_ids: the non-thinking generation prompt used in training."""
     ids = tokenizer.apply_chat_template(
