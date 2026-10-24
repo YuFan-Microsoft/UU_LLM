@@ -6,7 +6,9 @@ survive cleaning:
     L1 Negative:   pyscript/data_cleaning/layer1_negative_feedback_step1_merge_input_output.py / _step2_rule_based_clean.py
     L2:            pyscript/data_cleaning/layer2_step1_rule_based_clean.py
     L3 / L4:       pyscript/data_cleaning/layer3_*_rule_based_clean.py, layer4_biography / commercial_preference
-                   (--version v2) and layer4_hyper_step3_rule_based_clean.py
+                   (--version v3) and layer4_hyper_step3_rule_based_clean.py
+The schemas are the V3 ones (docs/V3_user_profile_dataset_schema.md): multilingual, no inferred intent, no
+predicted_content_locale and no query_language.
 
 Flow:
     score_example(messages, text)  -> one record per rollout (stage, json_valid, violations, stats)
@@ -16,18 +18,21 @@ Metrics:
     Every task: json_valid_ratio (parses, exactly the expected keys at every level in any order, and the expected
         value types), rule_based_pass_ratio (JSON-valid and no rule violation) and truncated_ratio
         (generation hit max_tokens), all over every sample
-    L1: topic_evidence_valid_ratio, avg_interest_num
+    L1: topic_evidence_valid_ratio, avg_interest_num, language_match_ratio_en / _glb
     L1 Negative: signal_coverage_ratio (every evidence idx exists and every input signal is cited),
         field_consistent_ratio (signal_type / source / detailed_source equal those of the cited signals)
-    L2: input_match_ratio (each input delta decided exactly once, no unknown names), merge_ratio
-    L3 Persona: input_match_ratio
-    L3 Commercial: input_match_ratio, query_language_match_ratio_en / _glb (fastText lid.176; requested
-        query_language "en" / any other language), avg_query_num (queries per commercial interest)
+    L2: input_match_ratio (each input delta decided exactly once, no unknown names), merge_ratio,
+        language_match_ratio_en / _glb
+    L3 Persona: input_match_ratio, language_match_ratio_en / _glb
+    L3 Commercial: input_match_ratio, language_match_ratio_en / _glb, avg_query_num (queries per interest)
     L4 Biography: declared_match_ratio (declared attributes copied verbatim with source declared),
-        source_grounded_ratio (linkedin / location_data sources backed by those facts)
+        source_grounded_ratio (linkedin / location_data sources backed by those facts), language_match_ratio_en / _glb
     L4 Commercial Preference: value_detail_consistent_ratio (every value agrees with its details)
     L4 Hyper: input_match_ratio (source interests from the input, predicted brands and queries not already in it),
-        query_language_match_ratio
+        language_match_ratio_en / _glb
+    language_match_ratio_*: share of checked units (L1 interest, L2 decision, L3 entry, L4 Hyper mission, L4
+        Biography output) written in the language of their input anchor (see "Language" below), split by the anchor
+        language: "en" / any other language.
 """
 
 import json
@@ -50,6 +55,11 @@ def normalize_name(value):
     if not isinstance(value, str):
         return ""
     return re.sub(r"[\W_]+", " ", value.casefold()).strip()
+
+
+def lookup(mapping, key):
+    """mapping.get(key) that is safe for any JSON value (lists and dicts are unhashable)."""
+    return mapping.get(key) if isinstance(key, str) else None
 
 
 def has_text(value):
@@ -131,7 +141,10 @@ def read_input(messages):
         return "l4_hyper", payload
     if "life_stage" in payload:
         return "l4_commercial_preference", payload
-    if "query_language" in payload and "interests" in payload:
+    if set(payload) == {"interests"} and any(
+            isinstance(topic, dict) for interest in dicts(payload["interests"])
+            for topic in (interest.get("topics") if isinstance(interest.get("topics"), list) else [])):
+        # L3 Commercial topics are {"topic", "actions"} objects; L3 Persona topics are plain strings.
         return "l3_commercial", payload
     if "declared_attributes" in payload:
         return "l4_biography", payload
@@ -146,20 +159,17 @@ def read_input(messages):
 
 
 # ---------------------------------------------------------------------------
-# Layer 1: {"predicted_content_locale", "interests": [{"interest_name", "topics": [...], ...}]}
+# Layer 1: {"interests": [{"interest_name", "topics": [{"topic", "evidence"}], "actual_activity"}]}
 # ---------------------------------------------------------------------------
 
-L1_TOP_KEYS = {"predicted_content_locale", "interests"}
-L1_INTEREST_KEYS = {"interest_name", "topics", "actual_activity", "inferred_intent"}
-L1_TOPIC_KEYS = {"topic", "source", "evidence"}
+L1_TOP_KEYS = {"interests"}
+L1_INTEREST_KEYS = {"interest_name", "topics", "actual_activity"}
+L1_TOPIC_KEYS = {"topic", "evidence"}
 L1_MAX_INTERESTS = 40
-L1_NON_LATIN = re.compile(r"[^\x00-\x7F\u00C0-\u024F\u2019\u2013\u2014]")
-# The fastText content locales kept by layer1_step2_language_detection.py (the V2 labels), or "mix".
-L1_CONTENT_LOCALES = {"en", "de", "fr", "es", "ja", "pt", "nl", "it", "sv", "pl", "zh-Hans", "zh-Hant", "mix"}
 
 
-def check_layer1_topic(topic, source_by_idx, violations):
-    """Check one topic. Returns True when its evidence and source are both correct."""
+def check_layer1_topic(topic, action_by_idx, violations):
+    """Check one topic. Returns True when its evidence is correct."""
     if set(topic) != L1_TOPIC_KEYS:
         violations.add("unexpected_keys")
     if not has_text(topic.get("topic")):
@@ -170,32 +180,19 @@ def check_layer1_topic(topic, source_by_idx, violations):
     if not isinstance(evidence, list) or not evidence or not all(type(idx) is int for idx in evidence):
         violations.add("invalid_evidence_format")
         return False
-    if not all(idx in source_by_idx for idx in evidence):
+    if not all(idx in action_by_idx for idx in evidence):
         violations.add("unknown_evidence_idx")
         return False
     if len(evidence) != len(set(evidence)):
         violations.add("duplicate_evidence_id")
-
-    # The topic's source list must equal the sources of its evidence activities.
-    source = topic.get("source")
-    if not isinstance(source, list) or not all(isinstance(s, str) for s in source):
-        violations.add("source_evidence_mismatch")
-        return False
-    if len(source) != len(set(source)):
-        violations.add("duplicate_topic_source")
-    if set(source) != {source_by_idx[idx] for idx in evidence}:
-        violations.add("source_evidence_mismatch")
-        return False
     return True
 
 
 L1_SCHEMA = {
-    "predicted_content_locale": str,
     "interests": ListOf({
+        "topics": ListOf({"evidence": ListOf(int), "topic": str}),
         "interest_name": str,
-        "topics": ListOf({"topic": str, "source": ListOf(str), "evidence": ListOf(int)}),
         "actual_activity": str,
-        "inferred_intent": str,
     }),
 }
 
@@ -211,18 +208,17 @@ def check_layer1(payload, output):
     stats = {"interests": 0, "topics": 0, "valid_topics": 0}
 
     # Input: one activity object per line ({"activities": [...]}), or the V1 table
-    # (columns include idx and source, rows grouped by date under days).
+    # (columns include idx and action, rows grouped by date under days).
     if "activities" in payload:
-        source_by_idx = {activity["idx"]: activity["source"] for activity in payload["activities"]}
+        action_by_idx = {activity["idx"]: activity["action"] for activity in payload["activities"]}
     else:
         idx_col = payload["columns"].index("idx")
-        source_col = payload["columns"].index("source")
-        source_by_idx = {row[idx_col]: row[source_col] for rows in payload["days"].values() for row in rows}
+        action_col = payload["columns"].index("action") if "action" in payload["columns"] else None
+        action_by_idx = {row[idx_col]: row[action_col] if action_col is not None else ""
+                         for rows in payload["days"].values() for row in rows}
 
-    if set(output) != L1_TOP_KEYS or not has_text(output.get("predicted_content_locale")):
+    if set(output) != L1_TOP_KEYS:
         violations.add("invalid_top_level")
-    elif output["predicted_content_locale"] not in L1_CONTENT_LOCALES:
-        violations.add("invalid_content_locale")
     interests = output.get("interests")
     if not isinstance(interests, list):
         violations.add("unexpected_keys")
@@ -240,11 +236,8 @@ def check_layer1(payload, output):
             violations.add("unexpected_keys")
 
         name = interest.get("interest_name")
-        if not (has_text(name) and has_text(interest.get("actual_activity"))
-                and has_text(interest.get("inferred_intent"))):
+        if not (has_text(name) and has_text(interest.get("actual_activity"))):
             violations.add("empty_text")
-        if isinstance(name, str) and L1_NON_LATIN.search(name):
-            violations.add("non_english_interest_name")
         if normalize_name(name) and normalize_name(name) in seen_interest_names:
             violations.add("duplicate_interest_name")
         seen_interest_names.add(normalize_name(name))
@@ -254,6 +247,7 @@ def check_layer1(payload, output):
             violations.add("empty_text")
             continue
         seen_topic_names = set()
+        evidence_actions = []
         for topic in topics:
             if not isinstance(topic, dict):
                 violations.add("unexpected_keys")
@@ -264,8 +258,11 @@ def check_layer1(payload, output):
             seen_topic_names.add(topic_name)
 
             stats["topics"] += 1
-            if check_layer1_topic(topic, source_by_idx, violations):
+            if check_layer1_topic(topic, action_by_idx, violations):
                 stats["valid_topics"] += 1
+                evidence_actions += [action_by_idx[idx] for idx in topic["evidence"]]
+        # The activity is written in the majority language of the interest's own activities.
+        check_language(stats, [interest.get("actual_activity")], evidence_actions)
     return violations, stats
 
 
@@ -275,17 +272,12 @@ def check_layer1(payload, output):
 
 L2_DECISION_KEYS = {
     "merge": {"action", "delta_interest_name", "snapshot_interest_name", "merged_interest_name",
-              "merged_actual_activity", "merged_inferred_intent"},
-    "add": {"action", "delta_interest_name", "actual_activity", "inferred_intent"},
+              "merged_actual_activity"},
+    "add": {"action", "delta_interest_name", "actual_activity"},
 }
-# V2 data has no `temporal`; V1 outputs still carry it, so it is accepted when valid.
+# V2 / V3 data have no `temporal`; V1 outputs still carry it, so it is accepted when valid.
 L2_OPTIONAL_KEY = "temporal"
-L2_TEXT_KEYS = {
-    "merge": ("merged_interest_name", "merged_actual_activity", "merged_inferred_intent"),
-    "add": ("delta_interest_name", "actual_activity", "inferred_intent"),
-}
 L2_TEMPORALS = {"Ephemeral", "ShortTerm", "LongTerm", "Persistent"}
-L2_NON_LATIN_LETTER = re.compile(r"[^\W\d_A-Za-z\u00C0-\u024F]")
 L2_UMBRELLA_NAMES = {
     "miscellaneous", "general interest", "general interests", "web browsing", "internet browsing", "online browsing",
     "general shopping", "general online shopping", "general retail shopping", "general shopping deals", "general news",
@@ -308,8 +300,6 @@ def check_layer2_decision_fields(decision, action, violations):
         violations.add("invalid_temporal")
     if not all(has_text(decision.get(key)) for key in L2_DECISION_KEYS[action]):
         violations.add("empty_text")
-    if any(L2_NON_LATIN_LETTER.search(str(decision.get(key) or "")) for key in L2_TEXT_KEYS[action]):
-        violations.add("non_latin_output_text")
 
 
 def layer2_keys_valid(output):
@@ -326,6 +316,9 @@ def check_layer2(payload, output):
     delta_names = [interest.get("interest_name") for interest in payload.get("delta") or []]
     snapshot_names = [interest.get("interest_name") for interest in payload.get("snapshot") or []]
     snapshot_normalized = {normalize_name(name) for name in snapshot_names}
+    # interest name -> actual_activity, per input side (a delta may share its name with a snapshot interest)
+    activity = {side: {interest.get("interest_name"): interest.get("actual_activity")
+                       for interest in dicts(payload.get(side))} for side in ("snapshot", "delta")}
     stats = {"decisions": 0, "merges": 0, "delta_exact_match": 0}
 
     if set(output) != {"decisions"}:
@@ -364,11 +357,15 @@ def check_layer2(payload, output):
             merged_names_by_snapshot[normalize_name(snapshot_name)].add(result_name)
             if normalize_name(delta_name) == normalize_name(snapshot_name) != result_name:
                 violations.add("same_name_merge_renamed")
+            # A merge is written in the language both merged sides share (unchecked when they differ).
+            check_language(stats, [decision.get("merged_actual_activity")],
+                           [lookup(activity["delta"], delta_name), lookup(activity["snapshot"], snapshot_name)])
         else:
             result_name = normalize_name(delta_name)
             if result_name in snapshot_normalized:
                 violations.add("add_name_matches_snapshot")
             added_names.append(result_name)
+            check_language(stats, [decision.get("actual_activity")], [lookup(activity["delta"], delta_name)])
         if result_name and is_umbrella(result_name):
             violations.add("umbrella_name")
 
@@ -403,12 +400,12 @@ def check_layer2(payload, output):
 #     input_mismatch  names, sources, query refs, brands, evidence idx or declared facts do not match the input
 #     inconsistent    the output contradicts or repeats itself
 #     text_quality    badly formed queries, or JSON fragments inside text
-#     wrong_language  L3 Commercial / L4 Hyper queries not in query_language, or L4 Biography / Commercial
-#                     Preference free text not English (see "Language" below)
+#     wrong_language  most checked units are not written in the language of their input anchor (see "Language")
 # ---------------------------------------------------------------------------
 
-# Query languages written without spaces between words; query word counts are not checked for them.
-UNSPACED_LANGUAGES = {"ja", "zh", "zh-Hans", "zh-Hant", "th"}
+# Scripts written without spaces between words (Han, kana, Thai, Lao, Khmer, Myanmar); query word counts are not
+# checked for queries containing them (layer3_commercial_step3_rule_based_clean.py).
+UNSPACED_SCRIPT = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff]")
 L4_SCENARIOS = {"shopping", "dining", "learning", "travel", "hobbies", "fitness", "technology"}
 
 
@@ -430,11 +427,11 @@ def has_duplicates(values):
     return len(set(folded)) < len(folded)
 
 
-def query_format_ok(query, language, min_words, max_words):
+def query_format_ok(query, min_words, max_words):
     text = query.strip()
     if text.endswith(("?", "？")):
         return False
-    return language in UNSPACED_LANGUAGES or min_words <= len(text.split()) <= max_words
+    return bool(UNSPACED_SCRIPT.search(text)) or min_words <= len(text.split()) <= max_words
 
 
 def names_match(payload, returned):
@@ -453,7 +450,7 @@ def l3_persona_keys_valid(output):
 
 
 def check_l3_persona(payload, output):
-    violations = set()
+    violations, stats = set(), {}
     entries = dicts(output.get("interest_personas"))
     if not entries or not all(
             has_text(e.get("interest_name")) and has_text(e.get("persona"))
@@ -469,7 +466,12 @@ def check_l3_persona(payload, output):
                 spellings[" ".join(segment.casefold().replace("&", " and ").split())].add(segment)
     if any(len(values) > 1 for values in spellings.values()) or has_duplicates([e.get("persona") for e in entries]):
         violations.add("inconsistent")
-    return violations
+    # The persona is written in the language of its interest's actual_activity.
+    activity = {interest.get("interest_name"): interest.get("actual_activity")
+                for interest in dicts(payload.get("interests"))}
+    for entry in entries:
+        check_language(stats, [entry.get("persona")], [lookup(activity, entry.get("interest_name"))])
+    return violations, stats
 
 
 # L3 Commercial: {"interest_commercial": [{"interest_name", "commercial", "commercial_score", ...}]}
@@ -485,38 +487,49 @@ def l3_commercial_keys_valid(output):
 
 
 def l3_commercial_entry_valid(entry):
-    """commercial true: valid score and stage, 1-3 queries. commercial false: nulls and empty lists."""
+    """commercial true: valid score and stage, 1-3 queries. commercial false: null score and stage, 0-3 queries
+    (entities and queries are listed for every interest)."""
     if not has_text(entry.get("interest_name")) or not isinstance(entry.get("commercial"), bool):
         return False
-    if not all(string_list(entry.get(key)) for key in L3C_LIST_KEYS):
+    if not all(string_list(entry.get(key)) for key in L3C_LIST_KEYS) or len(entry["predicted_queries"]) > 3:
         return False
     if entry["commercial"]:
         return (one_of(entry.get("commercial_score"), L3C_SCORES)
                 and one_of(entry.get("intent_funnel_stage"), L3C_STAGES)
-                and 1 <= len(entry["predicted_queries"]) <= 3)
-    return (entry.get("commercial_score") is None and entry.get("intent_funnel_stage") is None
-            and not any(entry[key] for key in L3C_LIST_KEYS))
+                and bool(entry["predicted_queries"]))
+    return entry.get("commercial_score") is None and entry.get("intent_funnel_stage") is None
 
 
 def check_l3_commercial(payload, output):
+    """Returns (violations, stats); stats has queries and interests (valid entries, for avg_query_num) and the
+    language counts."""
     violations = set()
     entries = dicts(output.get("interest_commercial"))
-    language = payload.get("query_language") or ""
+    stats = {"queries": 0, "interests": 0}
     if not names_match(payload, [e.get("interest_name") for e in entries]):
         violations.add("input_mismatch")
+    # Queries are written in the language of their interest's evidence actions.
+    actions = {interest.get("interest_name"): [action for topic in dicts(interest.get("topics"))
+                                               for action in (topic.get("actions") or [])]
+               for interest in dicts(payload.get("interests"))}
     for entry in entries:
         if not l3_commercial_entry_valid(entry):
             violations.add("invalid_value")
-        elif entry["commercial"]:
-            if any(has_duplicates(entry[key]) for key in L3C_LIST_KEYS):
-                violations.add("inconsistent")
-            if not all(query_format_ok(q, language, 2, 10) for q in entry["predicted_queries"]):
-                violations.add("text_quality")
-    return violations
+            continue
+        queries = entry["predicted_queries"]
+        stats["queries"] += len(queries)
+        stats["interests"] += 1
+        if any(has_duplicates(entry[key]) for key in L3C_LIST_KEYS):
+            violations.add("inconsistent")
+        if not all(query_format_ok(q, 2, 10) for q in queries):
+            violations.add("text_quality")
+        if queries:
+            check_language(stats, queries, lookup(actions, entry["interest_name"]) or [])
+    return violations, stats
 
 
-# L4 Biography (V2): {"life_stage": {"value", "confidence", "evidence"}, "user_attributes": {8 attributes},
-#                     "biography"}, mirroring layer4_biography_step2_rule_based_clean.py --version v2.
+# L4 Biography (V3): {"life_stage": {"value", "confidence", "evidence"}, "user_attributes": {8 attributes},
+#                     "biography"}, mirroring layer4_biography_step2_rule_based_clean.py --version v3.
 L4B_LIFE_STAGES = {"single", "married", "parenting", "caregiving", "job_seeking", "new_grad", "retirement",
                    "unknown"}
 L4B_CONFIDENCES = {"high", "medium", "low"}
@@ -542,7 +555,7 @@ L4B_JSON_ARTIFACT = re.compile(r'[{}`]|"(?:life_stage|user_attributes|biography|
 L4B_MALE_PRONOUN = re.compile(r"\b(?:he|him|his|himself)\b", re.IGNORECASE)
 L4B_FEMALE_PRONOUN = re.compile(r"\b(?:she|her|hers|herself)\b", re.IGNORECASE)
 
-# V2 data has no age_group.signals (removed from the GPT-5.6 output), so every attribute has exactly these keys.
+# V3 data has no age_group.signals (dropped in cleaning), so every attribute has exactly these keys.
 L4B_ATTRIBUTE_SCHEMA = {"evidence": ListOf(str), "value": str, "confidence": str, "source": str}
 
 
@@ -615,14 +628,16 @@ def check_l4_biography(payload, output):
     texts = [biography, *(text for evidence in evidence_lists for text in evidence)]
     if any(L4B_JSON_ARTIFACT.search(text) for text in texts):
         violations.add("text_quality")
-    if not is_english(texts):
-        violations.add("wrong_language")
-    return violations, {"declared_match": int(declared_ok), "source_grounded": int(grounded_ok)}
+    stats = {"declared_match": int(declared_ok), "source_grounded": int(grounded_ok)}
+    # The evidence and biography are written in the main language of the user's interests.
+    check_language(stats, texts, [interest.get("actual_activity") for interest in dicts(payload.get("interests"))])
+    return violations, stats
 
 
-# L4 Commercial Preference (V2): {"discount_sensitivity", "price_sensitivity", "subscription_affinity",
+# L4 Commercial Preference (V3): {"discount_sensitivity", "price_sensitivity", "subscription_affinity",
 #                                 "affinity": {"shopping", "dining"}}, mirroring
-#                                 layer4_commercial_preference_step2_rule_based_clean.py --version v2.
+#                                 layer4_commercial_preference_step2_rule_based_clean.py --version v3 (no language
+#                                 rule: the prompt sets none).
 L4P_LEVELS = ("Low", "Medium-Low", "Medium", "Medium-High", "High")
 L4P_SENSITIVITIES = {"discount_sensitivity": "sensitivity", "price_sensitivity": "sensitivity",
                      "subscription_affinity": "affinity"}
@@ -702,17 +717,12 @@ def check_l4_commercial_preference(payload, output):
                   and shopper_ok and restrictions_ok and not has_duplicates([c["category"] for c in categories]))
     if not consistent:
         violations.add("inconsistent")
-    details = [d for name in L4P_SENSITIVITIES for d in output[name]["details"]]
-    details += shopper["details"] + restrictions["details"]
-    texts = [c["description"] for c in categories] + [text for d in details for text in (d["area"], d["evidence"])]
-    if not is_english(texts):
-        violations.add("wrong_language")
     return violations, {"consistent": int(consistent)}
 
 
 # L4 Hyper: {"missions": [{"mission_name", "source_interests", "scenarios", "predicted_brands",
 #                          "predicted_queries": [str]}]}, mirroring layer4_hyper_step3_rule_based_clean.py (without
-#            its 2-7 word query rule and query count limit; the V2 data keeps each query as a plain string, without its
+#            its 2-7 word query rule and query count limit; the V3 data keeps each query as a plain string, without its
 #            provenance fields). An empty missions list is valid.
 L4H_MAX_BRANDS = 3
 L4H_MISSION_SCHEMA = {"mission_name": str, "source_interests": ListOf(str), "scenarios": ListOf(str),
@@ -757,9 +767,10 @@ def l4h_mission_valid(mission):
 
 
 def check_l4_hyper(payload, output):
+    """Returns (violations, stats); stats has the language counts."""
     if not l4_hyper_keys_valid(output):
-        return {"invalid_value"}
-    violations = set()
+        return {"invalid_value"}, {}
+    violations, stats = set(), {}
     blocks = l4h_interest_blocks(str(payload.get("commercial_interests") or ""))
     all_queries = []
     for mission in output["missions"]:
@@ -779,9 +790,11 @@ def check_l4_hyper(payload, output):
             violations.add("input_mismatch")
         if any(text.endswith(("?", "？")) for text in texts):
             violations.add("text_quality")
+        # The mission name and queries are written in the language of its source interests' names and queries.
+        check_language(stats, [mission["mission_name"], *texts], [*sources, *existing])
     if has_duplicates(all_queries):
         violations.add("inconsistent")
-    return violations
+    return violations, stats
 
 
 # L1 Negative: {"negative_interests": [{"keywords", "evidence", "source", "detailed_source", "signal_type",
@@ -854,13 +867,19 @@ TASK_CHECKERS = {
 
 
 # ---------------------------------------------------------------------------
-# Language (fastText lid.176, same vote as the data cleaning): each distinct non-URL text with probability
-# >= 0.5 votes and Chinese is split into zh-Hans / zh-Hant with OpenCC.
-#   Queries (L3 Commercial, L4 Hyper) must be in the requested query_language: the top language needs >= 60% of the
-#   votes (else "mix"), as in pyscript/data_cleaning/layer3_commercial_step2_language_detection.py.
-#   Free text (L4 Biography, L4 Commercial Preference) must be English: the top language needs >= 80% of the votes,
-#   as the cleaning's is_english (layer4_biography_step2_rule_based_clean.py).
-# Rollouts whose texts cannot be tagged are not checked.
+# Language (fastText lid.176, same vote as the data cleaning): each distinct non-URL text with probability >= 0.5
+# votes, the top language needs >= 60% of the votes (else "mix"), and Chinese is split into zh-Hans / zh-Hant with
+# OpenCC. V3 is multilingual, so a unit's output text must be in the language of its input anchor, as the prompts ask:
+#   L1 activity             <- the actions its topics cite
+#   L2 merged / added activity <- the activities of the merged delta and snapshot interests / of the delta interest
+#   L3 Persona persona      <- the interest's actual_activity
+#   L3 Commercial queries   <- the actions of the interest's topics
+#   L4 Biography biography and evidence <- the actual_activity of all interests
+#   L4 Hyper mission name and queries   <- the names and Existing queries of its source interests
+# Languages match by family (LANGUAGE_FAMILIES of layer1_step2_language_detection.py; zh-Hans / zh-Hant are one
+# family). A unit is not checked when its anchor or output is "mix" or cannot be tagged. language_match_ratio_* is
+# per unit; the rule violation wrong_language needs most of an output's checked units to mismatch (not for
+# LANGUAGE_METRIC_ONLY stages).
 # ---------------------------------------------------------------------------
 
 LID_MODEL_PATH = Path(os.environ.get("LID_MODEL_PATH",
@@ -868,24 +887,10 @@ LID_MODEL_PATH = Path(os.environ.get("LID_MODEL_PATH",
 LID_MODEL_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
 LID_MIN_CONFIDENCE = 0.5
 LID_MIN_SHARE = 0.6
-LID_MIN_SHARE_ENGLISH = 0.8
 URL_LIKE = re.compile(r"(https?://|www\.|^\S+\.(com|net|org|de|jp|fr|co|io|uk|au|cn|br|es|it|nl|ru)(/\S*)?$)", re.I)
-
-QUERY_GETTERS = {
-    "l3_commercial": lambda output: [
-        query for entry in dicts(output.get("interest_commercial"))
-        if isinstance(entry.get("predicted_queries"), list)
-        for query in entry["predicted_queries"] if isinstance(query, str)],
-    "l4_hyper": lambda output: [
-        query for mission in dicts(output.get("missions"))
-        if isinstance(mission.get("predicted_queries"), list)
-        for query in mission["predicted_queries"] if isinstance(query, str)],
-}
-
-# Units that carry queries, for avg_query_num: commercial interests (L3 Commercial).
-QUERY_UNIT_COUNTERS = {
-    "l3_commercial": lambda output: sum(e.get("commercial") is True for e in dicts(output.get("interest_commercial"))),
-}
+LANGUAGE_FAMILIES = (("es", "pt", "ca", "gl"), ("da", "no", "nn", "sv"), ("cs", "sk"), ("hr", "sr", "bs", "sh", "sl"),
+                     ("id", "ms"), ("nl", "de", "af", "lb", "fy"), ("zh", "zh-Hans", "zh-Hant"))
+LANGUAGE_FAMILY = {language: family[0] for family in LANGUAGE_FAMILIES for language in family}
 
 _language_tools = None
 
@@ -947,19 +952,33 @@ def detect_language(texts, min_share=LID_MIN_SHARE):
     return chinese_script(tagged, converters) if language == "zh" else language
 
 
-def detect_query_language(queries):
-    """Voted lid.176 language of the queries, "mix", or None when no query can be tagged."""
-    return detect_language(queries, LID_MIN_SHARE)
+def check_language(stats, texts, anchor_texts):
+    """Count one unit whose texts must be in the language of its anchor texts: stats language_units_<group> and
+    language_match_<group>, with group "en" (English anchor) or "glb" (any other language). Units whose anchor or
+    output is "mix" or cannot be tagged are skipped (short queries and names are often brand-only)."""
+    anchor = detect_language([text for text in anchor_texts if isinstance(text, str)])
+    if anchor in (None, "mix"):
+        return
+    detected = detect_language([text for text in texts if isinstance(text, str)])
+    if detected in (None, "mix"):
+        return
+    matched = LANGUAGE_FAMILY.get(detected, detected) == LANGUAGE_FAMILY.get(anchor, anchor)
+    group = "en" if anchor == "en" else "glb"
+    stats[f"language_units_{group}"] = stats.get(f"language_units_{group}", 0) + 1
+    stats[f"language_match_{group}"] = stats.get(f"language_match_{group}", 0) + int(matched)
 
 
-def is_english(texts):
-    """True when the texts vote English, or none of them can be tagged."""
-    return detect_language(texts, LID_MIN_SHARE_ENGLISH) in (None, "en")
+# Stages whose language match is logged but not a rule: ~41% of the GPT-5.6 L4 Biography references for users with
+# non-English interests write the biography in English, against the prompt.
+LANGUAGE_METRIC_ONLY = {"l4_biography"}
 
 
-def same_language(detected, requested):
-    """Exact match; a bare "zh" (no OpenCC, or no script-specific characters) matches either script."""
-    return detected == requested or (detected == "zh" and requested.startswith("zh"))
+def language_violations(stats):
+    """wrong_language when most checked units of the output are not in their anchor's language (single-unit
+    mismatches are mostly fastText noise on short text)."""
+    units = sum(stats.get(f"language_units_{group}", 0) for group in ("en", "glb"))
+    matched = sum(stats.get(f"language_match_{group}", 0) for group in ("en", "glb"))
+    return {"wrong_language"} if units and matched * 2 < units else set()
 
 
 # ---------------------------------------------------------------------------
@@ -984,19 +1003,8 @@ def score_example(messages, generated_text):
         json_valid = keys_valid(output)
         result = check(payload, output)
         violations, stats = result if isinstance(result, tuple) else (result, {})
-        if stage in QUERY_GETTERS:
-            queries = QUERY_GETTERS[stage](output)
-            stats["queries"] = len(queries)
-            if stage in QUERY_UNIT_COUNTERS:
-                stats["query_units"] = QUERY_UNIT_COUNTERS[stage](output)
-            detected = detect_query_language(queries)
-            if detected is not None:
-                requested = payload.get("query_language") or ""
-                matched = int(same_language(detected, requested))
-                stats["language_match"] = matched
-                stats[f"language_match_{'en' if requested == 'en' else 'glb'}"] = matched
-                if not matched:
-                    violations.add("wrong_language")
+    if stage not in LANGUAGE_METRIC_ONLY:
+        violations |= language_violations(stats)
     return {
         "stage": stage,
         "json_valid": json_valid,
@@ -1052,9 +1060,7 @@ def summarize_records(records):
             values["input_match_ratio"] = input_match()
         elif stage == "l3_commercial":
             values["input_match_ratio"] = input_match()
-            for group in ("en", "glb"):
-                values[f"query_language_match_ratio_{group}"] = over_checked(f"language_match_{group}")
-            values["avg_query_num"] = ratio(totals["queries"], totals["query_units"])
+            values["avg_query_num"] = ratio(totals["queries"], totals["interests"])
         elif stage == "l4_biography":
             values["declared_match_ratio"] = over_checked("declared_match")
             values["source_grounded_ratio"] = over_checked("source_grounded")
@@ -1062,7 +1068,9 @@ def summarize_records(records):
             values["value_detail_consistent_ratio"] = over_checked("consistent")
         elif stage == "l4_hyper":
             values["input_match_ratio"] = input_match()
-            values["query_language_match_ratio"] = over_checked("language_match")
+        for group in ("en", "glb"):
+            values[f"language_match_ratio_{group}"] = ratio(totals[f"language_match_{group}"],
+                                                            totals[f"language_units_{group}"])
 
         for name, value in values.items():
             if value is not None:

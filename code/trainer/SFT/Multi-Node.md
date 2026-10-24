@@ -1,6 +1,6 @@
 # Multi-Node DeepSpeed Training in Practice
 
-This document records the complete setup, the problems encountered, and troubleshooting lessons from launching `run_user_profile_multi_gpu.sh` in an AzureML/Singularity environment on 2 nodes with 8 NVIDIA A100 GPUs per node (16 GPUs total).
+This document records the complete setup, the problems encountered, and troubleshooting lessons from launching `run_user_profile_multi_gpu_4B.sh` in an AzureML/Singularity environment on 2 nodes with 8 NVIDIA A100 GPUs per node (16 GPUs total).
 
 ## 1. Final Running State
 
@@ -397,7 +397,7 @@ Save the full log:
 ```bash
 mkdir -p user_logs
 : > user_logs/user_profile_multi_gpu.log
-sh ./run_user_profile_multi_gpu.sh \
+sh ./run_user_profile_multi_gpu_4B.sh \
   > user_logs/user_profile_multi_gpu.log 2>&1
 ```
 
@@ -406,14 +406,14 @@ To run in the background, use the managed background mode provided by the job pl
 Disable rollout evaluation and run only perplexity evaluation:
 
 ```bash
-ROLLOUT_EVAL=0 sh ./run_user_profile_multi_gpu.sh \
+ROLLOUT_EVAL=0 sh ./run_user_profile_multi_gpu_4B.sh \
   > user_logs/user_profile_multi_gpu.log 2>&1
 ```
 
 Override the master port:
 
 ```bash
-MASTER_PORT=29500 sh ./run_user_profile_multi_gpu.sh \
+MASTER_PORT=29500 sh ./run_user_profile_multi_gpu_4B.sh \
   > user_logs/user_profile_multi_gpu.log 2>&1
 ```
 
@@ -636,7 +636,7 @@ If a node is missing cache, re-prefetch only the missing configs; do not put the
 
 ## 15. Key Design Points of the Current Script
 
-`run_user_profile_multi_gpu.sh` currently:
+`run_user_profile_multi_gpu_4B.sh` currently:
 
 - Uses `set -eu` to exit promptly on unset variables or failed commands.
 - Enables 8 IB HCAs and GDRDMA by default.
