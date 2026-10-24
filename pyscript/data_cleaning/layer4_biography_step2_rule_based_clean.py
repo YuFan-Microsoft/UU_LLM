@@ -39,6 +39,11 @@ rows are written without confidence_score (the confidence label carries it), and
 `"evidence": []` (the teacher mixes [] with "no evidence" filler). The report is also written to
 <output stem>.report.json.
 
+--version v3 checks GPT-5.6 Final rows with the v2 rules except the English check: the Final teacher writes the
+evidence and biography in the user's language (the prompt has no language rule), so `non_english` is not a category.
+Kept v3 rows are also written without user_attributes.age_group.signals (as in the published V2 data); the signals
+are still validated before they are dropped.
+
 The JSON-format checker, cleaning loop, and summary printer below are shared with the other
 layer4_*_rule_based_clean.py scripts.
 
@@ -494,18 +499,21 @@ def check_row_v2(record: dict, model, t2s, s2t, args: argparse.Namespace) -> Che
     texts = [biography, *(text for evidence in evidence_lists for text in evidence)]
     if any(JSON_ARTIFACT_V2.search(text) for text in texts) or leaks_user_id(record):
         reasons.add("text_quality")
-    if not is_english(texts, model, t2s, s2t, args):
+    if args.version == "v2" and not is_english(texts, model, t2s, s2t, args):
         reasons.add("non_english")
     return reasons, flags
 
 
-def normalize_v2(record: dict) -> bool:
+def normalize_v2(record: dict, drop_signals: bool = False) -> bool:
     """Drop every attribute's confidence_score (the confidence label carries it) and empty the evidence of Unknown
-    attributes (the teacher mixes [] and "no evidence" filler)."""
-    for attribute in record["output"]["user_attributes"].values():
+    attributes (the teacher mixes [] and "no evidence" filler); with drop_signals (v3) also drop age_group.signals."""
+    attributes = record["output"]["user_attributes"]
+    for attribute in attributes.values():
         attribute.pop("confidence_score", None)
         if attribute["value"] == "Unknown":
             attribute["evidence"] = []
+    if drop_signals:
+        attributes["age_group"].pop("signals", None)
     return True
 
 
@@ -530,8 +538,9 @@ def write_report(report: dict, args: argparse.Namespace) -> None:
 
 def add_v2_arguments(parser: argparse.ArgumentParser) -> None:
     default_model = Path(__file__).resolve().parents[2] / "models" / "lid.176.bin"
-    parser.add_argument("--version", choices=("v1", "v2"), default="v1",
-                        help="v1: GPT-5.4 output format; v2: GPT-5.6 output format (see the module docstring)")
+    parser.add_argument("--version", choices=("v1", "v2", "v3"), default="v1",
+                        help="v1: GPT-5.4 output format; v2: GPT-5.6 output format; v3: GPT-5.6 Final, v2 without the "
+                             "English check (see the module docstring)")
     parser.add_argument("--model", type=Path, default=default_model,
                         help=f"fastText lid.176.bin for the v2 English check (default: {default_model})")
     parser.add_argument("--min-confidence", type=float, default=0.5, help="Min fastText probability per text (v2)")
@@ -546,9 +555,11 @@ def main() -> None:
         print_summary(report, CATEGORIES)
         return
     model, t2s, s2t = load_language(args)
-    report = clean(args, lambda record: check_row_v2(record, model, t2s, s2t, args), CATEGORIES_V2,
-                   FLAG_CATEGORIES_V2, normalize_v2)
-    print_summary(report, CATEGORIES_V2)
+    categories = CATEGORIES_V2 if args.version == "v2" else \
+        {name: text for name, text in CATEGORIES_V2.items() if name != "non_english"}
+    report = clean(args, lambda record: check_row_v2(record, model, t2s, s2t, args), categories,
+                   FLAG_CATEGORIES_V2, lambda record: normalize_v2(record, drop_signals=args.version == "v3"))
+    print_summary(report, categories)
     write_report(report, args)
 
 

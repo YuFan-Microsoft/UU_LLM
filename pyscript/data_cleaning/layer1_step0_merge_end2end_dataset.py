@@ -1,36 +1,32 @@
 #!/usr/bin/env python3
-"""Merge the GPT-5.6 Layer 1 delta / actual / intent batch results into one end-to-end JSONL row per user-day.
+"""Merge the GPT-5.6 Final Layer 1 delta / actual results into one end-to-end JSONL row per user-day-window.
 
-The three source files (ProcessData/layer1_{delta,actual,intent}.jsonl) are chained stages of one pipeline;
-every line is one batch request with its result:
-    {"custom_id", "task", "request": {"messages": [{"role": "system", ...}, {"role": "user", "content"}], ...},
-     "response": {"content": <JSON string>, "finish_reason", ...}, "status", "response_status", "error",
-     "meta", "unit_id": "main/<delta7|daily>/<yyyymmdd>/<task>", "unit_key"}
+Source files (Training_Data_InferredByGPT56_Final/process_dataset/L1/) hold one call per line:
+    {"id", "input": [{"role": "system", ...}, {"role": "user", "content"}], "output": <JSON string>}
 
-    layer1_delta   user: "Date: <yyyymmdd>\\nUser ID: <id>\\n...Today's Denoised Signals (<n> events):\\n<signals JSON>"
-                   output: {"interests": [{"interest_name", "topics": [{"topic", "source", "evidence"}]}],
-                            ["predicted_content_locale"]}
-    layer1_actual  user: "User ID: <id>\\nDate: <yyyymmdd>\\n\\nDelta Interests:\\n<delta interests>"
-                   output: {"interests": [{"interest_name", "actual_activity"}]}
-    layer1_intent  user: "User ID: <id>\\nDate: <yyyymmdd>\\n\\nDelta Interests:\\n<interests + actual_activity>"
-                   output: {"interests": [{"interest_name", "inferred_intent"}]}
+    l1_delta   user:   "Date: <yyyymmdd>\\nUser ID: <id>\\nUser Demographics / Facts:\\n...\\n\\n"
+                       "Today's Denoised Signals (<n> events):\\n<[{"idx", "Date", "Source", "Action"}] JSON>"
+               output: {"interests": [{"topics": [{"evidence": [idx], "topic"}], "interest_name"}]}
+    l1_actual  user:   "User ID: <id>\\nDate: <yyyymmdd>\\n\\nDelta Interests:\\n"
+                       "<[{"interest_name", "topics": [{"topic", "evidence": [{"action"}]}]}] JSON>"
+               output: {"interests": [{"interest_name", "actual_activity"}]}
 
-Rows are joined on (User ID, window, Date), where window is delta7 / daily from unit_id (the same
-user-day can appear in both windows with different signals). actual / intent must return exactly one
-entry per delta interest, in the same order and with the same interest_name.
+There is no intent call and no predicted_content_locale any more: interest names, topics and activities are written
+in the language of each interest's evidence. Facts are always "No facts available." and are not kept.
+
+A delta row and an actual row are joined on (User ID, Date, [(interest_name, [topic])]): the same user-day can appear
+in a 7-day and a 1-day window with different signals, and the actual input caps each topic's evidence, so the names
+are the fingerprint. actual must return exactly one entry per delta interest, in the same order and with the same
+interest_name. Join keys seen more than once in either file are dropped entirely.
 
 Each kept row is:
     {"user_hash": sha256(user_id)[:16],
-     "input":  {"signals": [{"idx", "Date", "Source", "DetailedSource", "Action"}]},
-     "output": {["predicted_content_locale"],
-                "interests": [{"interest_name", "topics", "actual_activity", "inferred_intent"}]}}
-
-User ID and the request Date are not part of the input; user_hash is kept only so later steps can
-split train/test by user. Rows with GPT-5.6 failures are dropped (failed request, non-"stop" finish
-reason such as content_filter / length, invalid JSON, wrong keys, actual / intent missing or not aligned
-with delta, duplicated join key). Each dropped delta row is counted under its first failing reason.
-Delta rows with no interests have no actual / intent requests; they are kept as {"interests": []}
-unless --drop-empty-interests is set. Content-level rules are left to layer1_step1_rule_based_clean.py.
+     "input":  {"signals": [{"idx", "Date", "Source", "Action"}]},
+     "output": {"interests": [{"topics": [{"evidence", "topic"}], "interest_name", "actual_activity"}]}}
+with the teacher's key order. Rows with GPT-5.6 failures are dropped (invalid JSON, wrong keys, actual missing,
+duplicated, or not aligned with delta); each dropped delta row is counted under its first failing reason.
+Delta rows with no interests have no actual call and are kept as {"interests": []} unless --drop-empty-interests
+is set. Content-level rules are left to layer1_step1_rule_based_clean.py.
 """
 
 from __future__ import annotations
@@ -47,70 +43,55 @@ import orjson
 from tqdm import tqdm
 
 
-DELTA, ACTUAL, INTENT = "layer1_delta", "layer1_actual", "layer1_intent"
-TEXT_FIELD = {ACTUAL: "actual_activity", INTENT: "inferred_intent"}
 USER_ID = re.compile(r"^User ID: ([^\n]+)$", re.M)
 DATE = re.compile(r"^Date: (\d{8})$", re.M)
 SIGNALS_HEADER = re.compile(r"Today's Denoised Signals \((\d+) events\):\n")
-DELTA_TOP_KEYS = {"interests", "predicted_content_locale"}
-DELTA_INTEREST_KEYS = {"interest_name", "topics"}
+ACTUAL_HEADER = "Delta Interests:\n"
+DELTA_INTEREST_KEYS = {"topics", "interest_name"}
+DELTA_TOPIC_KEYS = {"evidence", "topic"}
+SIGNAL_KEYS = {"idx", "Date", "Source", "Action"}
 DUPLICATE = "duplicate_join_key"
 
 
 def user_message(record: dict) -> str:
-    messages = [m for m in (record.get("request") or {}).get("messages") or [] if m.get("role") == "user"]
+    messages = [m for m in record.get("input") or [] if isinstance(m, dict) and m.get("role") == "user"]
     return messages[-1].get("content") or "" if messages else ""
 
 
-def join_key(record: dict, content: str) -> tuple[str, str, str] | None:
+def join_key(record: dict, content: str) -> tuple[str, str] | None:
+    """(User ID, Date) from the user message header."""
     header = content[:500]
     user_id, date = USER_ID.search(header), DATE.search(header)
-    parts = str(record.get("unit_id", "")).split("/")
-    if not (user_id and date and len(parts) == 4):
-        return None
-    return user_id[1].strip(), parts[1], date[1]
+    return (user_id[1].strip(), date[1]) if user_id and date else None
 
 
 def parse_response(record: dict) -> tuple[str | None, dict | None]:
-    """Return (dirty_reason, parsed_response); shared GPT/API checks for all three tasks."""
-    response = record.get("response") or {}
-    if record.get("status") != "succeeded" or record.get("response_status") != 200 or record.get("error"):
-        return "request_failed", None
-    if response.get("finish_reason") != "stop":
-        return f"finish_reason_{response.get('finish_reason')}", None
+    """Return (dirty_reason, parsed_output)."""
     try:
-        parsed = orjson.loads(response.get("content") or "")
+        parsed = orjson.loads(record.get("output") or "")
     except orjson.JSONDecodeError:
         return "invalid_json", None
     if not isinstance(parsed, dict):
         return "invalid_json", None
+    if set(parsed) != {"interests"} or not isinstance(parsed["interests"], list):
+        return "unexpected_top_keys", None
     return None, parsed
 
 
-def check_delta(parsed: dict) -> str | None:
-    if "interests" not in parsed or not set(parsed) <= DELTA_TOP_KEYS:
-        return "unexpected_top_keys"
-    locale = parsed.get("predicted_content_locale")
-    if "predicted_content_locale" in parsed and not (isinstance(locale, str) and locale.strip()):
-        return "invalid_locale"
-    interests = parsed["interests"]
-    if not isinstance(interests, list) or not all(
-            isinstance(i, dict) and set(i) == DELTA_INTEREST_KEYS and isinstance(i["interest_name"], str)
-            for i in interests):
-        return "invalid_interest_schema"
+def fingerprint(interests: list[dict]) -> tuple:
+    return tuple((interest["interest_name"], tuple(topic["topic"] for topic in interest["topics"]))
+                 for interest in interests)
+
+
+def check_delta(interests: list) -> str | None:
+    for interest in interests:
+        if not (isinstance(interest, dict) and set(interest) == DELTA_INTEREST_KEYS
+                and isinstance(interest["interest_name"], str) and isinstance(interest["topics"], list)):
+            return "invalid_interest_schema"
+        for topic in interest["topics"]:
+            if not (isinstance(topic, dict) and set(topic) == DELTA_TOPIC_KEYS and isinstance(topic["topic"], str)):
+                return "invalid_interest_schema"
     return None
-
-
-def check_followup(parsed: dict, field: str) -> tuple[str | None, list[tuple[str, str]] | None]:
-    if set(parsed) != {"interests"}:
-        return "unexpected_top_keys", None
-    interests = parsed["interests"]
-    if not isinstance(interests, list) or not all(
-            isinstance(i, dict) and set(i) == {"interest_name", field}
-            and isinstance(i["interest_name"], str) and isinstance(i[field], str)
-            for i in interests):
-        return "invalid_interest_schema", None
-    return None, [(i["interest_name"], i[field]) for i in interests]
 
 
 def parse_signals(content: str) -> list[dict] | None:
@@ -122,45 +103,45 @@ def parse_signals(content: str) -> list[dict] | None:
     except orjson.JSONDecodeError:
         return None
     if (not isinstance(signals, list) or len(signals) != int(header[1])
-            or not all(isinstance(s, dict) for s in signals)):
+            or not all(isinstance(s, dict) and set(s) == SIGNAL_KEYS for s in signals)):
         return None
     return signals
 
 
-def load_followup(path: Path, task: str, stats: Counter) -> dict[tuple, str | list[tuple[str, str]]]:
-    """Map join key -> list of (interest_name, text), or a dirty-reason string."""
-    results: dict[tuple, str | list[tuple[str, str]]] = {}
+def load_actual(path: Path, stats: Counter) -> dict[tuple, list[str] | str]:
+    """Map (user_id, date, fingerprint) -> actual_activity list in interest order, or a dirty-reason string."""
+    results: dict[tuple, list[str] | str] = {}
     with path.open("rb") as source:
         for line in tqdm(source, desc=f"Reading {path.name}", unit="rows"):
             stats["rows"] += 1
             record = orjson.loads(line)
-            key = join_key(record, user_message(record))
+            content = user_message(record)
+            key = join_key(record, content)
+            start = content.find(ACTUAL_HEADER)
+            try:
+                delta_interests = orjson.loads(content[start + len(ACTUAL_HEADER):]) if start >= 0 else None
+                key = key and (*key, fingerprint(delta_interests))
+            except (orjson.JSONDecodeError, KeyError, TypeError):
+                key = None
             if key is None:
-                stats["dirty:unparseable_key"] += 1
+                stats["dirty:unparseable_input"] += 1
                 continue
-            reason, parsed = parse_response(record)
-            entries = None
-            if reason is None:
-                reason, entries = check_followup(parsed, TEXT_FIELD[task])
             if key in results:
                 stats[f"dirty:{DUPLICATE}"] += 1
                 results[key] = DUPLICATE
                 continue
+            reason, parsed = parse_response(record)
+            if reason is None:
+                entries = parsed["interests"]
+                if not all(isinstance(e, dict) and set(e) == {"interest_name", "actual_activity"}
+                           and isinstance(e["interest_name"], str) and isinstance(e["actual_activity"], str)
+                           for e in entries):
+                    reason = "invalid_interest_schema"
+                elif [e["interest_name"] for e in entries] != [name for name, _ in key[2]]:
+                    reason = "misaligned_with_delta"
             stats["ok" if reason is None else f"dirty:{reason}"] += 1
-            results[key] = entries if reason is None else reason
+            results[key] = reason or [e["actual_activity"] for e in entries]
     return results
-
-
-def resolve_followup(results: dict, key: tuple, names: list[str], task: str) -> tuple[str | None, list[str] | None]:
-    label = task.removeprefix("layer1_")
-    entry = results.get(key)
-    if entry is None:
-        return f"{label}:missing", None
-    if isinstance(entry, str):
-        return f"{label}:{entry}", None
-    if [name for name, _ in entry] != names:
-        return f"{label}:misaligned_with_delta", None
-    return None, [text for _, text in entry]
 
 
 def hash_user_id(user_id: str) -> str:
@@ -168,31 +149,30 @@ def hash_user_id(user_id: str) -> str:
 
 
 def merge(args: argparse.Namespace) -> dict:
-    paths = {task: args.input_dir / f"{task}.jsonl" for task in (DELTA, ACTUAL, INTENT)}
-    for path in paths.values():
+    for path in (args.delta, args.actual):
         if not path.is_file():
             raise SystemExit(f"Missing input file: {path}")
+    file_stats = {"delta": Counter(), "actual": Counter()}
+    actual = load_actual(args.actual, file_stats["actual"])
 
-    file_stats = {task: Counter() for task in paths}
-    followups = {task: load_followup(paths[task], task, file_stats[task]) for task in (ACTUAL, INTENT)}
-
-    # Delta join keys are counted first so duplicated user-day-windows are dropped entirely.
+    # Delta join keys are counted first so duplicated keys are dropped entirely.
     delta_keys: Counter = Counter()
-    with paths[DELTA].open("rb") as source:
-        for line in tqdm(source, desc=f"Indexing {paths[DELTA].name}", unit="rows"):
+    with args.delta.open("rb") as source:
+        for line in tqdm(source, desc=f"Indexing {args.delta.name}", unit="rows"):
             record = orjson.loads(line)
             key = join_key(record, user_message(record))
-            if key is not None:
-                delta_keys[key] += 1
+            reason, parsed = parse_response(record)
+            if key is not None and reason is None and check_delta(parsed["interests"]) is None:
+                delta_keys[(*key, fingerprint(parsed["interests"]))] += 1
 
     drops: Counter = Counter()
     kept = Counter()
-    users, user_days = set(), set()
+    users, user_days, matched = set(), set(), set()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
-    with paths[DELTA].open("rb") as source, temporary.open("wb", buffering=16 * 1024 * 1024) as destination:
-        for line in tqdm(source, desc=f"Merging {paths[DELTA].name}", unit="rows"):
-            stats = file_stats[DELTA]
+    with args.delta.open("rb") as source, temporary.open("wb", buffering=16 * 1024 * 1024) as destination:
+        for line in tqdm(source, desc=f"Merging {args.delta.name}", unit="rows"):
+            stats = file_stats["delta"]
             stats["rows"] += 1
             record = orjson.loads(line)
             content = user_message(record)
@@ -203,9 +183,11 @@ def merge(args: argparse.Namespace) -> dict:
                 continue
             reason, parsed = parse_response(record)
             if reason is None:
-                reason = check_delta(parsed)
-            if reason is None and delta_keys[key] > 1:
-                reason = DUPLICATE
+                reason = check_delta(parsed["interests"])
+            if reason is None:
+                key = (*key, fingerprint(parsed["interests"]))
+                if delta_keys[key] > 1:
+                    reason = DUPLICATE
             stats["ok" if reason is None else f"dirty:{reason}"] += 1
             if reason is not None:
                 drops[f"delta:{reason}"] += 1
@@ -224,40 +206,37 @@ def merge(args: argparse.Namespace) -> dict:
                 kept["rows_with_empty_interests"] += 1
                 merged_interests: list[dict] = []
             else:
-                names = [interest["interest_name"] for interest in interests]
-                reason, activities = resolve_followup(followups[ACTUAL], key, names, ACTUAL)
-                if reason is None:
-                    reason, intents = resolve_followup(followups[INTENT], key, names, INTENT)
-                if reason is not None:
-                    drops[reason] += 1
+                activities = actual.get(key)
+                if activities is None:
+                    drops["actual:missing"] += 1
                     continue
+                if isinstance(activities, str):
+                    drops[f"actual:{activities}"] += 1
+                    continue
+                matched.add(key)
                 merged_interests = [
-                    {"interest_name": interest["interest_name"], "topics": interest["topics"],
-                     "actual_activity": activity, "inferred_intent": intent}
-                    for interest, activity, intent in zip(interests, activities, intents)
+                    {"topics": [{"evidence": topic["evidence"], "topic": topic["topic"]} for topic in interest["topics"]],
+                     "interest_name": interest["interest_name"], "actual_activity": activity}
+                    for interest, activity in zip(interests, activities)
                 ]
 
-            output = {"interests": merged_interests}
-            if "predicted_content_locale" in parsed:
-                output = {"predicted_content_locale": parsed["predicted_content_locale"], **output}
             user_hash = hash_user_id(key[0])
             destination.write(orjson.dumps(
-                {"user_hash": user_hash, "input": {"signals": signals}, "output": output}) + b"\n")
+                {"user_hash": user_hash, "input": {"signals": signals}, "output": {"interests": merged_interests}})
+                + b"\n")
             kept["rows_written"] += 1
-            kept[f"window_{key[1]}"] += 1
             users.add(user_hash)
-            user_days.add((user_hash, key[2]))
+            user_days.add((user_hash, key[1]))
     os.replace(temporary, args.output)
 
-    for task in (ACTUAL, INTENT):
-        file_stats[task]["orphan_not_in_delta"] = sum(1 for key in followups[task] if key not in delta_keys)
-
-    delta_rows = file_stats[DELTA]["rows"]
+    file_stats["actual"]["orphan_not_in_delta"] = sum(1 for key in actual if key not in delta_keys)
+    delta_rows = file_stats["delta"]["rows"]
     return {
-        "input_dir": str(args.input_dir),
+        "delta": str(args.delta),
+        "actual": str(args.actual),
         "output": str(args.output),
         "drop_empty_interests": args.drop_empty_interests,
-        "per_file": {task: dict(sorted(stats.items())) for task, stats in file_stats.items()},
+        "per_file": {name: dict(sorted(stats.items())) for name, stats in file_stats.items()},
         "delta_rows": delta_rows,
         "rows_written": kept["rows_written"],
         "rows_dropped": sum(drops.values()),
@@ -274,12 +253,12 @@ def print_summary(report: dict) -> None:
         return f"{count / total:.3%}" if total else "-"
 
     print("\n=== GPT-5.6 dirty data per source file (all rows) ===")
-    for task, stats in report["per_file"].items():
+    for name, stats in report["per_file"].items():
         rows = stats.get("rows", 0)
-        print(f"\n[{task}] rows={rows:,}  ok={stats.get('ok', 0):,} ({pct(stats.get('ok', 0), rows)})")
-        for name, count in sorted(stats.items(), key=lambda item: -item[1]):
-            if name.startswith("dirty:") or name == "orphan_not_in_delta":
-                print(f"  {name:<45}{count:>10,}  {pct(count, rows):>8}")
+        print(f"\n[{name}] rows={rows:,}  ok={stats.get('ok', 0):,} ({pct(stats.get('ok', 0), rows)})")
+        for label, count in sorted(stats.items(), key=lambda item: -item[1]):
+            if label.startswith("dirty:") or label == "orphan_not_in_delta":
+                print(f"  {label:<45}{count:>10,}  {pct(count, rows):>8}")
 
     total = report["delta_rows"]
     print("\n=== Merge result (one delta row = one candidate end-to-end row) ===")
@@ -298,10 +277,9 @@ def print_summary(report: dict) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Merge GPT-5.6 Layer 1 delta / actual / intent results into end-to-end JSONL.")
-    parser.add_argument("--input-dir", required=True, type=Path,
-                        help="Directory with layer1_delta.jsonl, layer1_actual.jsonl and layer1_intent.jsonl")
+    parser = argparse.ArgumentParser(description="Merge GPT-5.6 Final Layer 1 delta / actual results into end-to-end JSONL.")
+    parser.add_argument("--delta", required=True, type=Path, help="l1_delta.jsonl")
+    parser.add_argument("--actual", required=True, type=Path, help="l1_actual.jsonl")
     parser.add_argument("--output", required=True, type=Path, help="Merged JSONL path")
     parser.add_argument("--report", type=Path, help="Report JSON path (default: <output>.report.json)")
     parser.add_argument("--drop-empty-interests", action="store_true",

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build Qwen SFT data (train/test JSONL with a `messages` column) from the
-Layer-2 step1 output (merge decisions).
+Layer-2 step1 output (GPT-5.6 Final merge decisions: multilingual, no intent).
 
 Each row becomes:
     {"messages": [{"role": "user", "content": PROMPT + "\\nInput:\\n" + <snapshot/delta JSON>},

@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Rule-based cleaning of the merged GPT-5.6 Layer 4 hyper dataset (step2 output, one JSONL row per user).
+"""Rule-based cleaning of the merged GPT-5.6 Layer 4 hyper dataset (one JSONL row per user-day): the GPT-5.6 Final
+step1 output (no query_language; input carries user_hash instead of user_id), or the older step2 output.
 
 Input/output row format (unchanged by this step):
-    {"input":  {"user_id", "date", "query_language",          # detected by step2
+    {"input":  {"user_id" | "user_hash", "date", ["query_language"],
                 "personal_context", "professional_context", "commercial_preferences",   # section text, may be ""
                 "commercial_interests"},                       # "### Interest N: <name>" blocks
      "output": {"missions": [<mission>]}}
@@ -21,8 +22,9 @@ layer4_hyper_mission_enhancement_step3_rule_based_clean.py, applied to every mis
   inconsistent_content  a source interest is not an input interest, a source_query_ref is not an Existing query of
                         the mission's sources, a predicted brand is already a known brand of the sources, or a query
                         repeats an Existing query (repeats across missions were removed by step1)
-  text_quality          a query is not 2-7 words (skipped for ja/zh/th) or ends with a question mark, or the output
-                        repeats the user_id
+  text_quality          a query is not 2-7 words (skipped for ja/zh/th query_language, or for queries in Han / kana /
+                        Thai / Lao / Khmer / Myanmar script when there is no query_language) or ends with a question
+                        mark, or the output repeats the user_id
 An empty missions list is valid (every candidate was rejected) and is only flagged.
 
 Writes the kept rows to <output>, prints the per-category summary table, and writes <output stem>.report.json.
@@ -56,6 +58,7 @@ OUTPUT_VALIDATOR = Draft202012Validator(OUTPUT_SCHEMA)
 KEY_ORDERS = {"missions[]": MERGED_MISSION_KEYS, "missions[].predicted_queries[]": QUERY_KEYS}
 
 INTEREST_HEADING = re.compile(r"(?m)^### Interest \d+: (.+)$")
+UNSPACED_SCRIPT = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff]")
 KNOWN_BRANDS = re.compile(r"(?m)^\s*- Brands: (.+)$")
 
 CATEGORIES = {
@@ -117,7 +120,8 @@ def check_row(record: dict) -> CheckResult:
             text = q["query"].strip()
             all_queries.append(text)
             words = len(text.split())
-            if ((language not in UNSPACED_LANGUAGES and not MIN_QUERY_WORDS <= words <= MAX_QUERY_WORDS)
+            unspaced = language in UNSPACED_LANGUAGES if language else bool(UNSPACED_SCRIPT.search(text))
+            if ((not unspaced and not MIN_QUERY_WORDS <= words <= MAX_QUERY_WORDS)
                     or text.endswith(("?", "？"))):
                 text_issue = True
             if text != text.lower():

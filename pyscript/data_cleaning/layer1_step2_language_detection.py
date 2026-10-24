@@ -1,33 +1,43 @@
 #!/usr/bin/env python3
-"""Detect a per-row (user-day) content language from the signal Actions and
-side-by-side (SBS) compare it with GPT's predicted_content_locale.
+"""Layer 1 language step for the GPT-5.6 Final data: tag each row's content language, check that every interest's
+actual_activity is written in the language of its interest_name, then merge and shuffle.
 
-Input: step1 output rows {"user_hash", "predicted_content_locale", "signals", "interests"}.
-In step1 a missing GPT locale was filled with "en" (GPT never emits "en"), so
-"en" there means "GPT omitted the field".
+Input: step1 output rows {"user_hash", "signals", "interests": [{"topics", "interest_name", "actual_activity"}]}.
+The teacher writes each interest (name, topics, activity) in the majority language of that interest's evidence and
+no longer predicts a content locale, so nothing is forced to English.
 
 Per row:
-  1. Tag every distinct, reliable Action with fastText lid.176 (skip URL-like
-     text, short Latin-script text, and low-confidence predictions).
-  2. If the top language covers >= --min-count Actions and >= --min-share of
-     the tagged Actions, output it; otherwise output "mix".
-  3. Chinese is split into zh-Hans / zh-Hant by simplified-only vs
-     traditional-only characters (OpenCC).
-  4. Detect the GPT output language the same way (steps 1-2) over the
-     interests' actual_activity + inferred_intent sentences. Unless
-     --keep-non-en-output, drop the row when that is not "en" (a non-English
-     language or "mix"); rows with no taggable output text are kept.
-
-  5. Merge all --inputs into one file, drop rows whose locale has fewer than
-     --min-locale-rows kept rows in total (the SBS is computed before both
-     filters), and shuffle the kept rows at row level with --seed.
+  1. `language` (metadata only, not a training target): fastText lid.176 vote over the distinct, reliable signal
+     Actions (skip URL-like text and low-confidence predictions). The top language must cover >= --min-count Actions
+     and >= --min-share of the tagged ones, else "mix". Chinese is split into zh-Hans / zh-Hant (OpenCC).
+  2. Name / activity consistency, per interest (the row is dropped if any interest fails):
+       script_mismatch    the name has no letter of the activity's writing system, or a Latin-script activity has a
+                          name with non-Latin letters (e.g. "Mobile Phone Plans" over a Chinese activity). The
+                          writing system is the one the activity's fastText language uses in this data when that
+                          prediction has >= --min-confidence and that system covers at least half of the activity's
+                          words (each CJK character counts as a word); otherwise only a name sharing no writing system
+                          with the activity fails (Latin brand names make up much of some Chinese / Japanese
+                          activities, and English activities can quote Thai or Burmese names).
+       language_mismatch  both are Latin script and the name is confidently in another language family than the
+                          activity (e.g. "Legal Services" over a Spanish activity): the activity's fastText language
+                          has >= --min-activity-confidence; the name has >= 2 words, fastText gives it a language with
+                          >= --min-name-confidence, and every name word occurs >= --min-vocab-count times in that
+                          language's activities; and no name word occurs that often in the activity language's ones.
+                          Single words (Golf, Sport, Café) and native compounds (Damesmode) are not judged.
+     All-caps names (UFC, NFL, F1) are language-neutral and skipped. Close languages (es/pt/ca/gl, da/no/sv, cs/sk,
+     hr/sr/bs/sl, id/ms, nl/de/af) count as one family: fastText cannot tell them apart on a 2-5 word name.
+     The per-family vocabulary and each language's writing system come from a first pass over the activities of
+     every input whose fastText language has >= --vocab-min-confidence.
+  3. Merge all --inputs into one file, optionally drop rows whose language has fewer than --min-locale-rows kept rows
+     (off by default), and shuffle the kept rows at row level with --seed.
 
 Outputs:
-  <output>                     merged rows with predicted_content_locale replaced
-  <output>.sbs_summary.json    kept/dropped locales, output-language filter stats, and
-                               detected-vs-GPT SBS (overall and per input)
-  <output>.sbs_samples.jsonl   sampled disagreements and dropped non-English outputs for manual review
+  <output>                   kept rows {"user_hash", "language", "signals", "interests"}
+  <output stem>.summary.json drop counts, language counts, and consistency stats
+  <output stem>.samples.jsonl sampled inconsistent interests for manual review
 """
+
+from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
@@ -36,7 +46,8 @@ import os
 from pathlib import Path
 import random
 import re
-from typing import Any
+from typing import Iterable
+import unicodedata
 
 import orjson
 from tqdm import tqdm
@@ -46,7 +57,11 @@ LABEL_PREFIX = "__label__"
 URL_LIKE = re.compile(r"(https?://|www\.|^\S+\.(com|net|org|de|jp|fr|co|io|uk|au|cn|br|es|it|nl|ru)(/\S*)?$)", re.I)
 LATIN_WORD = re.compile(r"[A-Za-z\u00C0-\u024F]{2,}")
 NON_LATIN_LETTER = re.compile(r"[^\W\d_A-Za-z\u00C0-\u024F]")
-OUTPUT_TEXT_FIELDS = ("actual_activity", "inferred_intent")
+WORD = re.compile(r"[^\W\d_]+")
+ACRONYM = re.compile(r"^[A-Z0-9&.+\-/ ]+$")
+LANGUAGE_FAMILIES = (("es", "pt", "ca", "gl"), ("da", "no", "nn", "sv"), ("cs", "sk"), ("hr", "sr", "bs", "sh", "sl"),
+                     ("id", "ms"), ("nl", "de", "af", "lb", "fy"))
+FAMILY = {language: family[0] for family in LANGUAGE_FAMILIES for language in family}
 
 
 def load_model(path: Path):
@@ -125,61 +140,8 @@ def detect_row_language(signals: list, model, t2s, s2t, args: argparse.Namespace
     return vote_language(texts, model, t2s, s2t, args, no_vote_label="mix")
 
 
-def detect_output_language(interests: list, model, t2s, s2t, args: argparse.Namespace) -> tuple[str, dict]:
-    """Language of GPT's sentence fields; "none" when nothing could be tagged (e.g. no interests)."""
-    values = [interest.get(field, "") for interest in interests for field in OUTPUT_TEXT_FIELDS]
-    return vote_language(reliable_texts(values, args), model, t2s, s2t, args, no_vote_label="none")
-
-
 def keeps_output(output_language: str) -> bool:
     return output_language in ("en", "none")
-
-
-def base_language(locale: str) -> str:
-    if locale.startswith("zh-Hant"):
-        return "zh-Hant"
-    if locale.startswith("zh-Hans"):
-        return "zh-Hans"
-    return locale.split("-")[0]
-
-
-def sbs_category(gpt: str, detected: str) -> str:
-    gpt_omitted = gpt == "en"
-    if gpt_omitted:
-        return {"en": "agree_en", "mix": "gpt_omitted_detected_mix"}.get(detected, "gpt_omitted_detected_non_en")
-    if detected == "mix":
-        return "gpt_lang_detected_mix"
-    gpt_base, detected_base = base_language(gpt), base_language(detected)
-    if gpt_base == detected_base or (gpt_base == "zh" and detected_base.startswith("zh")) \
-            or (detected_base == "zh" and gpt_base.startswith("zh")):
-        return "agree_lang"
-    if detected == "en":
-        return "gpt_lang_detected_en"
-    return "gpt_lang_detected_other_lang"
-
-
-def new_sbs_stats() -> dict:
-    return {"rows": 0, "detected": Counter(), "categories": Counter(), "pairs": Counter()}
-
-
-def add_sbs(stats: dict, gpt_locale: str, detected: str, category: str) -> None:
-    stats["rows"] += 1
-    stats["detected"][detected] += 1
-    stats["categories"][category] += 1
-    stats["pairs"][(gpt_locale if gpt_locale != "en" else "(omitted)", detected)] += 1
-
-
-def format_sbs(stats: dict, top_pairs: int) -> dict:
-    rows = stats["rows"]
-    return {
-        "rows": rows,
-        "detected_locale_counts": dict(stats["detected"].most_common()),
-        "sbs_categories": {k: {"rows": v, "fraction": round(v / rows, 6) if rows else 0.0}
-                           for k, v in stats["categories"].most_common()},
-        "sbs_top_pairs_gpt_vs_detected": [
-            {"gpt": g, "detected": d, "rows": n} for (g, d), n in stats["pairs"].most_common(top_pairs)
-        ],
-    }
 
 
 def add_sample(samples: dict, seen_per_category: Counter, category: str, sample: dict, limit: int,
@@ -195,16 +157,116 @@ def add_sample(samples: dict, seen_per_category: Counter, category: str, sample:
             bucket[slot] = sample
 
 
-def detect_all(args: argparse.Namespace, detected_path: Path) -> tuple[dict, dict, dict, dict]:
-    """Detect every row of every input, write rows passing the output-language filter to
-    detected_path, and return SBS stats, output-language stats, and samples."""
+def family(language: str) -> str:
+    return FAMILY.get(language, language)
+
+
+def script(char: str) -> str:
+    """Writing system of a letter: "cjk" for Han / kana, else the first word of its Unicode name (latin, cyrillic,
+    hangul, thai, tamil, ...)."""
+    name = unicodedata.name(char, "")
+    if name.startswith(("CJK", "HIRAGANA", "KATAKANA")):
+        return "cjk"
+    return name.split(" ", 1)[0].lower() or "other"
+
+
+def word_scripts(text: str) -> Counter:
+    """Words per writing system; every CJK character counts as one word."""
+    counts: Counter[str] = Counter()
+    for word in WORD.findall(text):
+        for char in word:
+            if script(char) == "cjk":
+                counts["cjk"] += 1
+        rest = {script(char) for char in word} - {"cjk"}
+        counts.update(rest)
+    return counts
+
+
+def name_scripts(name: str) -> set[str]:
+    return {script(char) for char in name if char.isalpha()}
+
+
+def latin_words(text: str) -> list[str]:
+    return [word.casefold() for word in WORD.findall(text) if len(word) >= 3]
+
+
+def predict_top(model, texts: list[str]) -> list[tuple[str, float]]:
+    if not texts:
+        return []
+    labels, probabilities = model.f.multilinePredict(texts, 1, 0.0, "strict")
+    return [(label[0][len(LABEL_PREFIX):] if label else "", float(probability[0]) if label else 0.0)
+            for label, probability in zip(labels, probabilities)]
+
+
+def clean_text(value) -> str:
+    return " ".join(str(value or "").split())
+
+
+def fit_vocabulary(text_batches: Iterable[list[str]], model,
+                   args: argparse.Namespace) -> tuple[dict[str, Counter], dict[str, str]]:
+    """Per language family, the number of confidently tagged texts each word occurs in; and per fastText language,
+    the writing system most of its words use. Shared with the Layer 2 / 3 consistency checks."""
+    vocabulary: defaultdict[str, Counter] = defaultdict(Counter)
+    scripts: defaultdict[str, Counter] = defaultdict(Counter)
+    for texts in text_batches:
+        texts = [clean_text(text) for text in texts]
+        for text, (language, probability) in zip(texts, predict_top(model, texts)):
+            if probability >= args.vocab_min_confidence:
+                vocabulary[family(language)].update(set(latin_words(text)))
+                scripts[language].update(word_scripts(text))
+    return vocabulary, {language: counts.most_common(1)[0][0] for language, counts in scripts.items() if counts}
+
+
+def build_vocabulary(args: argparse.Namespace, model) -> tuple[dict[str, Counter], dict[str, str]]:
+    def batches():
+        for path in args.inputs:
+            with path.open("rb") as source:
+                for line_number, line in enumerate(tqdm(source, desc=f"Vocabulary {path.name}", unit="rows"), 1):
+                    if args.limit and line_number > args.limit:
+                        break
+                    yield [interest.get("actual_activity") for interest in orjson.loads(line)["interests"]]
+    return fit_vocabulary(batches(), model, args)
+
+
+def check_interest(name: str, activity: str, prediction: tuple[str, float], vocabulary: dict[str, Counter],
+                   language_script: dict[str, str], model, args: argparse.Namespace) -> str | None:
+    """Drop reason when the activity is not written in the interest name's language, else None."""
+    if ACRONYM.match(name):
+        return None
+    activity_scripts = word_scripts(activity)
+    letters = name_scripts(name)
+    if not activity_scripts or not letters:
+        return None
+    language, probability = prediction
+    expected = language_script.get(language) if probability >= args.min_confidence else None
+    # fastText can name a language whose script hardly occurs (Thai artist names in an English sentence).
+    if expected is not None and activity_scripts[expected] * 2 < sum(activity_scripts.values()):
+        expected = None
+    if expected is None:
+        return None if letters & set(activity_scripts) else "script_mismatch"
+    if expected not in letters or (expected == "latin" and letters != {"latin"}):
+        return "script_mismatch"
+    if expected != "latin" or probability < args.min_activity_confidence or len(name.split()) < 2:
+        return None
+    words = latin_words(name)
+    (name_language, name_probability), = predict_top(model, [name])
+    if not words or name_probability < args.min_name_confidence or family(name_language) == family(language):
+        return None
+    name_vocabulary = vocabulary.get(family(name_language), Counter())
+    activity_vocabulary = vocabulary.get(family(language), Counter())
+    if any(name_vocabulary[word] < args.min_vocab_count for word in words) \
+            or any(activity_vocabulary[word] >= args.min_vocab_count for word in words):
+        return None
+    return "language_mismatch"
+
+
+def detect(args: argparse.Namespace, detected_path: Path) -> dict:
     model = load_model(args.model)
     t2s, s2t = load_opencc()
+    vocabulary, language_script = build_vocabulary(args, model)
     rng = random.Random(args.seed)
-    overall = new_sbs_stats()
-    per_input = {path.name: new_sbs_stats() for path in args.inputs}
-    output_stats = {"languages": Counter(), "rows_by_locale": Counter(), "removed_by_locale": Counter(),
-                    "kept_locale_counts": Counter()}
+    stats = {"rows": Counter(), "interest_checks": Counter(), "rows_dropped": Counter(),
+             "kept_languages": Counter(), "activity_languages": Counter()}
     samples: defaultdict[str, list[dict]] = defaultdict(list)
     seen_per_category: Counter[str] = Counter()
 
@@ -215,49 +277,42 @@ def detect_all(args: argparse.Namespace, detected_path: Path) -> tuple[dict, dic
                     if args.limit and line_number > args.limit:
                         break
                     record = orjson.loads(line)
-                    gpt_locale = record.get("predicted_content_locale") or "en"
-                    detected, stats = detect_row_language(record["signals"], model, t2s, s2t, args)
-                    record["predicted_content_locale"] = detected
-
-                    output_language, output_votes = detect_output_language(
-                        record.get("interests") or [], model, t2s, s2t, args)
-                    output_stats["languages"][output_language] += 1
-                    output_stats["rows_by_locale"][detected] += 1
-                    if args.keep_non_en_output or keeps_output(output_language):
-                        destination.write(orjson.dumps(record) + b"\n")
-                        output_stats["kept_locale_counts"][detected] += 1
-                    else:
-                        output_stats["removed_by_locale"][detected] += 1
-                        add_sample(samples, seen_per_category, "dropped_non_en_output", {
-                            "input": path.name, "line": line_number, "user_hash": record["user_hash"],
-                            "category": "dropped_non_en_output", "detected": detected,
-                            "output_language": output_language, **output_votes,
-                            "actual_activity": [i.get("actual_activity", "")[:160] for i in record["interests"][:10]],
-                        }, args.samples_per_category, rng)
-
-                    category = sbs_category(gpt_locale, detected)
-                    add_sbs(overall, gpt_locale, detected, category)
-                    add_sbs(per_input[path.name], gpt_locale, detected, category)
-                    if category.startswith("agree"):
+                    stats["rows"]["scanned"] += 1
+                    interests = record["interests"]
+                    activities = [clean_text(i["actual_activity"]) for i in interests]
+                    reasons: set[str] = set()
+                    for interest, activity, prediction in zip(interests, activities, predict_top(model, activities)):
+                        stats["activity_languages"][prediction[0]] += 1
+                        reason = check_interest(clean_text(interest["interest_name"]), activity, prediction,
+                                                vocabulary, language_script, model, args)
+                        stats["interest_checks"][reason or "consistent"] += 1
+                        if reason:
+                            reasons.add(reason)
+                            add_sample(samples, seen_per_category, reason, {
+                                "category": reason, "input": path.name, "line": line_number,
+                                "interest_name": interest["interest_name"], "actual_activity": activity,
+                                "activity_language": prediction[0],
+                                "activity_confidence": round(prediction[1], 4)}, args.samples_per_category, rng)
+                    if reasons:
+                        stats["rows_dropped"].update(reasons)
+                        stats["rows"]["dropped_inconsistent_language"] += 1
                         continue
-                    add_sample(samples, seen_per_category, category, {
-                        "input": path.name, "line": line_number, "user_hash": record["user_hash"],
-                        "category": category, "gpt": gpt_locale if gpt_locale != "en" else "(omitted)",
-                        "detected": detected, **stats,
-                        "actions": [s.get("Action", "")[:120] for s in record["signals"][:15]],
-                    }, args.samples_per_category, rng)
-    return overall, per_input, output_stats, samples
+                    language, _ = detect_row_language(record["signals"], model, t2s, s2t, args)
+                    stats["kept_languages"][language] += 1
+                    destination.write(orjson.dumps({"user_hash": record["user_hash"], "language": language,
+                                                    "signals": record["signals"], "interests": interests}) + b"\n")
+    return {"stats": stats, "samples": samples, "language_script": language_script}
 
 
 def filter_and_shuffle(detected_path: Path, output: Path, counts: Counter, min_rows: int,
                        seed: int) -> tuple[set[str], int]:
-    """Drop rare-locale rows, then write the kept rows in a seeded random order."""
-    keep = {locale for locale, rows in counts.items() if rows >= min_rows}
+    """Drop rare-language rows (min_rows > 0), then write the kept rows in a seeded random order."""
+    keep = {language for language, rows in counts.items() if rows >= min_rows}
     offsets: list[int] = []
     with detected_path.open("rb") as source:
         position = 0
-        for line in tqdm(source, desc="Filtering rare locales", unit="rows"):
-            if orjson.loads(line)["predicted_content_locale"] in keep:
+        for line in tqdm(source, desc="Collecting rows", unit="rows"):
+            if orjson.loads(line)["language"] in keep:
                 offsets.append(position)
             position += len(line)
     random.Random(seed).shuffle(offsets)
@@ -275,67 +330,75 @@ def run(args: argparse.Namespace) -> dict:
     args.output.parent.mkdir(parents=True, exist_ok=True)
     detected_path = args.output.with_suffix(args.output.suffix + ".detected.tmp")
     try:
-        overall, per_input, output_stats, samples = detect_all(args, detected_path)
-        kept_counts = output_stats["kept_locale_counts"]
-        keep, kept = filter_and_shuffle(detected_path, args.output, kept_counts, args.min_locale_rows, args.seed)
+        result = detect(args, detected_path)
+        stats = result["stats"]
+        keep, kept = filter_and_shuffle(detected_path, args.output, stats["kept_languages"], args.min_locale_rows,
+                                        args.seed)
     finally:
         detected_path.unlink(missing_ok=True)
 
-    rows = overall["rows"]
-    removed_output = sum(output_stats["removed_by_locale"].values())
-    rows_by_locale = output_stats["rows_by_locale"]
+    rows = stats["rows"]["scanned"]
+    checks = stats["interest_checks"]
+    interests = sum(checks.values())
+    fraction = lambda count, total: round(count / total, 6) if total else 0.0  # noqa: E731
     summary = {
         "inputs": [str(path) for path in args.inputs],
         "output_path": str(args.output),
         "params": {k: getattr(args, k) for k in (
-            "min_confidence", "min_count", "min_share", "min_latin_words", "min_non_latin_chars", "min_locale_rows",
-            "keep_non_en_output")},
-        "rows_detected": rows,
+            "min_confidence", "min_count", "min_share", "min_activity_confidence", "min_name_confidence",
+            "vocab_min_confidence", "min_vocab_count", "min_locale_rows", "seed")},
+        "rows_scanned": rows,
         "rows_kept": kept,
-        "rows_removed_non_en_output": removed_output,
-        "rows_removed_rare_locale": rows - removed_output - kept,
-        "kept_locales": {k: v for k, v in kept_counts.most_common() if k in keep},
-        "dropped_locales": {k: v for k, v in kept_counts.most_common() if k not in keep},
-        "output_language_filter": {
-            "fields": list(OUTPUT_TEXT_FIELDS),
-            "output_language_counts": dict(output_stats["languages"].most_common()),
-            "removed_by_detected_locale": {
-                k: {"rows": v, "fraction": round(v / rows_by_locale[k], 6)}
-                for k, v in output_stats["removed_by_locale"].most_common()},
-        },
-        "sbs_before_locale_filter": {"overall": format_sbs(overall, args.top_pairs),
-                                     **{name: format_sbs(stats, args.top_pairs) for name, stats in per_input.items()}},
+        "rows_removed_inconsistent_language": stats["rows"]["dropped_inconsistent_language"],
+        "rows_removed_rare_language": rows - stats["rows"]["dropped_inconsistent_language"] - kept,
+        "row_drop_reasons_nonexclusive": {k: {"rows": v, "fraction": fraction(v, rows)}
+                                          for k, v in stats["rows_dropped"].most_common()},
+        "interest_checks": {k: {"interests": v, "fraction": fraction(v, interests)} for k, v in checks.most_common()},
+        "kept_languages": {k: v for k, v in stats["kept_languages"].most_common() if k in keep},
+        "dropped_languages": {k: v for k, v in stats["kept_languages"].most_common() if k not in keep},
+        "activity_languages": dict(stats["activity_languages"].most_common(40)),
+        "language_script": dict(sorted(result["language_script"].items())),
     }
-    summary_path = args.output.with_name(args.output.stem + ".sbs_summary.json")
+    summary_path = args.output.with_name(args.output.stem + ".summary.json")
     summary_path.write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-    samples_path = args.output.with_name(args.output.stem + ".sbs_samples.jsonl")
+    samples_path = args.output.with_name(args.output.stem + ".samples.jsonl")
     with samples_path.open("wb") as destination:
-        for category in sorted(samples):
-            for sample in samples[category]:
+        for category in sorted(result["samples"]):
+            for sample in result["samples"][category]:
                 destination.write(orjson.dumps(sample) + b"\n")
     return summary
+
+
+def add_consistency_arguments(parser: argparse.ArgumentParser) -> None:
+    """Options of check_interest / fit_vocabulary (also used by the Layer 2 / 3 cleaners)."""
+    parser.add_argument("--min-activity-confidence", type=float, default=0.9,
+                        help="Min fastText probability of an activity's language for the Latin language check")
+    parser.add_argument("--min-name-confidence", type=float, default=0.9,
+                        help="Min fastText probability of a name's language for the Latin language check")
+    parser.add_argument("--vocab-min-confidence", type=float, default=0.9,
+                        help="Min fastText probability for an activity to add its words to the language vocabulary")
+    parser.add_argument("--min-vocab-count", type=int, default=20,
+                        help="Activities a word must occur in to count as a word of that language family")
 
 
 def parse_args() -> argparse.Namespace:
     default_model = Path(__file__).resolve().parents[2] / "models" / "lid.176.bin"
     parser = argparse.ArgumentParser(
-        description="Per-row language detection for step1 L1 data, GPT SBS, merge inputs, and drop rare locales.")
+        description="Tag L1 row language, drop interests whose activity and name languages differ, merge and shuffle.")
     parser.add_argument("--inputs", required=True, nargs="+", type=Path, help="step1 cleaned JSONL files to merge")
-    parser.add_argument("--output", required=True, type=Path, help="Merged output JSONL with detected locale")
+    parser.add_argument("--output", required=True, type=Path, help="Merged output JSONL")
     parser.add_argument("--model", type=Path, default=default_model, help=f"fastText lid.176.bin (default: {default_model})")
     parser.add_argument("--min-confidence", type=float, default=0.5, help="Min fastText probability per Action")
-    parser.add_argument("--min-count", type=int, default=1, help="Min Actions for the winning language")
-    parser.add_argument("--min-share", type=float, default=0.8, help="Min share of tagged Actions for the winning language")
+    parser.add_argument("--min-count", type=int, default=1, help="Min Actions for the winning row language")
+    parser.add_argument("--min-share", type=float, default=0.8, help="Min share of tagged Actions for the row language")
     parser.add_argument("--min-latin-words", type=int, default=0, help="Min Latin words for a Latin-script Action to be tagged")
     parser.add_argument("--min-non-latin-chars", type=int, default=0, help="Min non-Latin letters to treat an Action as non-Latin script")
-    parser.add_argument("--min-locale-rows", type=int, default=1000,
-                        help="After merging, drop rows whose locale has fewer than this many kept rows (default: 1000)")
-    parser.add_argument("--keep-non-en-output", action="store_true",
-                        help="Keep rows whose actual_activity/inferred_intent language is not English (default: drop)")
-    parser.add_argument("--samples-per-category", type=int, default=100, help="Disagreement samples kept per SBS category")
-    parser.add_argument("--top-pairs", type=int, default=40, help="Top GPT-vs-detected pairs in the summary")
+    add_consistency_arguments(parser)
+    parser.add_argument("--min-locale-rows", type=int, default=0,
+                        help="Drop rows whose language has fewer than this many kept rows (default: 0 = keep all)")
+    parser.add_argument("--samples-per-category", type=int, default=200, help="Review samples kept per drop reason")
     parser.add_argument("--limit", type=int, default=0, help="Process only the first N rows of each input (0 = all)")
-    parser.add_argument("--seed", type=int, default=0, help="Seed for SBS sampling and the output row shuffle")
+    parser.add_argument("--seed", type=int, default=0, help="Seed for review sampling and the output row shuffle")
     args = parser.parse_args()
     if args.output.resolve() in {path.resolve() for path in args.inputs}:
         parser.error("--output must differ from every input")
@@ -345,9 +408,8 @@ def parse_args() -> argparse.Namespace:
 def main() -> None:
     summary = run(parse_args())
     print(json.dumps({k: summary[k] for k in (
-        "rows_detected", "rows_kept", "rows_removed_non_en_output", "rows_removed_rare_locale", "kept_locales",
-        "dropped_locales")},
-        ensure_ascii=False, indent=2))
+        "rows_scanned", "rows_kept", "rows_removed_inconsistent_language", "rows_removed_rare_language",
+        "row_drop_reasons_nonexclusive", "kept_languages")}, ensure_ascii=False, indent=2))
 
 
 if __name__ == "__main__":
