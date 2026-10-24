@@ -1,4 +1,4 @@
-"""Layer-1 to Layer-4 user-profile inference with one Qwen3.5 V2 SFT checkpoint, reproducing the production pipeline.
+"""Layer-1 to Layer-4 user-profile inference with one Qwen3.5 V3 SFT checkpoint, reproducing the production pipeline.
 
 See README.md in this directory.
 """

@@ -7,7 +7,7 @@ import json
 
 from utils import HERE, INPUT_MARKER, PROMPT_BUDGET, dumps, layer2_keys_valid, normalize_language_tag
 
-# Must stay identical to UU_LLM/prompts/prompt_l2.md, the prompt of the V2 SFT data.
+# Must stay identical to UU_LLM/prompts/prompt_l2.md, the prompt of the V3 SFT data (decisions carry no intent).
 PROMPT = (HERE / "prompts" / "prompt_l2.md").read_text(encoding="utf-8")
 
 
@@ -239,8 +239,6 @@ def _add(decision: dict, delta_by_name: dict, cur: date) -> dict:
         "interest_name": name or delta.get("interest_name", ""),
         "actual_activity": (decision.get("actual_activity") or decision.get("merged_actual_activity")
                             or delta.get("actual_activity", "")),
-        "inferred_intent": (decision.get("inferred_intent") or decision.get("merged_inferred_intent")
-                            or delta.get("inferred_intent", "")),
         "topics": topics,
         "confidence_score": INITIAL_CONFIDENCE_MULTI if len(delta.get("topics", [])) >= 2 else INITIAL_CONFIDENCE,
         "first_detect_date": str(cur),
@@ -262,7 +260,6 @@ def _merge(decision: dict, delta_by_name: dict, snapshot_by_name: dict, cur: dat
     return {
         "interest_name": decision.get("merged_interest_name") or snapshot.get("interest_name", ""),
         "actual_activity": decision.get("merged_actual_activity") or snapshot.get("actual_activity", ""),
-        "inferred_intent": decision.get("merged_inferred_intent") or snapshot.get("inferred_intent", ""),
         "topics": topics,
         "confidence_score": _clamp(BOOST_ALPHA * float(snapshot.get("confidence_score", INITIAL_CONFIDENCE))
                                    + (1 - BOOST_ALPHA)),
@@ -315,8 +312,7 @@ def postmerge(user_id: str, date_str: str, decisions: list[dict] | None, delta: 
             item = _merge({"delta_interest_name": decision.get("delta_interest_name") or "",
                            "snapshot_interest_name": snapshot_name,
                            "merged_interest_name": target.get("interest_name", ""),
-                           "merged_actual_activity": decision.get("actual_activity") or "",
-                           "merged_inferred_intent": decision.get("inferred_intent") or ""},
+                           "merged_actual_activity": decision.get("actual_activity") or ""},
                           delta_by_name, snapshot_by_name, cur, prev)
         else:
             item = _add(decision, delta_by_name, cur)

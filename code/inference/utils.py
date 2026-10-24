@@ -63,9 +63,9 @@ def query_language(predicted_content_locale) -> dict:
 
 
 # ---------------------------------------------------------------------------
-# Copied from code/trainer/SFT/user_profile_rules.py so this directory runs on its own; keep them identical to the
-# originals. keys_valid of every task: exactly the expected keys at every level (any order) with the expected value
-# types, the "json_valid" of the rollout metrics.
+# Based on code/trainer/SFT/user_profile_rules.py so this directory runs on its own. keys_valid of every task: exactly
+# the expected keys at every level (any order) with the expected value types of the V3 SFT answers
+# (docs/V3_user_profile_dataset_schema.md), the "json_valid" of the rollout metrics.
 # ---------------------------------------------------------------------------
 
 INPUT_MARKER = "\nInput:\n"  # between the prompt and the input
@@ -111,13 +111,12 @@ def parse_json_object(text):
     return value if isinstance(value, dict) else None
 
 
+# V3: no predicted_content_locale, no topic source (rebuilt from the evidence) and no inferred_intent.
 L1_SCHEMA = {
-    "predicted_content_locale": str,
     "interests": ListOf({
+        "topics": ListOf({"evidence": ListOf(int), "topic": str}),
         "interest_name": str,
-        "topics": ListOf({"topic": str, "source": ListOf(str), "evidence": ListOf(int)}),
         "actual_activity": str,
-        "inferred_intent": str,
     }),
 }
 
@@ -126,15 +125,15 @@ def layer1_keys_valid(output):
     return matches(output, L1_SCHEMA)
 
 
-L2_DECISION_KEYS = {
+L2_DECISION_KEYS = {  # V3: no merged_inferred_intent / inferred_intent
     "merge": {"action", "delta_interest_name", "snapshot_interest_name", "merged_interest_name",
-              "merged_actual_activity", "merged_inferred_intent"},
-    "add": {"action", "delta_interest_name", "actual_activity", "inferred_intent"},
+              "merged_actual_activity"},
+    "add": {"action", "delta_interest_name", "actual_activity"},
 }
 
 
 def layer2_keys_valid(output):
-    """The V2 keys only (the trainer copy also accepts the V1 `temporal` key)."""
+    """The V3 keys only."""
     return matches(output, {"decisions": ListOf(lambda decision: (
         isinstance(decision, dict) and one_of(decision.get("action"), L2_DECISION_KEYS)
         and matches(decision, dict.fromkeys(L2_DECISION_KEYS[decision["action"]], str))))})
@@ -155,7 +154,8 @@ def l3_commercial_keys_valid(output):
 
 L4B_ATTRIBUTES = ("age_group", "gender", "estimated_income_level", "home_location", "occupation", "company",
                   "career_stage", "education_area")
-# V2 data has no age_group.signals (removed from the GPT-5.6 output), so every attribute has exactly these keys.
+# The V2 / V3 data have no age_group.signals (removed from the GPT-5.6 output), so every attribute has exactly these
+# keys.
 L4B_ATTRIBUTE_SCHEMA = {"evidence": ListOf(str), "value": str, "confidence": str, "source": str}
 
 
