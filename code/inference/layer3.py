@@ -75,8 +75,7 @@ class Commercial(Task):
             for i in interests]}
 
     def to_record(self, profile: UserProfile, answer: dict | None) -> dict:
-        return self.record(profile, interest_commercial=list((answer or {}).get("interest_commercial", [])),
-                           _query_language=profile.language)
+        return self.record(profile, interest_commercial=list((answer or {}).get("interest_commercial", [])))
 
 
 PERSONA, COMMERCIAL = Persona(), Commercial()

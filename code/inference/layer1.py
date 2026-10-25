@@ -27,8 +27,7 @@ def fit_prompt(signals: list[dict], encode) -> tuple[list[dict], list[int]]:
 
 
 def is_valid(output: dict) -> bool:
-    """Expected keys at every level (as in training); the schema also checks the string names / text, which later
-    steps lowercase."""
+    """Expected keys at every level (as in training); the schema also checks that names and text are strings."""
     return layer1_keys_valid(output)
 
 

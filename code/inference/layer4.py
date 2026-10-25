@@ -438,7 +438,7 @@ def hyper_record(profile: UserProfile, missions: list[dict], failed: bool) -> di
     missions = _dedupe_missions(missions)
     return HYPER.record(profile, enriched_interests=missions,
                         hyper_commercial_interests=[_mission_to_interest(m) for m in missions],
-                        _query_language=profile.language, **({"_failed": [HYPER.stage]} if failed else {}))
+                        **({"_failed": [HYPER.stage]} if failed else {}))
 
 
 def postprocess(layer3: dict, biography: dict, preference: dict, hyper: dict) -> dict:

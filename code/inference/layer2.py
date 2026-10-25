@@ -5,7 +5,7 @@ every class the same daily decay of 1.0, so untouched interests decay by DECAY_B
 from datetime import date, datetime
 import json
 
-from utils import HERE, INPUT_MARKER, PROMPT_BUDGET, dumps, layer2_keys_valid, normalize_language_tag
+from utils import HERE, INPUT_MARKER, PROMPT_BUDGET, dumps, layer2_keys_valid
 
 # Must stay identical to UU_LLM/prompts/prompt_l2.md, the prompt of the V3 SFT data (decisions carry no intent).
 PROMPT = (HERE / "prompts" / "prompt_l2.md").read_text(encoding="utf-8")
@@ -48,7 +48,8 @@ def fit_prompt(snapshot: list[dict], delta: list[dict], encode) -> tuple[list[in
 
 
 def is_valid(output: dict) -> bool:
-    """Expected keys and string values for every decision (as in training), which postmerge lowercases."""
+    """Expected keys and string values for every decision (as in training); postmerge matches names
+    case-insensitively."""
     return layer2_keys_valid(output)
 
 
@@ -337,8 +338,5 @@ def postmerge(user_id: str, date_str: str, decisions: list[dict] | None, delta: 
 
     interests += [_decay(dict(i), cur, prev) for i in (prev_snapshot or {}).get("interests", [])
                   if i.get("interest_name", "").lower() not in consumed]
-    # _resolve_predicted_content_locale: this window's Layer-1 locale, else the previous snapshot's.
-    locale = (normalize_language_tag(delta.get("predicted_content_locale"))
-              or normalize_language_tag((prev_snapshot or {}).get("predicted_content_locale")))
-    return {"user_id": user_id, "date": date_str, "layer": "layer2_postmerge", "interests": _prune_sort(interests),
-            **({"predicted_content_locale": locale} if locale else {})}
+    # V3 Layer 1 predicts no content locale, so the snapshot carries none.
+    return {"user_id": user_id, "date": date_str, "layer": "layer2_postmerge", "interests": _prune_sort(interests)}

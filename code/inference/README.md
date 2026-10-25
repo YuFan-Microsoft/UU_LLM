@@ -119,8 +119,8 @@ merge `{action, delta_interest_name, snapshot_interest_name, merged_interest_nam
 synthetic add (`layer2_merge._backfill_missing`). If the L2 prompt is too long, the lowest-confidence snapshot
 interests are left out of the prompt only (postmerge still decays and keeps them). An
 L2 answer that never parses becomes synthetic adds, like an unparseable `layer2_merge` response.
-`_resolve_predicted_content_locale` is kept, but the V3 Layer 1 predicts no locale, so snapshots carry no
-`predicted_content_locale` and no Layer-3 / Layer-4 input has a query language.
+The V3 Layer 1 predicts no locale, so snapshots carry no `predicted_content_locale` (production's
+`_resolve_predicted_content_locale` is dropped) and no Layer-3 / Layer-4 input has a query language.
 
 ## Layers 3 and 4
 
@@ -143,7 +143,7 @@ the two postprocessing records copy the snapshot, so they keep its `date` (the u
 Payloads follow the V3 SFT data (`docs/V3_user_profile_dataset_schema.md`) with the user-context fields empty, as in
 the rows without user context: `{}` for declared attributes and facts, `""` for the personal / professional
 context. No input carries an inferred intent or a query language: V3 answers are written in the language of their
-evidence (the records still carry `_query_language`, which falls back to `en`). A hyper answer is accepted (else
+evidence, and the records carry no `_query_language`. A hyper answer is accepted (else
 retried) only when every mission's source interests are input interests (the production enhancement retries
 otherwise, and the cleaning drops such rows). Each mission then keeps its resolved source interests and valid
 scenarios, the queries that pass the trainer's rollout rules (no word-count or query-count limit, like the prompt and
@@ -265,7 +265,7 @@ For the windows where some user's final snapshot was built: `layer3_persona`, `l
 `<out_dir>/final_profiles.jsonl` has one line per processed user with everything needed for evaluation:
 `user_id`, `profile_date` (last grid window), `last_update` (window of the user's last profile update), the raw
 `past_behaviors` and `future_behaviors` from the input, and the user's `layer4_postprocessing` profile:
-`predicted_content_locale` (always empty for a V3 model), `interests` (the Layer-2 interests with confidence ≥ 0.2, enriched with persona,
+`interests` (the Layer-2 interests with confidence ≥ 0.2, enriched with persona,
 category and commercial fields, followed by the `hyper_commercial` missions), `biography`, `life_stage`,
 `user_attributes`, `commercial_preferences` and `enriched_commercial_interests`. Everything is empty if the user never
 had a Layer-1 interest. The ungated Layer-2 snapshot stays in `layer2_postmerge.jsonl`.

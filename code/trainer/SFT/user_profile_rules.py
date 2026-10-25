@@ -882,8 +882,12 @@ TASK_CHECKERS = {
 # LANGUAGE_METRIC_ONLY stages).
 # ---------------------------------------------------------------------------
 
-LID_MODEL_PATH = Path(os.environ.get("LID_MODEL_PATH",
-                                     Path(__file__).resolve().parents[3] / "models" / "lid.176.bin"))
+# UU_LLM/models/lid.176.bin: the repository root is the first ancestor with code/ and pyscript/, so the copy in
+# code/inference/ finds the same file.
+REPO_ROOT = next((parent for parent in Path(__file__).resolve().parents
+                  if (parent / "code").is_dir() and (parent / "pyscript").is_dir()),
+                 Path(__file__).resolve().parents[3])
+LID_MODEL_PATH = Path(os.environ.get("LID_MODEL_PATH", REPO_ROOT / "models" / "lid.176.bin"))
 LID_MODEL_URL = "https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin"
 LID_MIN_CONFIDENCE = 0.5
 LID_MIN_SHARE = 0.6

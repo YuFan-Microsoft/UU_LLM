@@ -4,17 +4,17 @@ from datetime import date, timedelta
 import json
 import os
 from pathlib import Path
-import re
 import subprocess
 import zlib
 
 HERE = Path(__file__).resolve().parent
 
-# maiprofilev3dev default signal_source_priority (config.py): every production source. The V2 SFT data comes from a run
-# restricted to MSN,Bing,Ads,Shopping,Uet,Edge,ChromeImports, so Copilot / LinkedIn / LinkedInCA are unseen in training.
+# maiprofilev3dev default signal_source_priority (config.py): every production source. The V2 / V3 SFT data come from
+# a run restricted to MSN,Bing,Ads,Shopping,Uet,Edge,ChromeImports, so Copilot / LinkedIn / LinkedInCA are unseen in
+# training.
 SOURCE_RANK = {source: rank for rank, source in enumerate(  # signal_source_priority, best first
     ["MSN", "Bing", "Copilot", "Ads", "Shopping", "Uet", "Edge", "ChromeImports", "LinkedIn", "LinkedInCA"])}
-MAX_SIGNAL_ACTIONS = 200        # max_signal_actions (--max-user-actions of the V2 SFT run; production default 1000)
+MAX_SIGNAL_ACTIONS = 200        # max_signal_actions (--max-user-actions of the SFT runs; production default 1000)
 MAX_ACTION_CHARS = 128          # data_reader.clean_signals
 MIN_VALID_DATE = "2025-01-01"   # data_reader.MIN_VALID_DATE
 
@@ -28,38 +28,6 @@ PROMPT_BUDGET = MAX_MODEL_LEN - MIN_OUTPUT_TOKENS
 def dumps(value) -> str:
     """Minified JSON with raw UTF-8, as the SFT data was written."""
     return json.dumps(value, ensure_ascii=False, separators=(",", ":"))
-
-
-# ---------------------------------------------------------------------------
-# Production modules/query_language.py. There is no user context (Market) here, so the query language is
-# the snapshot's predicted_content_locale, else English.
-# ---------------------------------------------------------------------------
-
-_COMPACT_BCP47 = re.compile(r"^(?P<language>[A-Za-z]{2,3})(?:-(?P<script>[A-Za-z]{4}))?(?:-(?P<region>[A-Za-z]{2}|[0-9]{3}))?$")
-
-
-def normalize_language_tag(value) -> str | None:
-    """normalize_language_tag: a canonical compact BCP-47 tag, or None when invalid (or "mul" / "und"). The Layer-1
-    SFT labels also use "mix" (no single dominant language), which the production pipeline never produces; it is
-    treated like no detected locale, so the query language falls back to the previous locale or English ("mix" never
-    occurs as a query language in the L3 / L4 SFT data)."""
-    if not isinstance(value, str):
-        return None
-    match = _COMPACT_BCP47.fullmatch(value.strip())
-    if not match or match["language"].lower() in {"mul", "und", "mix"}:
-        return None
-    parts = [match["language"].lower()]
-    if match["script"]:
-        parts.append(match["script"].title())
-    if match["region"]:
-        parts.append(match["region"].upper() if match["region"].isalpha() else match["region"])
-    return "-".join(parts)
-
-
-def query_language(predicted_content_locale) -> dict:
-    """resolve_query_language({}, locale).state(): {"locale", "source"}."""
-    detected = normalize_language_tag(predicted_content_locale)
-    return {"locale": detected, "source": "predicted_content_locale"} if detected else {"locale": "en", "source": "default"}
 
 
 # ---------------------------------------------------------------------------
