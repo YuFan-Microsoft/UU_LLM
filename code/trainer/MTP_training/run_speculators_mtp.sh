@@ -1,33 +1,51 @@
 #!/bin/sh
 # Finetune the MTP head of an SFT Qwen3.5 checkpoint with vLLM Speculators and stitch it back for vLLM serving.
+# Model-size launchers: run_speculators_mtp_4B.sh / run_speculators_mtp_2B.sh (V3 SFT checkpoints).
 #
 # Stages (STAGES, default all, in order):
-#   generate  vLLM env: the SFT model answers the SFT train prompts (on-policy data)  -> $WORK_DIR/self_distill/
+#   merge     the official mtp.* of MTP_SOURCE are added to SFT_CHECKPOINT             -> $VERIFIER
+#             (code/inference/merge_official_mtp.py; skipped when VERIFIER already exists)
+#   generate  vLLM env: the SFT model answers the V3 SFT train prompts (on-policy data) -> $WORK_DIR/self_distill/
 #   prepare   Speculators env: tokenized rows -> Speculators dataset                  -> $WORK_DIR/data/
 #   train     vLLM serves last-layer hidden states on VLLM_GPUS; train_mtp.py trains
 #             the MTP head on TRAIN_GPUS (online, nothing cached on disk)             -> $WORK_DIR/checkpoints/
 #   stitch    the finetuned mtp.* replace the official ones in a copy of VERIFIER     -> $STITCHED_DIR
 #   check     check_mtp_weights.py: 15 mtp.* tensors present, right shape, finite, changed vs VERIFIER
 #
-# VERIFIER must already contain the official MTP head (code/inference/merge_official_mtp.py); it initializes the
-# finetuning. Serve the result with: --speculative-config '{"method": "mtp", "num_speculative_tokens": k}'.
+# VERIFIER (the SFT checkpoint with the official MTP head) initializes the finetuning: give SFT_CHECKPOINT (an SFT
+# checkpoint saved without mtp.*; VERIFIER defaults to <SFT_CHECKPOINT>_official_mtp and is built by the merge stage)
+# or an existing VERIFIER. Serve the result with: --speculative-config '{"method": "mtp", "num_speculative_tokens": k}'.
 set -eu
 
 SCRIPT_DIR=$(cd "$(dirname "$0")" && pwd)
 SPECULATORS_COMMIT=55ebbd5b9b49e9bd223f47949c986aa4abfffbc3  # keep in sync with requirements_speculators.txt
 QWEN3_5_OVERRIDES='{"architectures": ["Qwen3_5ForConditionalGeneration"]}'
 
-VERIFIER=${VERIFIER:-/yufan/MAI_Profile/checkpoints/unified_slm/Cur_SOTA_epoch_0_step_9000_ppl_1.2713_official_mtp}
+SFT_CHECKPOINT=${SFT_CHECKPOINT:-}
+SFT_CHECKPOINT=${SFT_CHECKPOINT%/}
+if [ -z "${VERIFIER:-}" ]; then
+    if [ -z "$SFT_CHECKPOINT" ]; then
+        echo "Set SFT_CHECKPOINT (an SFT checkpoint without mtp.*) or VERIFIER (one with the official MTP head)" >&2
+        exit 1
+    fi
+    VERIFIER=${SFT_CHECKPOINT}_official_mtp
+fi
+VERIFIER=${VERIFIER%/}
+MTP_SOURCE=${MTP_SOURCE:-/yufan/open_source_models/Qwen3.5_VLM/Qwen3.5-4B}  # official model of the same size
 WORK_DIR=${WORK_DIR:-./output/mtp_$(basename "$VERIFIER")}
 STITCHED_DIR=${STITCHED_DIR:-${VERIFIER%_official_mtp}_trained_mtp}
-STAGES=${STAGES:-"generate prepare train stitch check"}
+STAGES=${STAGES:-"merge generate prepare train stitch check"}
 
 # Python of each environment (they can be the same if the versions are compatible).
 VLLM_PYTHON=${VLLM_PYTHON:-python3}   # vllm==0.28.0 (SFT/requirements_inference.txt)
 SPEC_PYTHON=${SPEC_PYTHON:-python3}   # requirements_speculators.txt
 SPECULATORS_REPO=${SPECULATORS_REPO:-$WORK_DIR/speculators}  # for scripts/launch_vllm.py
 
-# Data generation (defaults follow run_inference.py; the MAIProfile client currently uses temperature 0.2).
+# Data generation (defaults follow run_inference.py; the MAIProfile client currently uses temperature 0.2). CONFIGS are
+# the eight V3 SFT tasks.
+CONFIGS=${CONFIGS:-"V3_User_Profile_L1_gpt56 V3_User_Profile_L1_Negative_gpt56 V3_User_Profile_L2_gpt56 \
+V3_User_Profile_L3_Persona_gpt56 V3_User_Profile_L3_Commercial_gpt56 V3_User_Profile_L4_Biography_gpt56 \
+V3_User_Profile_L4_CommercialPreference_gpt56 V3_User_Profile_L4_Hyper_gpt56"}
 SAMPLES_PER_CONFIG=${SAMPLES_PER_CONFIG:-2000}
 TEMPERATURE=${TEMPERATURE:-0.6}
 TOP_P=${TOP_P:-0.8}
@@ -63,14 +81,28 @@ has_stage() { case " $STAGES " in *" $1 "*) return 0 ;; *) return 1 ;; esac; }
 log() { echo "=== [$(date '+%H:%M:%S')] $*"; }
 
 mkdir -p "$WORK_DIR"
+echo "SFT_CHECKPOINT=${SFT_CHECKPOINT:-<not set>}  MTP_SOURCE=$MTP_SOURCE"
 echo "VERIFIER=$VERIFIER"
 echo "WORK_DIR=$WORK_DIR  STITCHED_DIR=$STITCHED_DIR  STAGES=$STAGES"
 echo "GPUs: all=$ALL_GPUS  vLLM=$VLLM_GPUS  train=$TRAIN_GPUS"
 
+if has_stage merge; then
+    if [ -e "$VERIFIER" ]; then
+        log "merge: $VERIFIER exists, skipped"
+    elif [ -z "$SFT_CHECKPOINT" ]; then
+        echo "merge: $VERIFIER does not exist; set SFT_CHECKPOINT to build it" >&2
+        exit 1
+    else
+        log "merge: official mtp.* of $MTP_SOURCE + $SFT_CHECKPOINT -> $VERIFIER"
+        "$VLLM_PYTHON" "$SCRIPT_DIR/../../inference/merge_official_mtp.py" \
+            --checkpoint "$SFT_CHECKPOINT" --output_dir "$VERIFIER" --mtp_source "$MTP_SOURCE"
+    fi
+fi
+
 if has_stage generate; then
     log "generate: on-policy responses from the SFT model"
     CUDA_VISIBLE_DEVICES=$ALL_GPUS "$VLLM_PYTHON" "$SCRIPT_DIR/generate_self_distill_data.py" \
-        --checkpoint "$VERIFIER" --output_dir "$WORK_DIR/self_distill" \
+        --checkpoint "$VERIFIER" --output_dir "$WORK_DIR/self_distill" --configs $CONFIGS \
         --samples_per_config "$SAMPLES_PER_CONFIG" --temperature "$TEMPERATURE" --top_p "$TOP_P" \
         --max_model_len "$SEQ_LEN"
 fi
