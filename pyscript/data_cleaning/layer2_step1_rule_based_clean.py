@@ -1,23 +1,23 @@
 #!/usr/bin/env python3
-"""Clean the merged Layer 2 (merge) dataset (one JSONL line per user-day).
+"""Clean the merged GPT-5.6 Final Layer 2 (merge) dataset (one JSONL line per user-day-window).
 
 Input line format (layer2_step0_merge_end2end_dataset.py output):
     {"user_hash",
      "input":  {"snapshot": [{"interest_name", "actual_activity", "topics": [str]}],
                 "delta":    [{"interest_name", "actual_activity", "topics": [str]}]},
      "output": {"decisions": [{"action": "merge", "delta_interest_name", "snapshot_interest_name",
-                               "merged_interest_name", "merged_actual_activity", "merged_inferred_intent"}
-                              | {"action": "add", "delta_interest_name", "actual_activity",
-                                 "inferred_intent"}]}}
+                               "merged_interest_name", "merged_actual_activity"}
+                              | {"action": "add", "delta_interest_name", "actual_activity"}]}}
 
 Any row that violates a rule is dropped. Kept rows are written as:
     {"user_hash", "snapshot", "delta", "decisions"}
-Decisions carry no `temporal` and no `reasoning` (step0 already removed `reasoning`).
+Decisions carry no intent and no `reasoning` (step0 removed both).
 
 Name references (delta_interest_name / snapshot_interest_name) must match the
 input exactly; name collisions are checked case- and punctuation-insensitively.
-The English check reuses the Layer-1 step2 fastText voting over every decision's
-activity and intent sentences.
+Names and activities may be in any language; rule C checks that each resulting interest's activity is written in the
+language of its name with the Layer-1 step2 consistency check (layer1_step2_language_detection.check_interest; the
+vocabulary is fitted on every decision activity in a first pass).
 """
 
 import argparse
@@ -38,19 +38,10 @@ import layer1_step2_language_detection as language  # noqa: E402
 
 DECISION_KEYS = {
     "merge": {"action", "delta_interest_name", "snapshot_interest_name", "merged_interest_name",
-              "merged_actual_activity", "merged_inferred_intent"},
-    "add": {"action", "delta_interest_name", "actual_activity", "inferred_intent"},
+              "merged_actual_activity"},
+    "add": {"action", "delta_interest_name", "actual_activity"},
 }
-TEXT_KEYS = {
-    "merge": ("merged_interest_name", "merged_actual_activity", "merged_inferred_intent"),
-    "add": ("delta_interest_name", "actual_activity", "inferred_intent"),
-}
-SENTENCE_KEYS = {
-    "merge": ("merged_actual_activity", "merged_inferred_intent"),
-    "add": ("actual_activity", "inferred_intent"),
-}
-# Letters outside the Latin script (CJK, Cyrillic, Greek, Arabic, ...); symbols and accented Latin pass.
-NON_LATIN_LETTER = language.NON_LATIN_LETTER
+ACTIVITY_KEY = {"merge": "merged_actual_activity", "add": "actual_activity"}
 # Result names that are catch-all buckets rather than interests (broad but real interests such as Sports,
 # Travel or Online Shopping are allowed). Matched on the normalized full name.
 UMBRELLA_NAMES = {
@@ -74,9 +65,9 @@ RULES = {
     "add_name_matches_snapshot": "An added interest has the same normalized name as a snapshot interest",
     "result_name_collides_snapshot": "A merged/added name equals an untouched snapshot interest's name",
     "duplicate_result_name": "Two resulting interests share the same normalized name",
-    # C. English output
-    "non_latin_output_text": "A decision name/activity/intent contains non-Latin letters",
-    "non_english_output": "fastText vote over activity/intent sentences is not English",
+    # C. language
+    "inconsistent_language": "A merged/added activity is not written in the language of its resulting name "
+                             "(script_mismatch / language_mismatch of the Layer-1 step2 check)",
     # D. naming
     "umbrella_name": "A merged/added name is a catch-all bucket (see UMBRELLA_NAMES)",
 }
@@ -166,22 +157,35 @@ def structural_violations(record: dict) -> set[str]:
     return reasons
 
 
-def language_violations(decisions: list, model, t2s, s2t, args: argparse.Namespace) -> set[str]:
-    """Rule C: every output name/activity/intent must be English."""
-    reasons: set[str] = set()
-    sentences: list[str] = []
-    for decision in decisions:
+def decision_texts(decisions) -> list[tuple[str, str]]:
+    """(resulting name, activity) of every well-formed decision."""
+    pairs = []
+    for decision in decisions if isinstance(decisions, list) else []:
         action = decision.get("action") if isinstance(decision, dict) else None
-        if action not in TEXT_KEYS:
-            continue
-        if any(NON_LATIN_LETTER.search(str(decision.get(key) or "")) for key in TEXT_KEYS[action]):
-            reasons.add("non_latin_output_text")
-        sentences += [decision.get(key) for key in SENTENCE_KEYS[action]]
-    output_language, _ = language.vote_language(
-        language.reliable_texts(sentences, args), model, t2s, s2t, args, no_vote_label="none")
-    if not language.keeps_output(output_language):
-        reasons.add("non_english_output")
-    return reasons
+        if action in ACTIVITY_KEY and has_text(result_name(decision)) and has_text(decision.get(ACTIVITY_KEY[action])):
+            pairs.append((result_name(decision), decision[ACTIVITY_KEY[action]]))
+    return pairs
+
+
+def language_violations(decisions: list, vocabulary, language_script, model, args: argparse.Namespace) -> set[str]:
+    """Rule C: each resulting activity is written in the language of its resulting name."""
+    pairs = decision_texts(decisions)
+    activities = [language.clean_text(activity) for _, activity in pairs]
+    for (name, _), activity, prediction in zip(pairs, activities, language.predict_top(model, activities)):
+        if language.check_interest(language.clean_text(name), activity, prediction, vocabulary, language_script,
+                                   model, args):
+            return {"inconsistent_language"}
+    return set()
+
+
+def fit_language(args: argparse.Namespace, model):
+    def batches():
+        with args.input.open("rb") as source:
+            for line_number, line in enumerate(tqdm(source, desc=f"Vocabulary {args.input.name}", unit="rows"), 1):
+                if args.limit and line_number > args.limit:
+                    break
+                yield [activity for _, activity in decision_texts(orjson.loads(line)["output"].get("decisions"))]
+    return language.fit_vocabulary(batches(), model, args)
 
 
 def to_output_row(record: dict) -> dict:
@@ -195,7 +199,7 @@ def to_output_row(record: dict) -> dict:
 
 def clean(args: argparse.Namespace) -> tuple[int, int, Counter, Counter]:
     model = language.load_model(args.model)
-    t2s, s2t = language.load_opencc()
+    vocabulary, language_script = fit_language(args, model)
     rows = kept = 0
     counts: Counter[str] = Counter()
     umbrella_hits: Counter[str] = Counter()
@@ -213,7 +217,7 @@ def clean(args: argparse.Namespace) -> tuple[int, int, Counter, Counter]:
             reasons = structural_violations(record)
             decisions = record["output"].get("decisions")
             if isinstance(decisions, list):
-                reasons |= language_violations(decisions, model, t2s, s2t, args)
+                reasons |= language_violations(decisions, vocabulary, language_script, model, args)
                 if "umbrella_name" in reasons:
                     umbrella_hits.update(
                         normalize_name(result_name(d)) for d in decisions
@@ -231,7 +235,9 @@ def write_reports(report_path: Path, args: argparse.Namespace, rows: int, kept: 
     report = {
         "input_path": str(args.input),
         "output_path": str(args.output),
-        "params": {"min_confidence": args.min_confidence, "min_share": args.min_share},
+        "params": {key: getattr(args, key) for key in ("min_confidence", "min_activity_confidence",
+                                                        "min_name_confidence", "vocab_min_confidence",
+                                                        "min_vocab_count")},
         "rows_scanned": rows,
         "rows_kept": kept,
         "rows_removed": rows - kept,
@@ -255,19 +261,18 @@ def write_reports(report_path: Path, args: argparse.Namespace, rows: int, kept: 
 
 def parse_args() -> argparse.Namespace:
     default_model = Path(__file__).resolve().parents[2] / "models" / "lid.176.bin"
-    parser = argparse.ArgumentParser(description="Clean the merged GPT-5.4 Layer 2 JSONL dataset.")
-    parser.add_argument("--input", required=True, type=Path, help="Merged L2 JSONL (e.g. step0_merge_l2/en.jsonl)")
+    parser = argparse.ArgumentParser(description="Clean the merged GPT-5.6 Final Layer 2 JSONL dataset.")
+    parser.add_argument("--input", required=True, type=Path, help="step0 merged L2 JSONL")
     parser.add_argument("--output", required=True, type=Path, help="Cleaned JSONL path")
     parser.add_argument("--report", type=Path, help="Report JSON path (default: <output>.report.json)")
     parser.add_argument("--model", type=Path, default=default_model, help=f"fastText lid.176.bin (default: {default_model})")
-    parser.add_argument("--min-confidence", type=float, default=0.5, help="Min fastText probability per sentence")
-    parser.add_argument("--min-share", type=float, default=0.8, help="Min share of tagged sentences for the top language")
+    parser.add_argument("--min-confidence", type=float, default=0.5,
+                        help="Min fastText probability of an activity's language to use its writing system")
+    language.add_consistency_arguments(parser)
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N rows (0 = all)")
     args = parser.parse_args()
     if args.output.resolve() == args.input.resolve():
         parser.error("--output must differ from --input")
-    # Fixed settings shared with layer1_step2's text reliability / voting helpers.
-    args.min_count, args.min_latin_words, args.min_non_latin_chars = 1, 0, 0
     return args
 
 

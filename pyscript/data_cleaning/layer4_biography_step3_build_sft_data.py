@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Build Qwen SFT data (train/test JSONL with a `messages` column) from the
-Layer-4 biography step2 output (rule-based cleaned rows, --version v2).
+Layer-4 biography step2 output (rule-based cleaned rows, --version v2 / v3).
 
 Each row becomes:
     {"messages": [{"role": "user", "content": PROMPT + "\\nInput:\\n" + <{"declared_attributes", "facts", "interests"} JSON>},
@@ -9,7 +9,8 @@ Each row becomes:
 
 PROMPT is prompts/prompt_l4_biography.md verbatim. The input carries only per-user data (no user_id or date):
 `declared_attributes` (self-reported age_group / gender, {} when none), `facts` (any of location_data,
-linkedin_profile, market, or {}), and the teacher's `active_interests` as `interests`. The answer is the step2
+linkedin_profile, market, or {}), and the teacher's `active_interests` as `interests`, without `inferred_intent`
+(intent is no longer predicted upstream, so it is not available at inference). The answer is the step2
 output unchanged (the teacher output without confidence_score, Unknown evidence emptied). JSON is minified. Train/test
 is split by user_hash exactly as in
 layer3_commercial_step4_build_sft_data.py (--test-ratio, or --test-rows in bucket order); --test-ratio 0.0485 holds
@@ -38,11 +39,13 @@ from layer3_commercial_step4_build_sft_data import lowest_bucket_users, user_has
 
 
 PROMPT = (Path(__file__).resolve().parents[2] / "prompts" / "prompt_l4_biography.md").read_text(encoding="utf-8")
+DROPPED_INTEREST_KEYS = {"inferred_intent"}
 
 
 def payload(row_input: dict) -> dict:
     return {"declared_attributes": row_input.get("declared_attributes") or {}, "facts": row_input.get("facts") or {},
-            "interests": row_input["active_interests"]}
+            "interests": [{key: value for key, value in interest.items() if key not in DROPPED_INTEREST_KEYS}
+                          for interest in row_input["active_interests"]]}
 
 
 def input_features(row_input: dict) -> list[str]:
@@ -51,19 +54,21 @@ def input_features(row_input: dict) -> list[str]:
     return features
 
 
-def build_example(record: dict, prompt: str, build_payload: Callable[[dict], dict]) -> dict:
+def build_example(record: dict, prompt: str, build_payload: Callable[[dict], dict],
+                  build_answer: Callable[[dict], dict] | None = None) -> dict:
+    row_input = record["input"]
     return {
         "messages": [
-            {"role": "user", "content": prompt + INPUT_MARKER + dumps(build_payload(record["input"]))},
-            {"role": "assistant", "content": dumps(record["output"])},
+            {"role": "user", "content": prompt + INPUT_MARKER + dumps(build_payload(row_input))},
+            {"role": "assistant", "content": dumps(build_answer(record) if build_answer else record["output"])},
         ],
-        "user_hash": user_hash(record["input"]["user_id"]),
+        "user_hash": row_input.get("user_hash") or user_hash(row_input["user_id"]),
     }
 
 
 def parse_args(description: str) -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=description)
-    parser.add_argument("--input", required=True, type=Path, help="step2 cleaned JSONL (--version v2)")
+    parser.add_argument("--input", required=True, type=Path, help="step2 cleaned JSONL (--version v2 / v3)")
     parser.add_argument("--out-dir", required=True, type=Path, help="Directory for train.jsonl / test.jsonl")
     parser.add_argument("--test-ratio", type=float, default=0.02, help="Fraction of users held out for test")
     parser.add_argument("--test-rows", type=int, default=0,
@@ -81,8 +86,9 @@ def parse_args(description: str) -> argparse.Namespace:
 
 
 def build(description: str, prompt: str, build_payload: Callable[[dict], dict],
-          features: Callable[[dict], list[str]]) -> None:
-    """Write <out-dir>/{train,test}.jsonl and summary.json; `features` labels each row's input for the summary."""
+          features: Callable[[dict], list[str]], build_answer: Callable[[dict], dict] | None = None) -> None:
+    """Write <out-dir>/{train,test}.jsonl and summary.json; `features` labels each row's input for the summary and
+    `build_answer` maps the step2 record to the answer (default: its output unchanged)."""
     args = parse_args(description)
     args.out_dir.mkdir(parents=True, exist_ok=True)
     count_tokens = load_token_counter(args.tokenizer)
@@ -102,7 +108,7 @@ def build(description: str, prompt: str, build_payload: Callable[[dict], dict],
                 if args.limit and line_number > args.limit:
                     break
                 record = orjson.loads(line)
-                example = build_example(record, prompt, build_payload)
+                example = build_example(record, prompt, build_payload, build_answer)
                 if test_users is not None:
                     split = "test" if example["user_hash"] in test_users else "train"
                 else:

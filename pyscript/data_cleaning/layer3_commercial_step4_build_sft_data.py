@@ -3,20 +3,21 @@
 Layer-3 commercial step3 output (rule-based cleaned rows).
 
 Each row becomes:
-    {"messages": [{"role": "user", "content": PROMPT + "\\nInput:\\n" + <{"interests", "query_language"} JSON>},
+    {"messages": [{"role": "user", "content": PROMPT + "\\nInput:\\n" + <{"interests"} JSON>},
                   {"role": "assistant", "content": <{"interest_commercial": [...]} JSON>}],
      "user_hash": sha256(user_id)[:16]}
 
 PROMPT is prompts/prompt_l3_commercial.md verbatim. The input carries only per-user data (no user_id or
-date): `interests` as given to the teacher and the step2 `query_language`. JSON is minified. Train/test is
+date): `interests` as given to the teacher (GPT-5.6 Final has no query_language: entities and queries follow the
+language of the evidence actions). JSON is minified. Train/test is
 split by user_hash with the same rule as the Layer-1 builder, so a user held out in L1 / L2 is also held
 out here; --test-rows instead holds out exactly N users, taken in that rule's bucket order so the L1 / L2
-test users are still included. Rows are never filtered by length; with --tokenizer the full-chat token
-percentiles are reported.
+test users are still included. With --tokenizer the full-chat token percentiles of the written rows are
+reported, and --max-tokens drops examples longer than that (after --max-interests chunking).
 
 With --max-interests N, a user with more than N interests is split into ceil(n / N) examples of contiguous,
-near-equal interest chunks in input order (e.g. 103 -> 35 + 34 + 34). Each chunk keeps the user's
-`query_language` and the matching `interest_commercial` slice; output entries map 1:1 to input interests.
+near-equal interest chunks in input order (e.g. 103 -> 35 + 34 + 34). Each chunk keeps the matching
+`interest_commercial` slice; output entries map 1:1 to input interests.
 """
 
 from __future__ import annotations
@@ -71,7 +72,7 @@ def build_examples(record: dict, max_interests: int = 0) -> list[dict]:
     examples = []
     for interests, commercial in split_interests(
             source["interests"], record["output"]["interest_commercial"], max_interests):
-        payload = {"interests": interests, "query_language": source["query_language"]}
+        payload = {"interests": interests}
         examples.append({
             "messages": [
                 {"role": "user", "content": PROMPT + INPUT_MARKER + dumps(payload)},
@@ -91,12 +92,17 @@ def parse_args() -> argparse.Namespace:
                         help="Hold out exactly this many users for test instead of --test-ratio: the users with the "
                              "lowest (hash bucket, user_hash), so every --test-ratio test user comes first (0 = off)")
     parser.add_argument("--tokenizer", help="HF tokenizer name or path (e.g. the Qwen3.5-4B model dir) to report "
-                                            "full-chat token length percentiles; rows are never filtered by length")
+                                            "full-chat token length percentiles")
+    parser.add_argument("--max-tokens", type=int, default=0,
+                        help="Drop examples whose full-chat token length exceeds this (requires --tokenizer; 0 = keep all)")
     parser.add_argument("--max-interests", type=int, default=0,
                         help="Split a user with more interests into near-equal contiguous chunks of at most this many "
                              "interests, one example each (0 = off)")
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N rows (0 = all)")
-    return parser.parse_args()
+    args = parser.parse_args()
+    if args.max_tokens and not args.tokenizer:
+        parser.error("--max-tokens requires --tokenizer")
+    return args
 
 
 def lowest_bucket_users(path: Path, count: int, limit: int) -> set[str]:
@@ -119,7 +125,7 @@ def main() -> None:
     test_users = lowest_bucket_users(args.input, args.test_rows, args.limit) if args.test_rows else None
 
     rows = Counter()
-    languages = {"train": Counter(), "test": Counter()}
+    too_long = Counter()
     commercial = {"train": Counter(), "test": Counter()}
     users = {"train": set(), "test": set()}
     user_chars, answer_chars, token_lengths = [], [], []
@@ -140,10 +146,13 @@ def main() -> None:
                     split = "test" if is_test_user(hashed, args.test_ratio) else "train"
                 for example in examples:
                     if count_tokens:
-                        token_lengths.append(count_tokens(example["messages"]))
+                        tokens = count_tokens(example["messages"])
+                        if args.max_tokens and tokens > args.max_tokens:
+                            too_long[split] += 1
+                            continue
+                        token_lengths.append(tokens)
                     handles[split].write(orjson.dumps(example) + b"\n")
                     rows[split] += 1
-                    languages[split][record["input"]["query_language"]] += 1
                     user_chars.append(len(example["messages"][0]["content"]))
                     answer_chars.append(len(example["messages"][1]["content"]))
                 users[split].add(hashed)
@@ -162,7 +171,8 @@ def main() -> None:
         "test_ratio": None if test_users is not None else args.test_ratio,
         "test_rows": args.test_rows or None,
         "max_interests": args.max_interests or None,
-        "query_language": {split: dict(counter.most_common()) for split, counter in languages.items()},
+        "max_tokens": args.max_tokens or None,
+        "examples_dropped_over_max_tokens": dict(too_long),
         "interest_commercial": {split: dict(counter.most_common()) for split, counter in commercial.items()},
         "user_chars": length_stats(user_chars),
         "assistant_chars": length_stats(answer_chars),

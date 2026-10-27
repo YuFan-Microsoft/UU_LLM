@@ -3,10 +3,11 @@
     Biography -> CommercialPreference -> Hyper (one call: the final shopping missions with their new queries)
     -> layer4_hyper_commercial_interest record -> layer4_postprocessing (the final profile)
 
-Payloads follow the V2 SFT data (layer4_biography_step3 / layer4_commercial_preference_step3 /
-layer4_hyper_step4_build_sft_data.py and docs/V2_user_profile_dataset_schema.md), built from the production
+Payloads follow the V3 SFT data (layer4_biography_step3 / layer4_commercial_preference_step3 /
+layer4_hyper_step4_build_sft_data.py and docs/V3_user_profile_dataset_schema.md), built from the production
 (MAIProfile_Official) requests. There is no user context here: declared attributes and facts are {}, and the personal
-/ professional context sections of the hyper input are "".
+/ professional context sections of the hyper input are "". No input carries an inferred intent, and the hyper input
+has no query_language.
 """
 
 import math
@@ -64,14 +65,15 @@ class Biography(Task):
         return l4_biography_keys_valid(output)
 
     def payload(self, interests: list[dict]) -> dict:
-        """The V2 input, built as layer4_biography does (user_attributes.rank_interests / project_interest): no
-        declared attributes or facts here, and the layer3_postprocessing interests highest count first, then highest
-        confidence, each with at most 8 distinct topic names (most frequent topics first; no topics key when none)
-        and, for commercial interests only, at most 6 distinct brands, products and predicted queries each."""
+        """The V3 input (no inferred_intent), built as layer4_biography does (user_attributes.rank_interests /
+        project_interest): no declared attributes or facts here, and the layer3_postprocessing interests highest count
+        first, then highest confidence, each with at most 8 distinct topic names (most frequent topics first; no
+        topics key when none) and, for commercial interests only, at most 6 distinct brands, products and predicted
+        queries each."""
         projected = []
         for i in sorted(interests, key=lambda i: (-_float(i.get("count")), -_float(i.get("confidence_score")))):
             item = {"interest_name": i.get("interest_name"), "actual_activity": i.get("actual_activity", ""),
-                    "inferred_intent": i.get("inferred_intent", ""), "persona": i.get("persona", ""),
+                    "persona": i.get("persona", ""),
                     "confidence_score": i.get("confidence_score", 0), "count": i.get("count", 0),
                     "first_detect_date": i.get("first_detect_date", ""),
                     "last_detect_date": i.get("last_detect_date", ""), "source": i.get("source", [])}
@@ -109,7 +111,7 @@ class CommercialPreference(Task):
         return [i for i in layer3.get("interests", []) if i.get("commercial")]
 
     def payload(self, interests: list[dict], layer3: dict, biography: dict) -> dict:
-        """Layer4CommercialPreference._call_llm in the V2 layout (topics carry no intent). The V2 data always has a
+        """Layer4CommercialPreference._call_llm in the V2 / V3 layout (topics carry no intent). The data always has a
         {value, confidence, evidence} life_stage (its cleaning drops an empty one), so a failed biography call sends
         an unknown life stage rather than {}."""
         life_stage = biography.get("life_stage")
@@ -282,7 +284,7 @@ def _values(raw) -> list[str]:
 
 class Hyper(Task):
     """layer4_hyper_commercial_interest in one call: group the commercial interests into shopping missions, each with
-    new search queries (discovery and enhancement of the production pipeline, merged in the V2 data)."""
+    new search queries (discovery and enhancement of the production pipeline, merged in the V2 / V3 data)."""
     stage, layer, prompt_file = "l4_hyper", "layer4_hyper_commercial_interest", "prompt_l4_hyper.md"
     MAX_BRANDS = 3
 
@@ -299,8 +301,7 @@ class Hyper(Task):
         sections = []
         for index, interest in enumerate(interests, start=1):
             lines = [f"### Interest {index}: {_text(interest.get('interest_name'))}"]
-            for label, key in (("Category", "category"), ("Persona", "persona"), ("Activity", "actual_activity"),
-                               ("Intent", "inferred_intent")):
+            for label, key in (("Category", "category"), ("Persona", "persona"), ("Activity", "actual_activity")):
                 if _text(interest.get(key)):
                     lines.append(f"- {label}: {_text(interest.get(key))}")
             queries = _values(interest.get("predicted_queries"))
@@ -316,9 +317,10 @@ class Hyper(Task):
             sections.append("\n".join(lines))
         return "\n\n".join(sections)
 
-    def payload(self, interests: list[dict], preferences_json: str, language: str) -> dict:
+    def payload(self, interests: list[dict], preferences_json: str) -> dict:
+        """The V3 input: no query_language (missions and queries follow the language of their source interests)."""
         return {"personal_context": "", "professional_context": "", "commercial_preferences": preferences_json,
-                "commercial_interests": self.profile_text(interests), "query_language": language}
+                "commercial_interests": self.profile_text(interests)}
 
     @staticmethod
     def existing_queries(names: list[str], catalog: dict) -> dict:
@@ -327,7 +329,7 @@ class Hyper(Task):
                 for query in _values(interest.get("predicted_queries"))}
 
     def references_valid(self, answer: dict, catalog: dict) -> bool:
-        """Every source interest names one input interest (the production enhancement retries otherwise; the V2
+        """Every source interest names one input interest (the production enhancement retries otherwise; the V2 / V3
         cleaning drops such rows)."""
         for mission in answer["missions"]:
             names, invalid = _resolve_sources(mission["source_interests"], catalog)
@@ -356,8 +358,8 @@ class Hyper(Task):
 
     def _queries(self, mission: dict, names: list[str], catalog: dict) -> None:
         """Valid new queries, as the trainer's rollout rules check them (no word-count or query-count limit, like the
-        V2 prompt and data): non-empty, no question mark, not an Existing query, not repeated. The query text is kept
-        as written (the V2 prompt does not ask for lowercase)."""
+        V2 / V3 prompt and data): non-empty, no question mark, not an Existing query, not repeated. The query text is
+        kept as written (the prompt does not ask for lowercase)."""
         existing = self.existing_queries(names, catalog)
         queries = []
         for item in mission.get("predicted_queries", []) or []:
@@ -394,7 +396,7 @@ class Hyper(Task):
 
 
 def _dedupe_missions(missions: list[dict]) -> list[dict]:
-    """Drop repeated mission names and queries across missions (the V2 data repeats no query), renumber."""
+    """Drop repeated mission names and queries across missions (the V2 / V3 data repeats no query), renumber."""
     result, seen_queries, seen_names = [], set(), set()
     for mission in missions:
         if _name_key(mission.get("mission_name")) in seen_names:
@@ -436,7 +438,7 @@ def hyper_record(profile: UserProfile, missions: list[dict], failed: bool) -> di
     missions = _dedupe_missions(missions)
     return HYPER.record(profile, enriched_interests=missions,
                         hyper_commercial_interests=[_mission_to_interest(m) for m in missions],
-                        _query_language=profile.language, **({"_failed": [HYPER.stage]} if failed else {}))
+                        **({"_failed": [HYPER.stage]} if failed else {}))
 
 
 def postprocess(layer3: dict, biography: dict, preference: dict, hyper: dict) -> dict:
@@ -487,7 +489,7 @@ def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
     for p in profiles:
         interests = HYPER.interests(p.layer3)
         items[p.user_id] = interests and HYPER.request(
-            p, lambda k: HYPER.payload(interests[:k], preferences[p.user_id], p.language["locale"]), len(interests),
+            p, lambda k: HYPER.payload(interests[:k], preferences[p.user_id]), len(interests),
             encode, make_check=lambda k: HYPER.check(build_catalog(interests[:k])))
         if items[p.user_id]:
             catalogs[p.user_id] = build_catalog(interests[:items[p.user_id]["kept"]])

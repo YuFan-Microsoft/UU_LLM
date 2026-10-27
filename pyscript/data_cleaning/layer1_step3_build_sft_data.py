@@ -1,18 +1,19 @@
 #!/usr/bin/env python3
 """Build Qwen SFT data (train/test JSONL with a `messages` column) from the
-Layer-1 step2 output.
+Layer-1 step2 output (GPT-5.6 Final: multilingual, no content locale, no intent).
 
 Each row becomes:
     {"messages": [{"role": "user", "content": PROMPT + "\\nInput:\\n" + <activity lines>},
-                  {"role": "assistant", "content": <output JSON>}],
-     "user_hash": ..., "locale": ...}
+                  {"role": "assistant", "content": <{"interests": [...]} JSON>}],
+     "user_hash": ..., "language": <step2 row language, metadata only>}
 
 PROMPT is prompts/prompt_l1.md verbatim. Signals are sorted by date (oldest first,
 original order within a day), re-numbered 0..n-1 in that reading order, and written
-one minified JSON object per line (DetailedSource is dropped):
+one minified JSON object per line (the GPT-5.6 Final signals carry no DetailedSource):
     {"idx":0,"date":"YYYY-MM-DD","source":"Bing","action":"..."}
     {"idx":1,"date":"YYYY-MM-DD","source":"MSN","action":"..."}
-Answer `evidence` indices are remapped to the new idx and sorted.
+Answer `evidence` indices are remapped to the new idx and sorted; the answer keeps the teacher's key order
+    {"interests": [{"topics": [{"evidence", "topic"}], "interest_name", "actual_activity"}]}.
 
 The "\\nInput:\\n" marker and this input layout match what
 code/trainer/SFT/user_profile_rules.py parses. JSON is minified.
@@ -67,17 +68,14 @@ def remap_interests(interests: list[dict], remap: dict[int, int]) -> list[dict]:
 
 def build_example(record: dict) -> dict:
     payload, remap = build_input(record["signals"])
-    answer = {
-        "predicted_content_locale": record["predicted_content_locale"],
-        "interests": remap_interests(record["interests"], remap),
-    }
+    answer = {"interests": remap_interests(record["interests"], remap)}
     return {
         "messages": [
             {"role": "user", "content": PROMPT + INPUT_MARKER + payload},
             {"role": "assistant", "content": dumps(answer)},
         ],
         "user_hash": record["user_hash"],
-        "locale": record["predicted_content_locale"],
+        "language": record["language"],
     }
 
 
@@ -133,7 +131,7 @@ def main() -> None:
     count_tokens = load_token_counter(args.tokenizer)
 
     rows = Counter()
-    locales = {"train": Counter(), "test": Counter()}
+    languages = {"train": Counter(), "test": Counter()}
     users = {"train": set(), "test": set()}
     user_chars, answer_chars, token_lengths = [], [], []
     paths = {split: args.out_dir / f"{split}.jsonl" for split in ("train", "test")}
@@ -150,7 +148,7 @@ def main() -> None:
                 split = "test" if is_test_user(example["user_hash"], args.test_ratio) else "train"
                 handles[split].write(orjson.dumps(example) + b"\n")
                 rows[split] += 1
-                locales[split][example["locale"]] += 1
+                languages[split][example["language"]] += 1
                 users[split].add(example["user_hash"])
                 user_chars.append(len(example["messages"][0]["content"]))
                 answer_chars.append(len(example["messages"][1]["content"]))
@@ -165,7 +163,7 @@ def main() -> None:
         "rows": dict(rows),
         "users": {split: len(values) for split, values in users.items()},
         "test_ratio": args.test_ratio,
-        "locales": {split: dict(counter.most_common()) for split, counter in locales.items()},
+        "languages": {split: dict(counter.most_common()) for split, counter in languages.items()},
         "user_chars": length_stats(user_chars),
         "assistant_chars": length_stats(answer_chars),
     }

@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
-"""Clean the merged GPT-5.4 Layer 1 dataset (one JSONL line per user-day).
+"""Clean the merged GPT-5.6 Final Layer 1 dataset (layer1_step0_merge_end2end_dataset.py output, one JSONL line
+per user-day-window).
 
 Input line format:
-    {"input":  {"user_id", "date", "signals": [{"idx", "Source", "Action", ...}]},
-     "output": {"user_id", "date", ["predicted_content_locale"],
-                "interests": [{"interest_name", "topics": [{"topic", "source", "evidence"}],
-                               "actual_activity", "inferred_intent"}]}}
-The GPT-5.6 merge (layer1_step0_merge_end2end_dataset.py) instead writes a top-level "user_hash"
-and an input of {"signals"} only; such rows keep that user_hash.
+    {"user_hash",
+     "input":  {"signals": [{"idx", "Date", "Source", "Action"}]},
+     "output": {"interests": [{"topics": [{"evidence", "topic"}], "interest_name", "actual_activity"}]}}
 
 Any row that violates a rule is dropped. Kept rows are written as:
-    {"user_hash", "predicted_content_locale", "signals", "interests"}
-where user_hash = sha256(user_id)[:16], date is removed, and a missing
-predicted_content_locale defaults to "en".
+    {"user_hash", "signals", "interests"}
+Names, topics and activities may be in any language (each interest follows its evidence); the
+interest_name / actual_activity language consistency is checked by layer1_step2_language_detection.py.
 """
 
 import argparse
@@ -28,29 +26,25 @@ import orjson
 from tqdm import tqdm
 
 
-INTEREST_KEYS = {"interest_name", "topics", "actual_activity", "inferred_intent"}
-TOPIC_KEYS = {"topic", "source", "evidence"}
-NON_LATIN = re.compile(r"[^\x00-\x7F\u00C0-\u024F\u2019\u2013\u2014]")
+INTEREST_KEYS = {"topics", "interest_name", "actual_activity"}
+TOPIC_KEYS = {"evidence", "topic"}
 
 RULES = {
     # Structure / fields
     "unexpected_keys": "Interest or topic has unexpected keys",
-    "empty_text": "Empty interest name, topic, actual_activity or inferred_intent, or no topics",
+    "empty_text": "Empty interest name, topic or actual_activity, or no topics",
     "invalid_evidence_format": "Topic evidence is not a list, is empty, or has non-integer values",
-    # Evidence / source consistency
+    # Evidence consistency
     "unknown_evidence_idx": "Topic evidence references an idx missing from the input signals",
     "duplicate_evidence_id": "Duplicate idx within a topic evidence",
-    "source_evidence_mismatch": "Topic source does not match the sources of its evidence signals",
-    "duplicate_topic_source": "Duplicate value within a topic source",
     # Content
     "too_many_interests": "Row has at least --interest-limit interests",
-    "non_english_interest_name": "Interest name contains non-Latin characters",
     "duplicate_interest_name": "Duplicate interest name within a row",
     "duplicate_topic_name": "Duplicate topic name within an interest",
     # File-level deduplication
     "identical_duplicate": "Identical input and output duplicate an earlier row",
     "normalized_duplicate_input": (
-        "Same set of (Source, Action) signals as an earlier kept row, ignoring Date/idx/intent"
+        "Same set of (Source, Action) signals as an earlier kept row, ignoring Date/idx"
     ),
 }
 
@@ -95,11 +89,8 @@ def row_violations(record: dict, interest_limit: int) -> set[str]:
             reasons.add("unexpected_keys")
 
         name = interest.get("interest_name")
-        if not (has_text(name) and has_text(interest.get("actual_activity"))
-                and has_text(interest.get("inferred_intent"))):
+        if not (has_text(name) and has_text(interest.get("actual_activity"))):
             reasons.add("empty_text")
-        if isinstance(name, str) and NON_LATIN.search(name):
-            reasons.add("non_english_interest_name")
         normalized = normalize_name(name)
         if normalized and normalized in interest_names:
             reasons.add("duplicate_interest_name")
@@ -132,15 +123,6 @@ def row_violations(record: dict, interest_limit: int) -> set[str]:
                 continue
             if len(evidence) != len(set(evidence)):
                 reasons.add("duplicate_evidence_id")
-
-            source = topic.get("source")
-            if not isinstance(source, list) or not all(isinstance(s, str) for s in source):
-                reasons.add("source_evidence_mismatch")
-                continue
-            if len(source) != len(set(source)):
-                reasons.add("duplicate_topic_source")
-            if set(source) != {signals[e].get("Source") for e in evidence}:
-                reasons.add("source_evidence_mismatch")
     return reasons
 
 
@@ -156,8 +138,7 @@ def scan(input_path: Path, interest_limit: int) -> list[set[str]]:
             except orjson.JSONDecodeError as error:
                 raise ValueError(f"Line {line_number}: invalid JSON: {error}") from error
             reasons = row_violations(record, interest_limit)
-            output = {k: v for k, v in record["output"].items() if k not in ("user_id", "date")}
-            row_hash = (digest(record["input"]["signals"]), digest(output))
+            row_hash = (digest(record["input"]["signals"]), digest(record["output"]))
             if row_hash in seen_rows:
                 reasons.add("identical_duplicate")
             seen_rows.add(row_hash)
@@ -176,14 +157,9 @@ def scan(input_path: Path, interest_limit: int) -> list[set[str]]:
     return violations
 
 
-def hash_user_id(user_id: str) -> str:
-    return hashlib.sha256(user_id.encode("utf-8")).hexdigest()[:16]
-
-
 def to_output_row(record: dict) -> dict:
     return {
-        "user_hash": record.get("user_hash") or hash_user_id(record["input"]["user_id"]),
-        "predicted_content_locale": record["output"].get("predicted_content_locale") or "en",
+        "user_hash": record["user_hash"],
         "signals": record["input"]["signals"],
         "interests": record["output"]["interests"],
     }
@@ -231,8 +207,8 @@ def write_reports(report_path: Path, input_path: Path, output_path: Path,
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Clean the merged GPT-5.4 Layer 1 JSONL dataset.")
-    parser.add_argument("--input", required=True, type=Path, help="Merged L1 JSONL (e.g. l1_merged/en.jsonl)")
+    parser = argparse.ArgumentParser(description="Clean the merged GPT-5.6 Final Layer 1 JSONL dataset.")
+    parser.add_argument("--input", required=True, type=Path, help="step0 merged L1 JSONL")
     parser.add_argument("--output", required=True, type=Path, help="Cleaned JSONL path")
     parser.add_argument("--report", type=Path, help="Report JSON path (default: <output>.report.json)")
     parser.add_argument("--interest-limit", type=int, default=40,

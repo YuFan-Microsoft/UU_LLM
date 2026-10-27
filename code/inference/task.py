@@ -3,7 +3,7 @@ state they pass along."""
 
 from dataclasses import dataclass, field
 
-from utils import HERE, INPUT_MARKER, PROMPT_BUDGET, dumps, new_item, query_language
+from utils import HERE, INPUT_MARKER, PROMPT_BUDGET, dumps, new_item
 
 PROMPT_DIR = HERE / "prompts"
 
@@ -41,10 +41,6 @@ class UserProfile:
     def date(self) -> str:
         return self.run_date
 
-    @property
-    def language(self) -> dict:
-        """resolve_query_language(...).state() without a user Market: {"locale", "source"}."""
-        return query_language(self.snapshot.get("predicted_content_locale"))
 
 
 class Task:

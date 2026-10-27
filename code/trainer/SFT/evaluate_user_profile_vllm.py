@@ -3,7 +3,7 @@
 Reproduces the in-training rollout evaluation (vllm_colocate_rollout.run_rollout_evaluation) on a
 single machine: same example selection, same chat-template prompt, same per-example token budget,
 same sampling parameters and the same rule-based metrics from user_profile_rules.py. Sampling defaults
-match the rollout arguments in run_user_profile_multi_gpu.sh.
+match the rollout arguments in run_user_profile_multi_gpu_4B.sh.
 
 Like training, examples are sharded round-robin over data-parallel vLLM engines (one per
 --tensor_parallel_size GPUs, engine i seeded with --seed + i). Each engine runs in its own process.
@@ -25,14 +25,14 @@ from vllm_colocate_rollout import load_rollout_eval_examples
 QWEN3_5_FULL_ARCH = "Qwen3_5ForConditionalGeneration"
 DEFAULT_DATASET = "yufan/user_profile_dataset"
 DEFAULT_CONFIGS = [
-    "V2_User_Profile_L1_gpt56",
-    "V2_User_Profile_L1_Negative_gpt56",
-    "V2_User_Profile_L2_gpt56",
-    "V2_User_Profile_L3_Persona_gpt56",
-    "V2_User_Profile_L3_Commercial_gpt56",
-    "V2_User_Profile_L4_Biography_gpt56",
-    "V2_User_Profile_L4_CommercialPreference_gpt56",
-    "V2_User_Profile_L4_Hyper_gpt56",
+    "V3_User_Profile_L1_gpt56",
+    "V3_User_Profile_L1_Negative_gpt56",
+    "V3_User_Profile_L2_gpt56",
+    "V3_User_Profile_L3_Persona_gpt56",
+    "V3_User_Profile_L3_Commercial_gpt56",
+    "V3_User_Profile_L4_Biography_gpt56",
+    "V3_User_Profile_L4_CommercialPreference_gpt56",
+    "V3_User_Profile_L4_Hyper_gpt56",
 ]
 
 

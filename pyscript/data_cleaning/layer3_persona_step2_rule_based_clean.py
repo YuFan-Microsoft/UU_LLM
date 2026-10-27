@@ -12,7 +12,9 @@ A row is dropped when it violates any rule in RULES:
   R interest_mismatch    output interest names are not exactly the input names, once each
   R inconsistent_output  within the row, one category segment is spelled two ways (case, "&"/"and",
                          spacing) or two interests share the same persona
-  R non_english_persona  fastText vote (layer1_step2 helpers) over the row's personas is not English
+  R inconsistent_language  a persona is not written in the language of its interest_name (GPT-5.6 Final writes each
+                         interest's category and persona in that interest's language; checked with the Layer-1 step2
+                         consistency check, its vocabulary fitted on every persona in a first pass)
 
 Writes the kept rows and prints a per-rule summary table (TSV). With --market-locales, rows are split
 into en-star (pipeline locale en-*) and global columns by looking up the user-day's locale.
@@ -62,7 +64,7 @@ RULES = {
                          "repeated, or duplicate input names)",
     "inconsistent_output": "Within a user, a category segment is spelled two ways (e.g. '&' vs 'and') or two "
                            "interests share the same persona",
-    "non_english_persona": "fastText vote over the row's personas is not English",
+    "inconsistent_language": "A persona is not written in the language of its interest_name",
 }
 MARKETS = ("en-star", "global")
 
@@ -71,7 +73,7 @@ def segment_key(segment: str) -> str:
     return " ".join(segment.casefold().replace("&", " and ").split())
 
 
-def check_row(record: dict, model, t2s, s2t, args: argparse.Namespace) -> set[str]:
+def check_row(record: dict, model, vocabulary, language_script, args: argparse.Namespace) -> set[str]:
     output = record.get("output")
     if any(True for _ in OUTPUT_VALIDATOR.iter_errors(output)) \
             or any(tuple(entry) != ENTRY_KEYS for entry in output["interest_personas"]):
@@ -93,11 +95,25 @@ def check_row(record: dict, model, t2s, s2t, args: argparse.Namespace) -> set[st
             or len({persona.strip().casefold() for persona in personas}) < len(personas):
         reasons.add("inconsistent_output")
 
-    persona_language, _ = language.vote_language(
-        language.reliable_texts(personas, args), model, t2s, s2t, args, no_vote_label="none")
-    if not language.keeps_output(persona_language):
-        reasons.add("non_english_persona")
+    texts = [language.clean_text(persona) for persona in personas]
+    for entry, text, prediction in zip(entries, texts, language.predict_top(model, texts)):
+        if language.check_interest(language.clean_text(entry["interest_name"]), text, prediction, vocabulary,
+                                   language_script, model, args):
+            reasons.add("inconsistent_language")
+            break
     return reasons
+
+
+def fit_language(args: argparse.Namespace, model):
+    def batches():
+        with args.input.open("rb") as source:
+            for line_number, line in enumerate(tqdm(source, desc=f"Vocabulary {args.input.name}", unit="rows"), 1):
+                if args.limit and line_number > args.limit:
+                    break
+                entries = (orjson.loads(line).get("output") or {}).get("interest_personas")
+                yield [entry.get("persona") for entry in entries if isinstance(entry, dict)] \
+                    if isinstance(entries, list) else []
+    return language.fit_vocabulary(batches(), model, args)
 
 
 def load_market_locales(paths: list[Path]) -> dict[tuple[str, str], str]:
@@ -139,21 +155,20 @@ def parse_args() -> argparse.Namespace:
                         help="JSONL rows with input.user_id/date/query_language (e.g. the commercial step1 output) "
                              "used to split the summary into en-star / global")
     parser.add_argument("--model", type=Path, default=default_model, help=f"fastText lid.176.bin (default: {default_model})")
-    parser.add_argument("--min-confidence", type=float, default=0.5, help="Min fastText probability per persona")
-    parser.add_argument("--min-share", type=float, default=0.8, help="Min share of tagged personas for the top language")
+    parser.add_argument("--min-confidence", type=float, default=0.5,
+                        help="Min fastText probability of a persona's language to use its writing system")
+    language.add_consistency_arguments(parser)
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N rows (0 = all)")
     args = parser.parse_args()
     if args.output.resolve() == args.input.resolve():
         parser.error("--output must differ from --input")
-    # Fixed settings shared with layer1_step2's text reliability / voting helpers.
-    args.min_count, args.min_latin_words, args.min_non_latin_chars = 1, 0, 0
     return args
 
 
 def main() -> None:
     args = parse_args()
     model = language.load_model(args.model)
-    t2s, s2t = language.load_opencc()
+    vocabulary, language_script = fit_language(args, model)
     locales = load_market_locales(args.market_locales) if args.market_locales else None
     hits: defaultdict[str, Counter] = defaultdict(Counter)
     rows: Counter[str] = Counter()
@@ -173,7 +188,7 @@ def main() -> None:
                 missing_locale += locale is None
                 market = "en-star" if (locale or "").split("-")[0].lower() == "en" else "global"
             rows[market] += 1
-            reasons = check_row(record, model, t2s, s2t, args)
+            reasons = check_row(record, model, vocabulary, language_script, args)
             hits[market].update(reasons)
             if reasons:
                 dropped[market] += 1

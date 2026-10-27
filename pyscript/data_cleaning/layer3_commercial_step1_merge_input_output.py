@@ -3,7 +3,10 @@
 
 Two source layouts are supported:
 
---inputs: ProcessData files (e.g. Training_Data_InferredByGPT56/ProcessData/layer3_commercial_interest.jsonl),
+--inputs: GPT-5.6 Final process_dataset files (e.g. Training_Data_InferredByGPT56_Final/process_dataset/L3/
+    l3_commercial_interest_enrichment.jsonl), one call per line:
+        {"id", "input": [{"role": "system", ...}, {"role": "user", "content"}], "output": <response JSON string>}
+    or older ProcessData files (e.g. Training_Data_InferredByGPT56/ProcessData/layer3_commercial_interest.jsonl),
     one line per request holding both sides:
         {"custom_id", "task", "status", "response_status", "error",
          "request":  {"model", "messages": [{"role": "system", "content": <L3 commercial prompt>},
@@ -33,8 +36,9 @@ becomes `user_id` / `date` and the payload JSON (the Layer 2 post-processing res
 splits stay separate rows because each has its own interests. A request is kept only if at least one
 of its results finished normally with a JSON-object response text: Batch API status_code 200 and status
 "completed", or ProcessData status "succeeded", response_status 200, and finish_reason "stop" (so
-"length"-truncated and "content_filter" responses are dropped). When several qualify, the first in
-file order is used.
+"length"-truncated and "content_filter" responses are dropped); a Final line only needs a JSON-object
+output. When several qualify, the first in file order is used, and a Final user-day seen again is dropped
+as input_duplicate_user_day.
 """
 
 from __future__ import annotations
@@ -177,33 +181,48 @@ def process_data_output(record: dict, counts: Counter) -> dict | None:
     return parsed
 
 
+def final_output(record: dict, counts: Counter) -> dict | None:
+    """Parsed output of a GPT-5.6 Final process_dataset line ({"id", "input", "output"})."""
+    parsed = json_object(record.get("output") or "")
+    if parsed is None:
+        counts["output_invalid_json"] += 1
+    return parsed
+
+
 def process_data_rows(args: argparse.Namespace, parse_user_message: Callable[[str], dict | None],
                       counts: Counter) -> Iterator[dict]:
     counts["input_files"] = len(args.inputs)
     seen: set[str] = set()
     ok: set[str] = set()
     written: set[str] = set()
+    user_days: set[tuple] = set()
     for path in args.inputs:
         with path.open("rb") as source:
             for line in tqdm(source, desc=f"Merging {path.name}", unit="rows", leave=False):
                 counts["input_lines"] += 1
                 record = orjson.loads(line)
-                custom_id = record["custom_id"]
+                final = "request" not in record
+                custom_id = record["id"] if final else record["custom_id"]
                 seen.add(custom_id)
                 # A later line for the same custom_id (a retry) is used only if no earlier one was written.
                 if custom_id in written:
                     counts["input_duplicate"] += 1
                     continue
-                output = process_data_output(record, counts)
+                output = final_output(record, counts) if final else process_data_output(record, counts)
                 if output is None:
                     continue
                 ok.add(custom_id)
-                content = user_content(record["request"]["messages"])
+                content = user_content(record["input"] if final else record["request"]["messages"])
                 request_input = parse_user_message(content) if content is not None else None
                 if request_input is None:
                     counts["input_unparseable"] += 1
                     continue
                 written.add(custom_id)
+                user_day = (request_input["user_id"], request_input["date"])
+                if final and user_day in user_days:
+                    counts["input_duplicate_user_day"] += 1
+                    continue
+                user_days.add(user_day)
                 yield {"input": request_input, "output": output}
     counts["unique_requests"] = len(seen)
     counts["requests_with_ok_output"] = len(ok)

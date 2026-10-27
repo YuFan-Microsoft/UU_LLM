@@ -9,15 +9,15 @@
 | `layer4.py` | Layer 4: `Biography`, `CommercialPreference` and `Hyper` task classes (payloads, answer checks, records, mission validation), `postprocess` (= `layer4_postprocessing`) and `run` (three rounds of calls) |
 | `task.py` | `Task` base class (prompt, answer key check, trimmed request, record) and `UserProfile` (one user's final snapshot and its Layer-3 / Layer-4 records) |
 | `utils.py` | Input loading and cleaning, weekly windows, signal dedupe / cap, query language, the answer key checks of every task, `generate()` with retries, MTP acceptance counters |
-| `user_profile_rules.py` | Copy of `code/trainer/SFT/user_profile_rules.py` (keep it identical): the rollout checks that score every call's first sample for `rule_metrics` |
+| `user_profile_rules.py` | Copy of `code/trainer/SFT/user_profile_rules.py` (keep it identical): the V3 rollout checks that score every call's first sample for `rule_metrics`; it is reporting only (the answer key checks in `utils.py` decide retries) |
 | `merge_official_mtp.py` | Adds the official Qwen3.5 MTP head (`mtp.*`) to an SFT checkpoint saved without it (see [MTP speculative decoding](#mtp-speculative-decoding)) |
-| `prompts/` | The prompts (`prompt_l1.md` ... `prompt_l4_hyper.md`, plus `prompt_negative.md`, kept in sync but not used: the input has no negative feedback), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V2 SFT configs) |
+| `prompts/` | The prompts (`prompt_l1.md` ... `prompt_l4_hyper.md`, plus `prompt_negative.md`, kept in sync but not used: the input has no negative feedback), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V3 SFT configs) |
 
 The prompt files are read as-is (line endings normalized to `\n`); the script builds each user message as
-`prompt + "\nInput:\n" + input`, exactly like the V2 SFT data: rebuilt from their own inputs, every
-`V2_User_Profile_*_gpt56` test row without user context (no declared attributes, facts or personal / professional
-context, which this script never has) gives the identical user message, and every test answer passes the answer
-checks. The model was trained on these exact strings, so edit them only together with the SFT data (and retrain).
+`prompt + "\nInput:\n" + input`, exactly like the V3 SFT data: rebuilt from their own inputs, every
+`V3_User_Profile_*_gpt56` L1, L2, L3 Persona and L3 Commercial test row gives the identical user message, the L4
+inputs have the same fields (without user context: no declared attributes, facts or personal / professional context,
+which this script never has), and every V3 test answer passes the answer checks. The model was trained on these exact strings, so edit them only together with the SFT data (and retrain).
 
 Run inside the same environment as the SFT evaluation (`../trainer/SFT/requirements_inference.txt`: vLLM,
 transformers, datasets). The directory is self-contained, so it can be uploaded on its own: the few helpers it shares
@@ -56,10 +56,10 @@ Input rows, one per user (only `past_behaviors` is used; `future_behaviors` is h
 {"user_id": "...", "past_behaviors": [{"source": "Bing", "action": "...", "intent": "...", "date": "2026-02-06T00:00:00", "action_id": 0}], "future_behaviors": [...]}
 ```
 
-One checkpoint serves all seven tasks. The V2 SFT data were distilled from GPT-5.6 runs of the production pipeline
-(MAIProfile_Official, the successor of maiprofilev3dev, whose step logic this script ports). With the Layer-1 prompt
-the model produces in one call what maiprofilev3dev builds with `layer1_delta` -> `layer1_actual` -> `layer1_intent`
--> `layer1_postprocessing`. With the Layer-2 prompt it replaces `layer2_merge` (merge/add decisions; there is no
+One checkpoint serves all seven tasks. The V3 SFT data were distilled from GPT-5.6 Final runs of the production
+pipeline (MAIProfile_Official, the successor of maiprofilev3dev, whose step logic this script ports). With the Layer-1
+prompt the model produces in one call what the pipeline builds with `layer1_delta` -> `layer1_actual` ->
+`layer1_postprocessing` (V3 has no `layer1_intent` step and no inferred intent anywhere). With the Layer-2 prompt it replaces `layer2_merge` (merge/add decisions; there is no
 temporal classification, see [Layer 2](#layer-2)). `layer2_postmerge` is pure computation and is ported to
 `layer2.postmerge`. The five Layer-3 / Layer-4 prompts replace the Layer-3 / Layer-4 LLM calls (see
 [Layers 3 and 4](#layers-3-and-4)); the hyper prompt replaces both mission calls (discovery and enhancement).
@@ -81,16 +81,16 @@ default allows 1000); that run kept only MSN,Bing,Ads,Shopping,Uet,Edge,ChromeIm
 LinkedInCA signals were never seen in training. The user message is
 `prompt_l1.md + "\nInput:\n"` followed by one minified JSON object per signal and line,
 `{"idx":0,"date":"YYYY-MM-DD","source":"Bing","action":"..."}`, with the signals sorted by date and numbered from 0,
-exactly as the SFT data. The behaviors' `intent` is not used: the model does not see it (the V2 input has none) and,
+exactly as the SFT data. The behaviors' `intent` is not used: the model does not see it (the V3 input has none) and,
 as in production, the evidence of the Layer-1 record does not store it. Prompts are trimmed to leave 8192 of the 32768 context tokens for the answer
-(at most 10240 answer tokens; the V2 SFT length is 25600, within Qwen3.5's native 262144-token context): L1 drops
+(at most 10240 answer tokens; the V3 SFT length is 25600, within Qwen3.5's native 262144-token context): L1 drops
 the lowest-priority / oldest signals.
 
-The answer becomes the `layer1_postprocessing` record exactly as maiprofilev3dev builds it: interests and topics
-(names, topic `source`) are kept as the model wrote them, evidence indices are rebuilt into evidence objects
-(`_coerce_evidence_idx` / `_reconstruct_evidence_from_indices`: unknown and repeated indices are dropped),
-`predicted_content_locale` is kept when it is a valid language tag (`normalize_language_tag`). The model's `"mix"`
-(no dominant language, a label of the L1 SFT data that maiprofilev3dev never produces) counts as no locale.
+The answer (`{"interests":[{"topics":[{"evidence","topic"}],"interest_name","actual_activity"}]}`) becomes the
+`layer1_postprocessing` record as the pipeline builds it: interest and topic names are kept as the model wrote them,
+evidence indices are rebuilt into evidence objects (`_coerce_evidence_idx` / `_reconstruct_evidence_from_indices`:
+unknown and repeated indices are dropped), and each topic's `source` is rebuilt from its evidence signals (the V3
+answer has no topic source). The V3 answer has no `inferred_intent` and no `predicted_content_locale`.
 
 ## Layer 2
 
@@ -108,17 +108,19 @@ optional coarse clustering read them, so they are not written):
 | Otherwise (`merge`) | model decisions; missing deltas get a synthetic add | merged snapshot |
 
 There is no temporal classification and the interests carry no `temporal` / `decay` fields. Production's separate
-`layer2_temporal` call (not part of the V2 data) gives every class the same daily decay of 1.0
+`layer2_temporal` call (not part of the V3 data) gives every class the same daily decay of 1.0
 (`TEMPORAL_DAILY_DECAY`), so an untouched interest decays by 0.98 per day (at most 7 days per window) exactly as there.
 
 The L2 user message is `prompt_l2.md + "\nInput:\n" + {"snapshot":[...],"delta":[...]}`. The snapshot only
 contains interests that `layer2_merge` would show (not coarse / Archived / confidence ≤ 0.2); snapshot and delta
-interests are projected to `{interest_name, actual_activity, topics: [names]}`. Deltas without a decision get a
+interests are projected to `{interest_name, actual_activity, topics: [names]}`. The decisions carry no intent:
+merge `{action, delta_interest_name, snapshot_interest_name, merged_interest_name, merged_actual_activity}`, add
+`{action, delta_interest_name, actual_activity}`. Deltas without a decision get a
 synthetic add (`layer2_merge._backfill_missing`). If the L2 prompt is too long, the lowest-confidence snapshot
 interests are left out of the prompt only (postmerge still decays and keeps them). An
 L2 answer that never parses becomes synthetic adds, like an unparseable `layer2_merge` response.
-Every snapshot carries `predicted_content_locale`: this window's Layer-1 locale, else the previous snapshot's
-(`_resolve_predicted_content_locale`); Layers 3 and 4 use it as the query language.
+The V3 Layer 1 predicts no locale, so snapshots carry no `predicted_content_locale` (production's
+`_resolve_predicted_content_locale` is dropped) and no Layer-3 / Layer-4 input has a query language.
 
 ## Layers 3 and 4
 
@@ -130,22 +132,23 @@ the two postprocessing records copy the snapshot, so they keep its `date` (the u
 
 | Round | Production step | Model input (payload) | Skipped when |
 | --- | --- | --- | --- |
-| 1 | `layer3_persona` | `{"interests"}`: interests with confidence ≥ 0.2: name, activity, intent, topic names (no `facts`) | no such interest |
-| 1 | `layer3_commercial_interests` | same interests with sorted `sources` and per-topic evidence `actions`; `query_language`. Like the V2 data (at most 30 interests per row), a user with more than 30 is split into near-equal contiguous chunks (103 -> 26 + 26 + 26 + 25), one call each, and the answers are concatenated in order | no such interest |
+| 1 | `layer3_persona` | `{"interests"}`: interests with confidence ≥ 0.2: name, activity, topic names (no `facts`, no intent) | no such interest |
+| 1 | `layer3_commercial_interests` | `{"interests"}`: same interests with sorted `sources` and per-topic evidence `actions` (no `query_language`). Like the V3 data (at most 30 interests per row), a user with more than 30 is split into near-equal contiguous chunks (103 -> 26 + 26 + 26 + 25), one call each, and the answers are concatenated in order | no such interest |
 | — | `layer3_postprocessing` | rule: persona / category and commercial fields merged by exact name into the gated interests, sorted by confidence | — |
-| 2 | `layer4_biography` | `{"declared_attributes": {}, "facts": {}, "interests"}`: the Layer-3 interests highest `count` first, then highest confidence (name, activity, intent, persona, confidence, count, dates, source, at most 8 distinct topic names with the most frequent first, and for commercial interests at most 6 distinct brands / products / predicted queries each, as production's `project_interest`) | no interest |
+| 2 | `layer4_biography` | `{"declared_attributes": {}, "facts": {}, "interests"}`: the Layer-3 interests highest `count` first, then highest confidence (name, activity, persona, confidence, count, dates, source, at most 8 distinct topic names with the most frequent first, and for commercial interests at most 6 distinct brands / products / predicted queries each, as production's `project_interest`) | no interest |
 | 3 | `layer4_commercial_preference` | `life_stage` from the biography (`{"value": "unknown", "confidence": "low", "evidence": []}` when the biography failed), commercial interests (persona, brands, retailers, products, topics with evidence actions), non-commercial names; then the rule-based `confidence_score`s and defaults | no commercial interest |
-| 4 | `layer4_hyper_commercial_interest` (discovery + enhancement in one call) | `personal_context` / `professional_context` `""`, `commercial_preferences` (JSON string of the short form, as production's `project_commercial_preferences`: each dimension, shopper type and dining restriction with a known value and `confidence_score` >= 0.3 as `{value, confidence_score}`, the product categories, no empty containers; `""` when nothing is left), the `### Interest N` blocks of the commercial interests, `query_language` | no commercial interest |
+| 4 | `layer4_hyper_commercial_interest` (discovery + enhancement in one call) | `personal_context` / `professional_context` `""`, `commercial_preferences` (JSON string of the short form, as production's `project_commercial_preferences`: each dimension, shopper type and dining restriction with a known value and `confidence_score` >= 0.3 as `{value, confidence_score}`, the product categories, no empty containers; `""` when nothing is left), the `### Interest N` blocks of the commercial interests (Category, Persona, Activity, Existing queries, Known entities; no Intent line); no `query_language` | no commercial interest |
 | — | `layer4_postprocessing` | rule: Layer-3 snapshot + biography, life stage, `user_attributes`, commercial preferences, `enriched_commercial_interests`, and the missions appended to `interests` as `hyper_commercial` | — |
 
-Payloads follow the V2 SFT data (`docs/V2_user_profile_dataset_schema.md`) with the user-context fields empty, as in
-the V2 rows without user context: `{}` for declared attributes and facts, `""` for the personal / professional
-context. The query language is `resolve_query_language` without a user Market: the snapshot's
-`predicted_content_locale`, else `en`. A hyper answer is accepted (else retried) only when every mission's source
-interests are input interests (the production enhancement retries otherwise, and the V2 cleaning drops such rows). Each
-mission then keeps its resolved source interests and valid scenarios, the queries that pass the trainer's rollout rules (no
-word-count or query-count limit, like the V2 prompt and data; no question mark, not an Existing query, not repeated;
-the text is kept as written, the V2 prompt does not ask for lowercase), at most 3 new brands and a category (no `enrichment_sources`: the V2 data dropped it, and its answer is
+Payloads follow the V3 SFT data (`docs/V3_user_profile_dataset_schema.md`) with the user-context fields empty, as in
+the rows without user context: `{}` for declared attributes and facts, `""` for the personal / professional
+context. No input carries an inferred intent or a query language: V3 answers are written in the language of their
+evidence, and the records carry no `_query_language`. A hyper answer is accepted (else
+retried) only when every mission's source interests are input interests (the production enhancement retries
+otherwise, and the cleaning drops such rows). Each mission then keeps its resolved source interests and valid
+scenarios, the queries that pass the trainer's rollout rules (no word-count or query-count limit, like the prompt and
+data; no question mark, not an Existing query, not repeated; the text is kept as written, the prompt does not ask for
+lowercase), at most 3 new brands and a category (no `enrichment_sources`: the data dropped it, and its answer is
 plain-string queries without per-query provenance); missions without a query and repeated names / queries across missions are dropped. If a prompt is too long, the
 lowest-confidence interests are left out of that call.
 
@@ -155,18 +158,18 @@ The V1 version of this script was checked against the maiprofilev3dev source by 
 model and comparing every model input and every record: Layers 1-2 over several windows (`clean_signals`,
 `build_delta_grid`, `Layer1Delta` ... `Layer1PostProcessing`, `Layer2Merger`, `Layer2Temporal`, `Layer2PostProcessor`,
 carry-forward, idle windows, the 200-signal cap, foreign sources), and Layers 3-4 on synthetic snapshots
-(`Layer3Persona` ... `Layer4PostProcessing`): identical. The V2 version keeps that step logic and changes only the
-model inputs / answers to the V2 SFT layouts (checked against the V2 test rows, see above). The remaining differences
-come from replacing the LLM calls with a 25600-token model trained on the V2 data:
+(`Layer3Persona` ... `Layer4PostProcessing`): identical. The V2 and V3 versions keep that step logic and change only
+the model inputs / answers to the SFT layouts (checked against the V3 test rows, see above). The remaining differences
+come from replacing the LLM calls with a 25600-token model trained on the V3 data:
 
 - Prompts are trimmed to fit the context (L1: lowest-priority / oldest signals; L2: lowest-confidence snapshot
   interests, which postmerge still keeps; L3/L4: lowest-confidence interests); production sends everything.
-- `actual_activity` / `inferred_intent` come from the same answer as the interests instead of two extra calls, so
-  two interests with the same name keep their own text (production looks them up by name).
+- `actual_activity` comes from the same answer as the interests instead of an extra call, so two interests with
+  the same name keep their own text (production looks them up by name). There is no inferred intent.
 - There is no `layer2_temporal` call and no `temporal` / `decay` field. All temporal classes decay at 1.0 in
   production, so the confidences evolve exactly as there. `init` (no
   previous snapshot) makes no model call, as in production's merge step.
-- Mission discovery and enhancement are one call whose answer is the final missions (the V2 hyper task), so there
+- Mission discovery and enhancement are one call whose answer is the final missions (the V3 hyper task), so there
   are no candidate missions, enhancement audit blocks or `input_mission_name`, and the queries keep the model's
   case.
 - Answers are retried until they have the trained keys (and, for the missions, valid references); one that never
@@ -176,11 +179,11 @@ come from replacing the LLM calls with a 25600-token model trained on the V2 dat
 - The hyper input's `commercial_preferences` follows the current maiprofilev3dev projection
   (`hyper_preferences.project_commercial_preferences`): preferences with a `confidence_score` below 0.3 and empty
   containers are left out. This
-  has not been checked against the V2 hyper rows (built from MAIProfile_Official runs).
+  has not been checked against the V3 hyper rows (built from MAIProfile_Official runs).
 - There is no user context, world knowledge or negative feedback: declared attributes and facts are `{}`, the
   personal / professional context is `""`, the event filter is not called, `negative_interests` is `[]` and the
-  query language never comes from a Market. (In the V2 data, about half of the biography rows carry declared
-  attributes or facts and about 57% of the hyper rows a personal context.)
+  query language never comes from a Market. (In the V3 data, about 45% of the biography rows carry declared
+  attributes or facts and about 45% of the hyper rows a personal context.)
 - Layers 3 and 4 run once per user (on the final snapshot), so production's per-interest reuse and refresh
   intervals do not apply; `layer3_seasonality` is not run (no `seasonality` field).
 - No `reasoning` / `reason` fields, `layer2_coarse_interest` is not run, and the input is expected to be already
@@ -262,7 +265,7 @@ For the windows where some user's final snapshot was built: `layer3_persona`, `l
 `<out_dir>/final_profiles.jsonl` has one line per processed user with everything needed for evaluation:
 `user_id`, `profile_date` (last grid window), `last_update` (window of the user's last profile update), the raw
 `past_behaviors` and `future_behaviors` from the input, and the user's `layer4_postprocessing` profile:
-`predicted_content_locale`, `interests` (the Layer-2 interests with confidence ≥ 0.2, enriched with persona,
+`interests` (the Layer-2 interests with confidence ≥ 0.2, enriched with persona,
 category and commercial fields, followed by the `hyper_commercial` missions), `biography`, `life_stage`,
 `user_attributes`, `commercial_preferences` and `enriched_commercial_interests`. Everything is empty if the user never
 had a Layer-1 interest. The ungated Layer-2 snapshot stays in `layer2_postmerge.jsonl`.
@@ -276,7 +279,7 @@ call's first sample is also scored with the in-training rollout rules (`user_pro
 `score` of each `predictions.jsonl` call); `rule_metrics` summarizes them per task with `summarize_records`, the
 same metrics as W&B `<Task>_Evaluation/*` during training: `json_valid_ratio`, `rule_based_pass_ratio`,
 `truncated_ratio` and the task's own ratios (e.g. `topic_evidence_valid_ratio` for L1, `input_match_ratio` for L2 /
-L3 / L4 Hyper, `query_language_match_ratio_*` for L3 Commercial). The run ends with one line per task of these values.
+L3 / L4 Hyper, `language_match_ratio_en` / `_glb` for the language checks). The run ends with one line per task of these values.
 fastText `lid.176.bin` (language checks) is read from `UU_LLM/models/` (`LID_MODEL_PATH`). The main process downloads
 it if missing (60 s socket timeout) and loads it before starting the engines, so a missing file, no network or no
 `fasttext` fails at once instead of hanging at the end of Layer 3. Without internet access, copy the file there first.

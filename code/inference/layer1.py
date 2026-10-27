@@ -1,10 +1,9 @@
-"""Layer 1: one model call replaces the production layer1_delta -> layer1_actual -> layer1_intent and gives the
-layer1_postprocessing record."""
+"""Layer 1: one model call replaces the production layer1_delta -> layer1_actual and gives the layer1_postprocessing
+record (V3: no intent call and no content locale)."""
 
-from utils import (HERE, INPUT_MARKER, MAX_SIGNAL_ACTIONS, PROMPT_BUDGET, cap, dumps, layer1_keys_valid,
-                   normalize_language_tag)
+from utils import HERE, INPUT_MARKER, MAX_SIGNAL_ACTIONS, PROMPT_BUDGET, cap, dumps, layer1_keys_valid
 
-# Must stay identical to UU_LLM/prompts/prompt_l1.md, the prompt of the V2 SFT data.
+# Must stay identical to UU_LLM/prompts/prompt_l1.md, the prompt of the V3 SFT data.
 PROMPT = (HERE / "prompts" / "prompt_l1.md").read_text(encoding="utf-8")
 
 
@@ -28,11 +27,8 @@ def fit_prompt(signals: list[dict], encode) -> tuple[list[dict], list[int]]:
 
 
 def is_valid(output: dict) -> bool:
-    """Expected keys at every level (as in training) and string names / text, which later steps lowercase."""
-    return layer1_keys_valid(output) and all(
-        isinstance(interest[key], str) for interest in output["interests"]
-        for key in ("interest_name", "actual_activity", "inferred_intent")
-    ) and all(isinstance(topic["topic"], str) for interest in output["interests"] for topic in interest["topics"])
+    """Expected keys at every level (as in training); the schema also checks that names and text are strings."""
+    return layer1_keys_valid(output)
 
 
 def evidence_index(ref) -> int | None:
@@ -53,16 +49,15 @@ def evidence_index(ref) -> int | None:
 
 
 def to_record(user_id: str, date_str: str, output: dict | None, signals: list[dict]) -> dict:
-    """layer1_postprocessing, built as the production pipeline does from one answer instead of three calls.
+    """layer1_postprocessing, built as the production pipeline does from one answer instead of two calls.
 
     Layer1Delta keeps the interests and topics as the model wrote them and rebuilds evidence from the indices
-    (_reconstruct_evidence_from_indices: unknown / repeated indices are dropped); Layer1PostProcessing adds the
-    actual_activity / inferred_intent text. An answer that never
-    became valid gives no interests, like an unparseable layer1_delta response. predicted_content_locale is kept
-    only when it is a valid language tag (Layer1Delta: normalize_language_tag). The evidence keeps each signal's
-    detailed source from the input, although the model does not see it, and, like production, no intent.
+    (_reconstruct_evidence_from_indices: unknown / repeated indices are dropped) and each topic's source from its
+    evidence signals (the V3 answer has no topic source); Layer1PostProcessing adds the actual_activity text. An
+    answer that never became valid gives no interests, like an unparseable layer1_delta response. The evidence keeps
+    each signal's detailed source from the input, although the model does not see it. There is no inferred_intent and
+    no predicted_content_locale.
     """
-    locale = normalize_language_tag((output or {}).get("predicted_content_locale"))
     interests = []
     for interest in (output or {}).get("interests", []):
         topics = []
@@ -74,7 +69,7 @@ def to_record(user_id: str, date_str: str, output: dict | None, signals: list[di
                     indices.append(index)
             topics.append({
                 "topic": topic["topic"],
-                "source": topic["source"],
+                "source": list(dict.fromkeys(signals[i]["source"] for i in indices)),
                 "evidence": [{"date": signals[i]["date"], "source": [signals[i]["source"]],
                               "detailed_source": signals[i]["detailed_source"], "action": signals[i]["action"]}
                              for i in indices],
@@ -83,8 +78,5 @@ def to_record(user_id: str, date_str: str, output: dict | None, signals: list[di
             "interest_name": interest["interest_name"],
             "topics": topics,
             "actual_activity": interest["actual_activity"],
-            "inferred_intent": interest["inferred_intent"],
         })
-    return {"user_id": user_id, "date": date_str, "layer": "layer1_postprocessing",
-            **({"predicted_content_locale": locale} if locale else {}),
-            "interests": interests}
+    return {"user_id": user_id, "date": date_str, "layer": "layer1_postprocessing", "interests": interests}

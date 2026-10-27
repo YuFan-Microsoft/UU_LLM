@@ -1,22 +1,24 @@
 #!/usr/bin/env python3
-"""Rule-based cleaning of the Layer 3 commercial dataset (step2 output, one JSONL row per request).
+"""Rule-based cleaning of the GPT-5.6 Final Layer 3 commercial dataset (step1 output, one JSONL row per request).
 
 Input/output row format (unchanged by this step):
     {"input":  {"user_id", "date", "interests": [{"interest_name", "actual_activity", "sources",
-                                                  "topics": [{"topic", "actions"}]}],
-                "query_language"},
+                                                  "topics": [{"topic", "actions"}]}]},
      "output": {"interest_commercial": [...]}}
+GPT-5.6 Final writes brands / retailers / products / predicted_queries for every interest, commercial or not
+("BRQP scope"), in the language of the evidence actions; there is no query_language input any more, so the step2
+language detection is not used for this data.
 
-1. Skeleton: `output` must match OUTPUT_SCHEMA (the legal output format of
-   prompts/layer3_commercial_interests.md, "Output" + "Validate before output" #1/#7) and every entry
+1. Skeleton: `output` must match OUTPUT_SCHEMA (the legal output format of the GPT-5.6 Final
+   Layer 3 commercial prompt, "Output" + "Validate before output" #1/#7) and every entry
    must keep the prompt's key order:
        {"interest_commercial": [                                   # non-empty, nothing else
          {"interest_name": str,                                   # non-empty
           "commercial": bool,
           "commercial_score": "low"|"medium"|"high",               # null when commercial=false
           "intent_funnel_stage": "discovery"|"research"|"consideration"|"purchase"|"post-purchase",  # null when false
-          "brands": [str], "retailers": [str], "products": [str],  # non-empty strings; [] when false
-          "predicted_queries": [str]}]}                            # 1-3 non-empty strings; [] when false
+          "brands": [str], "retailers": [str], "products": [str],  # non-empty strings, may be []
+          "predicted_queries": [str]}]}                            # 0-3 non-empty strings; >= 1 when commercial
    A row whose output breaks the skeleton is dropped as "schema_violation"; the report breaks the
    violations down by field and failed check.
 2. Rows with a valid skeleton are then checked against the content RULES (alignment with the input
@@ -54,7 +56,6 @@ MAX_QUERIES = 3
 
 NON_EMPTY_STRING = {"type": "string", "pattern": r"\S"}
 STRING_LIST = {"type": "array", "items": NON_EMPTY_STRING}
-EMPTY_LIST = {"type": "array", "maxItems": 0}
 ENTRY_SCHEMA = {
     "type": "object",
     "required": list(ENTRY_KEYS),
@@ -78,7 +79,6 @@ ENTRY_SCHEMA = {
     "else": {"properties": {
         "commercial_score": {"const": None},
         "intent_funnel_stage": {"const": None},
-        **{key: EMPTY_LIST for key in (*ENTITY_KEYS, "predicted_queries")},
     }},
 }
 OUTPUT_SCHEMA = {
@@ -89,8 +89,9 @@ OUTPUT_SCHEMA = {
 }
 OUTPUT_VALIDATOR = Draft202012Validator(OUTPUT_SCHEMA)
 
-# Query languages written without spaces between words; the query word-count rule is skipped for them.
-UNSPACED_LANGUAGES = {"ja", "zh-Hans", "zh-Hant", "zh", "th"}
+# Scripts written without spaces between words (Han, kana, Thai, Lao, Khmer, Myanmar); the query word-count rule is
+# skipped for queries containing them.
+UNSPACED_SCRIPT = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uf900-\ufaff\u0e00-\u0eff\u1000-\u109f\u1780-\u17ff]")
 # Looser than the prompt's 2-6 words so that slightly long but valid queries are kept.
 MIN_QUERY_WORDS, MAX_QUERY_WORDS = 2, 10
 
@@ -106,7 +107,7 @@ RULES = {
     # C. content
     "duplicate_entity": "brands, retailers, or products repeats a string (case-insensitive)",
     "duplicate_query": "An interest repeats a predicted query (case-insensitive)",
-    "query_word_count": "A query is not 2-10 words (skipped for ja/zh/th query languages)",
+    "query_word_count": "A query is not 2-10 words (skipped for queries in Han / kana / Thai / Lao / Khmer / Myanmar script)",
     "query_question": "A query ends with a question mark",
 }
 FLAGS = {
@@ -150,15 +151,15 @@ def evidence_text(interest: dict) -> str:
     return normalize(" ".join(str(part or "") for part in parts))
 
 
-def check_entry(entry: dict, query_language: str, evidence: str, reasons: set[str], flags: set[str]) -> None:
-    """Content rules for one skeleton-valid commercial=true entry."""
+def check_entry(entry: dict, evidence: str, reasons: set[str], flags: set[str]) -> None:
+    """Content rules for one skeleton-valid entry (commercial or not: both carry entities and queries)."""
     queries = entry["predicted_queries"]
     if any(has_duplicates(entry[key]) for key in ENTITY_KEYS):
         reasons.add("duplicate_entity")
     if has_duplicates(queries):
         reasons.add("duplicate_query")
     for query in queries:
-        if query_language not in UNSPACED_LANGUAGES and not MIN_QUERY_WORDS <= len(query.split()) <= MAX_QUERY_WORDS:
+        if not UNSPACED_SCRIPT.search(query) and not MIN_QUERY_WORDS <= len(query.split()) <= MAX_QUERY_WORDS:
             reasons.add("query_word_count")
         if query.rstrip().endswith(("?", "？")):
             reasons.add("query_question")
@@ -189,15 +190,13 @@ def check_row(record: dict) -> tuple[set[str], set[str], set[str]]:
     if len(set(names)) < len(names):
         reasons.add("duplicate_input_name")
     evidence = {interest.get("interest_name"): evidence_text(interest) for interest in interests}
-    query_language = source.get("query_language") or ""
     returned: Counter[str] = Counter()
     for entry in output["interest_commercial"]:
         name = entry["interest_name"]
         if name not in evidence:
             reasons.add("unknown_interest_name")
         returned[name] += 1
-        if entry["commercial"]:
-            check_entry(entry, query_language, evidence.get(name, ""), reasons, flags)
+        check_entry(entry, evidence.get(name, ""), reasons, flags)
     if any(returned[name] == 0 for name in names):
         reasons.add("interest_not_covered")
     if any(count > 1 for count in returned.values()):
@@ -211,7 +210,7 @@ def clean(args: argparse.Namespace) -> dict:
     sole: Counter[str] = Counter()
     violation_counts: Counter[str] = Counter()
     kept_flags: Counter[str] = Counter()
-    kept_languages: Counter[str] = Counter()
+    kept_commercial: Counter[str] = Counter()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
     with args.input.open("rb") as source, temporary.open("wb", buffering=16 * 1024 * 1024) as destination:
@@ -231,7 +230,7 @@ def clean(args: argparse.Namespace) -> dict:
             kept += 1
             kept_entries += len(record["output"]["interest_commercial"])
             kept_flags.update(flags)
-            kept_languages[record["input"].get("query_language")] += 1
+            kept_commercial.update(str(entry["commercial"]).lower() for entry in record["output"]["interest_commercial"])
     os.replace(temporary, args.output)
 
     fraction = lambda count, total: round(count / total, 6) if total else 0.0  # noqa: E731
@@ -258,7 +257,7 @@ def clean(args: argparse.Namespace) -> dict:
             flag: {"rows": kept_flags[flag], "fraction": fraction(kept_flags[flag], kept)}
             for flag in sorted(FLAGS, key=lambda f: (-kept_flags[f], f))
         },
-        "kept_query_language_counts": dict(kept_languages.most_common()),
+        "kept_entries_by_commercial": dict(kept_commercial.most_common()),
     }
 
 
@@ -279,7 +278,7 @@ def write_reports(report: dict, args: argparse.Namespace) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Rule-based cleaning of the Layer 3 commercial JSONL dataset.")
-    parser.add_argument("--input", required=True, type=Path, help="step2 JSONL (e.g. step2_language_detection.jsonl)")
+    parser.add_argument("--input", required=True, type=Path, help="step1 merged JSONL")
     parser.add_argument("--output", required=True, type=Path, help="Cleaned JSONL path")
     parser.add_argument("--limit", type=int, default=0, help="Only process the first N rows (0 = all)")
     args = parser.parse_args()

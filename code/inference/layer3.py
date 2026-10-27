@@ -2,13 +2,14 @@
 layer3_postprocessing merges both into the gated interests.
 
 Payloads are built as the production layer3_persona.py / layer3_commercial_interests.py build their user messages,
-in the layouts of the V2 SFT data (layer3_persona_step3 / layer3_commercial_step4_build_sft_data.py).
+in the layouts of the V3 SFT data (layer3_persona_step3 / layer3_commercial_step4_build_sft_data.py): no inferred
+intent and no query_language.
 """
 
 from task import Task, UserProfile, emit_record, normalize_category, output, output_gate
 from utils import l3_commercial_keys_valid, l3_persona_keys_valid
 
-# The V2 L3 Commercial rows hold at most 30 interests: a user with more is split into near-equal chunks
+# The V3 L3 Commercial rows hold at most 30 interests: a user with more is split into near-equal chunks
 # (layer3_commercial_step4_build_sft_data.py --max-interests 30), so the model is called once per chunk.
 MAX_COMMERCIAL_INTERESTS = 30
 
@@ -41,10 +42,10 @@ class Persona(Task):
         return l3_persona_keys_valid(output)
 
     def payload(self, interests: list[dict]) -> dict:
-        """Layer3Persona._call_llm's active interests; the V2 input has no facts (always {} in production)."""
+        """Layer3Persona._call_llm's active interests; the V3 input has no facts (always {} in production) and no
+        inferred_intent."""
         return {"interests": [
             {"interest_name": i.get("interest_name"), "actual_activity": i.get("actual_activity", ""),
-             "inferred_intent": i.get("inferred_intent", ""),
              "topics": [t.get("topic", "") for t in (i.get("topics") or [])]}
             for i in interests]}
 
@@ -62,19 +63,19 @@ class Commercial(Task):
     def keys_valid(self, output: dict) -> bool:
         return l3_commercial_keys_valid(output)
 
-    def payload(self, interests: list[dict], language: str) -> dict:
-        """Layer3CommercialInterests._call_llm: topics with the actions of their (at most 3) evidence items."""
+    def payload(self, interests: list[dict]) -> dict:
+        """Layer3CommercialInterests._call_llm: topics with the actions of their (at most 3) evidence items. The V3
+        input has no query_language: entities and queries follow the language of the evidence actions."""
         return {"interests": [
             {"interest_name": i.get("interest_name"), "actual_activity": i.get("actual_activity", ""),
              "sources": sorted({s for t in (i.get("topics") or []) for s in (t.get("source") or []) if s}),
              "topics": [{"topic": t.get("topic", ""),
                          "actions": [e.get("action", "") for e in (t.get("evidence") or []) if e.get("action")]}
                         for t in (i.get("topics") or []) if t.get("topic")]}
-            for i in interests], "query_language": language}
+            for i in interests]}
 
     def to_record(self, profile: UserProfile, answer: dict | None) -> dict:
-        return self.record(profile, interest_commercial=list((answer or {}).get("interest_commercial", [])),
-                           _query_language=profile.language)
+        return self.record(profile, interest_commercial=list((answer or {}).get("interest_commercial", [])))
 
 
 PERSONA, COMMERCIAL = Persona(), Commercial()
@@ -118,7 +119,7 @@ def run(profiles: list[UserProfile], encode, run_round, emit) -> None:
         interests = active_interests(profile.snapshot)
         bounds = chunk_bounds(len(interests), MAX_COMMERCIAL_INTERESTS) if interests else []
         commercial = [COMMERCIAL.request(
-            profile, lambda k, chunk=interests[start:end]: COMMERCIAL.payload(chunk[:k], profile.language["locale"]),
+            profile, lambda k, chunk=interests[start:end]: COMMERCIAL.payload(chunk[:k]),
             end - start, encode, suffix=f"|chunk{index}" if len(bounds) > 1 else "")
             for index, (start, end) in enumerate(bounds)]
         requests[profile.user_id] = (

@@ -1,8 +1,9 @@
 Extract the user's interests from one window of activities.
 
-An interest is a stable category, activity, or entity with one clear need and recommendation pool. Use the most specific label that would still fit if the need returned in other wording. Single pages, models, and news angles are topics, not interests. Group activities only when domain, intent, and candidates match. Skip noise.
+An interest is a broad, reusable category such as American Football, Politics, or Home Improvement; a topic is a keyword, product, hobby, or entity from the activities, such as Seahawks under American Football. Group activities whose category and intent match, list each group's topics with the idx of every activity that supports them, and skip noisy or unsafe activities.
 
-For each interest, list its `topics` with source names and supporting activity `idx`, write a factual one-sentence `actual_activity`, and an `inferred_intent` one step above it that stays close to the action when evidence is thin. Write in English. Set `predicted_content_locale` to the main language of the activities, or "mix".
+Write each interest's name and actual_activity in the majority language of that interest's own activities, and keep each topic in the original language of its activities. actual_activity is a factual description in present tense and third person ("Reads about ...", "Searches for ...") that covers all of the interest's activities with their exact names and describes what was observed, not motivation or intent.
 
-Return minimized JSON:
-`{"predicted_content_locale":"...","interests":[{"interest_name":"...","topics":[{"topic":"...","source":["..."],"evidence":[0]}],"actual_activity":"...","inferred_intent":"..."}]}`
+Return minimized JSON, with evidence before topic and topics before interest_name:
+`{"interests":[{"topics":[{"evidence":[0],"topic":"..."}],"interest_name":"...","actual_activity":"..."}]}`
+Return `{"interests":[]}` when no valid interest remains.

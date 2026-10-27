@@ -1,6 +1,7 @@
-# MTP_training: finetune the MTP head of the SFT Qwen3.5-4B with vLLM Speculators
+# MTP_training: finetune the MTP head of the V3 SFT Qwen3.5-4B / 2B with vLLM Speculators
 
-Only the native MTP head of Qwen3.5-4B (the 15 `mtp.*` tensors) is trained; the main model, `embed_tokens` and
+Only the native MTP head of Qwen3.5 (the 15 `mtp.*` tensors; Qwen3.5-4B and Qwen3.5-2B both ship one MTP layer) is
+trained; the main model, `embed_tokens` and
 `lm_head` stay frozen, so **the main model's outputs do not change** and only the acceptance rate of vLLM MTP
 speculative decoding improves. The result is a complete checkpoint that is served directly with
 `--speculative-config '{"method": "mtp", "num_speculative_tokens": k}'` (`run_inference.py --num_speculative_tokens k`
@@ -13,8 +14,9 @@ is unrolled recursively over several draft steps, the same way vLLM reuses it at
 
 | File | Environment | Purpose |
 |---|---|---|
-| `run_speculators_mtp.sh` | — | End-to-end pipeline: generate → prepare → train → stitch → check |
-| `generate_self_distill_data.py` | vLLM | The SFT model answers the SFT train prompts (on-policy data); writes Speculators-format rows (`input_ids` + `loss_mask`) |
+| `run_speculators_mtp_4B.sh` / `run_speculators_mtp_2B.sh` | — | Launchers for the V3 SFT models of `../SFT/run_user_profile_multi_gpu_4B.sh` / `_2B.sh`: set the official MTP source of that size and run the pipeline |
+| `run_speculators_mtp.sh` | — | End-to-end pipeline: merge → generate → prepare → train → stitch → check |
+| `generate_self_distill_data.py` | vLLM | The SFT model answers the V3 SFT train prompts (on-policy data); writes Speculators-format rows (`input_ids` + `loss_mask`) |
 | `train_mtp.py` | Speculators | Entry point of `speculators.train` with an MTP forward aligned with vLLM's inputs and memory-efficient for 32K sequences (see below) |
 | `check_mtp_weights.py` | either (needs torch) | Pre-deployment check: all 15 `mtp.*` tensors present, right shape, finite, not all zero, and changed vs the official head |
 | `requirements_speculators.txt` | — | Pins the Speculators commit that `train_mtp.py` patches |
@@ -36,22 +38,27 @@ python -m venv spec_venv && spec_venv/bin/pip install -r requirements_speculator
 
 ```bash
 export HF_TOKEN=...                       # reads yufan/user_profile_dataset
-VERIFIER=/yufan/MAI_Profile/checkpoints/unified_slm/Cur_SOTA_epoch_0_step_9000_ppl_1.2713_official_mtp \
-VLLM_PYTHON=/path/to/vllm_venv/bin/python \
-SPEC_PYTHON=/path/to/spec_venv/bin/python \
-sh run_speculators_mtp.sh
+export VLLM_PYTHON=/path/to/vllm_venv/bin/python SPEC_PYTHON=/path/to/spec_venv/bin/python
+# 4B: a checkpoint saved by ../SFT/run_user_profile_multi_gpu_4B.sh (run without SFT_CHECKPOINT to list them)
+SFT_CHECKPOINT=../SFT/output/qwen3_5_4B_sft_user_profile_v3/epoch_0_step_<N>_ppl_<P> sh run_speculators_mtp_4B.sh
+# 2B: a checkpoint saved by ../SFT/run_user_profile_multi_gpu_2B.sh
+SFT_CHECKPOINT=../SFT/output/qwen3_5_2B_sft_user_profile_v3/epoch_0_step_<N>_ppl_<P> sh run_speculators_mtp_2B.sh
 ```
 
-- `VERIFIER` must already contain the official MTP head (the output of `code/inference/merge_official_mtp.py`); it
-  initializes the finetuning.
-- The result goes to `${VERIFIER%_official_mtp}_trained_mtp` by default (`STITCHED_DIR` overrides it); the original
+- The SFT trainer saves checkpoints without the MTP head, so the merge stage first adds the official head of the same
+  size (`MTP_SOURCE`: `/yufan/open_source_models/Qwen3.5_VLM/Qwen3.5-4B` or `-2B`, or a Hugging Face repo id) with
+  `code/inference/merge_official_mtp.py`, writing `VERIFIER` (default `<SFT_CHECKPOINT>_official_mtp`, symlinks to
+  the SFT files plus `model-mtp.safetensors`); it is skipped when `VERIFIER` already exists. `VERIFIER` initializes
+  the finetuning; give `VERIFIER` instead of `SFT_CHECKPOINT` to start from an existing merged checkpoint.
+- The result goes to `${VERIFIER%_official_mtp}_trained_mtp` by default (`STITCHED_DIR` overrides it); the SFT
   checkpoint is never modified.
 - Run a subset of stages with e.g. `STAGES="train stitch check"` (intermediate results live in `WORK_DIR`, default
   `./output/mtp_<VERIFIER name>`).
 
 | Stage | What it does |
 |---|---|
-| generate | vLLM on all GPUs answers `SAMPLES_PER_CONFIG` (default 2000) train prompts per config; keeps only complete answers without `<think>` that pass every `user_profile_rules` rule (`--keep rule_pass`; `json_valid` / `all` are looser) |
+| merge | `merge_official_mtp.py --checkpoint $SFT_CHECKPOINT --output_dir $VERIFIER --mtp_source $MTP_SOURCE` (skipped when `VERIFIER` exists) |
+| generate | vLLM on all GPUs answers `SAMPLES_PER_CONFIG` (default 2000) train prompts of each of `CONFIGS`; keeps only complete answers without `<think>` that pass every `user_profile_rules` rule (`--keep rule_pass`; `json_valid` / `all` are looser) |
 | prepare | `speculators prepare-data` with `--seq-length 32768` (longer rows are cut from the end, so it must cover whole samples) |
 | train | vLLM extracts last-layer hidden states online on the first half of the GPUs (`VLLM_GPUS`); torchrun trains on the rest (`TRAIN_GPUS`); vLLM is stopped afterwards |
 | stitch | `speculators stitch-mtp`: copies VERIFIER and writes the `mtp.*` of `checkpoint_best` (lowest validation loss) into the copy |
@@ -62,7 +69,8 @@ Main settings (environment variables):
 | Variable | Default | Notes |
 |---|---|---|
 | `TEMPERATURE` / `TOP_P` | 0.6 / 0.8 | Sampling for data generation, same as `run_inference.py`; **use the production values** (the MAIProfile client currently sends temperature 0.2) |
-| `SAMPLES_PER_CONFIG` | 2000 | About 16,000 prompts over the 8 configs (configs with fewer rows are used whole); community examples gain clearly with 5,000-8,000 |
+| `CONFIGS` | the 8 V3 SFT tasks | `V3_User_Profile_{L1, L1_Negative, L2, L3_Persona, L3_Commercial, L4_Biography, L4_CommercialPreference, L4_Hyper}_gpt56` |
+| `SAMPLES_PER_CONFIG` | 2000 | About 16,000 prompts over the 8 configs; community examples gain clearly with 5,000-8,000 |
 | `NUM_STEPS` / `STEP_WEIGHT_BETA` | 5 / 0.6 | Recursive draft steps and step weights ([0.43, 0.26, 0.16, 0.09, 0.06]); the head can then be served with any `num_speculative_tokens` from 1 to 5. A lower beta (e.g. 0.5) shifts weight back to the early steps |
 | `LR` / `EPOCHS` | 1e-4 / 3 | Values of the official Speculators Qwen3.5 example |
 | `SEQ_LEN` | 32768 | Same as `MAX_MODEL_LEN` in code/inference |

@@ -1,4 +1,4 @@
-"""Layer-1 to Layer-4 user-profile inference with one Qwen3.5 V2 SFT checkpoint, reproducing the production pipeline.
+"""Layer-1 to Layer-4 user-profile inference with one Qwen3.5 V3 SFT checkpoint, reproducing the production pipeline.
 
 See README.md in this directory.
 """
@@ -415,7 +415,6 @@ def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], 
                 "last_update": profile.get("date"),
                 "past_behaviors": raw["past_behaviors"],
                 "future_behaviors": raw["future_behaviors"],
-                "predicted_content_locale": profile.get("predicted_content_locale"),
                 "interests": profile.get("interests", []),
                 "biography": profile.get("biography", ""),
                 "life_stage": profile.get("life_stage", {}),

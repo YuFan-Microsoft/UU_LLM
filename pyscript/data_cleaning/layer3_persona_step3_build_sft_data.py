@@ -8,8 +8,9 @@ Each row becomes:
      "user_hash": sha256(user_id)[:16]}
 
 PROMPT is prompts/prompt_l3_persona.md verbatim. The input carries only the teacher's `active_interests` as
-`interests` (no user_id, date, or facts: GPT-5.6 facts are always {} and the prompt does not use them; rows with
-non-empty facts are counted in the summary). JSON is minified. Train/test is
+`interests`, without `inferred_intent` (intent is no longer predicted upstream), and no user_id, date, or facts
+(GPT-5.6 facts are always {} and the prompt does not use them; rows with non-empty facts are counted in the summary).
+Category and persona are written in each interest's own language (GPT-5.6 Final). JSON is minified. Train/test is
 split by user_hash exactly as in layer3_commercial_step4_build_sft_data.py (--test-ratio, or --test-rows in
 bucket order). Rows are never filtered by length; with --tokenizer the full-chat token percentiles are reported.
 """
@@ -32,11 +33,13 @@ from layer3_commercial_step4_build_sft_data import lowest_bucket_users, user_has
 
 
 PROMPT = (Path(__file__).resolve().parents[2] / "prompts" / "prompt_l3_persona.md").read_text(encoding="utf-8")
+DROPPED_INTEREST_KEYS = {"inferred_intent"}
 
 
 def build_example(record: dict) -> dict:
     source = record["input"]
-    payload = {"interests": source["active_interests"]}
+    payload = {"interests": [{key: value for key, value in interest.items() if key not in DROPPED_INTEREST_KEYS}
+                             for interest in source["active_interests"]]}
     return {
         "messages": [
             {"role": "user", "content": PROMPT + INPUT_MARKER + dumps(payload)},

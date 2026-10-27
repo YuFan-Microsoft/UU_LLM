@@ -1,37 +1,52 @@
 #!/usr/bin/env python3
-"""Merge the GPT-5.6 Layer 4 hyper mission discovery and enhancement calls into one JSONL row per user-day.
+"""Merge the GPT-5.6 Final Layer 4 hyper mission discovery and query generation calls into one JSONL row per user-day.
 
-The GPT-5.6 pipeline makes one discovery call per user-day (ProcessData/layer4_hyper_commercial_interest_mission.jsonl,
-output {"candidate_missions": [{"mission_name", "source_interests", "scenarios"}]}) and then one enhancement call per
-candidate mission (ProcessData/layer4_hyper_commercial_interest_query.jsonl, output: audit blocks plus
-"enhanced_missions"). Both requests carry only a system message: the shared instructions followed by an <input> block
-(see layer4_hyper_mission_discovery_step1_merge_input_output.py). This script folds the two stages into one task:
+Source files (Training_Data_InferredByGPT56_Final/process_dataset/L4/), one call per line
+{"id", "input": [{"role": "system", "content"}], "output": <JSON string>}; the system message is the shared
+instructions followed by an <input> block (see layer4_hyper_mission_discovery_step1_merge_input_output.py):
+    l4_hyper_mission_discovery.jsonl   one call per user-day, <input> sections Personal context, Professional context,
+                                       Commercial preferences and Source commercial interest profile ("### Interest N:"
+                                       blocks); output {"candidate_missions": [{"mission_name", "source_interests",
+                                       "scenarios"}]}
+    l4_hyper_query_generation.jsonl    one call per candidate mission, <input> sections Assigned candidate mission
+                                       ("### Candidate 1: <name>"), Detailed source evidence, the same three context
+                                       sections, and filtered world knowledge; output: audit blocks plus
+                                       "enhanced_missions"
+Neither carries a user id, and the Date is the same run date for every snapshot, so the three context sections
+(identical in both stages for one call chain) identify a user's calls but not which snapshot: one user often has several
+discovery calls with the same context. Discovery calls are grouped by their full input (context and interest
+profile): the pipeline often ran discovery several times on one input, and the candidates differ between those runs.
+A query generation call belongs to the input whose context and candidate mission name it carries; a candidate name
+that more than one distinct input with that context proposes is ambiguous (those inputs are dropped). Each input yields
+at most one row: the first of its discovery runs (in file order) whose every candidate has a query generation call
+with an enhanced_missions list; when a candidate has several such calls, the first is used.
 
-    {"input":  {"user_id", "date",
-                "query_language",            # from the enhancement instructions ("... natively in `<lang>`.")
-                "personal_context", "professional_context", "commercial_preferences",   # discovery <input> section
-                                                                                       # text, may be ""
-                "commercial_interests"},     # discovery "### Interest N: <name>" blocks
+With --user-index (written by --write-user-index from the Layer 4 commercial preference SFT rows or step1 output) the
+user is recovered from the commercial preferences' affinity.shopping.product_categories, which the pipeline copies from
+that user's Layer 4 commercial preference answer (the description gains a final period); otherwise user_hash is a
+hash of the context key, so train/test can still be split per user context.
+
+This folds the two stages into one task:
+    {"input":  {"user_hash", "date",
+                "personal_context", "professional_context", "commercial_preferences",   # section text, may be ""
+                "commercial_interests"},     # discovery "### Interest N: <name>" blocks without "- Intent:" lines
      "output": {"missions": [<enhanced mission without input_mission_name>, ...]}}
+Intent is no longer predicted upstream, so the interest blocks drop their "- Intent:" line. GPT-5.6 Final has no
+query language instruction (queries follow the language of the source interests), so there is no query_language.
 
-The missions are the enhanced_missions of every candidate in discovery order; a candidate whose enhancement returned
-no mission contributes nothing. Since the candidates were enhanced in separate calls, a query repeated by a later
-mission is removed (a mission left with no query is removed), and a query-level copy of enrichment_sources is
-dropped. The enhancement audit blocks (price_tier_resolution, shopping_category_opportunities,
-...) are dropped, and so is input_mission_name (the candidate name of the dropped intermediate step). The interests are
-the discovery blocks for every interest (the enhancement "Detailed source evidence" exists only for the interests a
-candidate picked, so using it would leak the discovery decision).
-
-Requests are grouped by user-day (user_id and the Date line of the <input> block), so a user with several days yields
-one row per day. A user-day is kept only if it has exactly one discovery request and that request finished normally
-with candidate missions, and every candidate has exactly one enhancement request that finished normally with an
-enhanced_missions list and the same query language. The report (<output stem>.report.json) counts every drop reason.
+The missions are the enhanced_missions of every candidate in discovery order; a candidate whose call returned no
+mission contributes nothing. Since the candidates were enhanced in separate calls, a query repeated by a later mission
+is removed (a mission left with no query is removed), and a query-level copy of enrichment_sources is dropped. The
+audit blocks (geo_resolution, shopping_category_opportunities, ...) and input_mission_name are dropped. A user-day is
+kept only if its discovery call finished with candidate missions and every candidate has exactly one query generation
+call with an enhanced_missions list. The report (<output stem>.report.json) counts every drop reason.
 """
 
 from __future__ import annotations
 
 import argparse
 from collections import Counter, defaultdict
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -42,15 +57,20 @@ import orjson
 from tqdm import tqdm
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from layer3_commercial_step1_merge_input_output import process_data_output  # noqa: E402
+from layer3_commercial_step1_merge_input_output import json_object  # noqa: E402
 from layer4_hyper_mission_discovery_step1_merge_input_output import (  # noqa: E402
-    DATE_LINE, DISCOVERY_HEADERS, INPUT_BLOCK, split_input_sections,
+    DISCOVERY_HEADERS, split_input_sections,
 )
 
 
-QUERY_LANGUAGE = re.compile(r"Generate every candidate and final query natively in `([^`]+)`")
 CANDIDATE = re.compile(r"(?m)^### Candidate \d+: (.+)$")
 ASSIGNED_HEADER = "Assigned candidate mission and source interests:\n"
+CONTEXT_HEADERS = {"Personal context": "personal_context", "Professional context": "professional_context",
+                   "Commercial preferences": "commercial_preferences"}
+INTENT_LINE = re.compile(r"(?m)^- Intent:.*\n?")
+QUERY_GENERATION_HEADERS = {**CONTEXT_HEADERS, ASSIGNED_HEADER[:-2]: "assigned",
+                            "Detailed source evidence": "source_evidence",
+                            "Filtered world knowledge selected from the original interest profile": "world_knowledge"}
 
 
 def mission_key(name: object) -> str:
@@ -58,129 +78,162 @@ def mission_key(name: object) -> str:
 
 
 def system_prompt(record: dict) -> str:
-    return next((m["content"] for m in record["request"]["messages"] if m.get("role") == "system"), "")
+    return next((m["content"] for m in record.get("input") or [] if m.get("role") == "system"), "")
 
 
-def discovery_entry(record: dict, sections: dict | None, counts: Counter) -> dict | str:
-    """The usable discovery fields of one request, or the drop reason."""
-    output = process_data_output(record, stage_counts := Counter())
-    counts.update({f"discovery_{key}": value for key, value in stage_counts.items()})
-    if output is None:
-        return "drop_discovery_failed"
-    if sections is None:
-        return "drop_discovery_unparseable"
-    candidates = output.get("candidate_missions")
-    if not isinstance(candidates, list) or not all(isinstance(c, dict) for c in candidates):
-        return "drop_discovery_bad_candidates"
-    if not candidates:
-        return "drop_discovery_no_candidates"
-    keys = [mission_key(candidate.get("mission_name")) for candidate in candidates]
-    if not all(keys) or len(set(keys)) < len(keys):
-        return "drop_discovery_bad_candidates"
-    return {"date": sections["date"], "personal_context": sections["personal_context"],
-            "professional_context": sections["professional_context"],
-            "commercial_preferences": sections["commercial_preferences"],
-            "commercial_interests": sections["commercial_interests"], "candidates": keys}
+def context_key(sections: dict) -> bytes:
+    return hashlib.md5(orjson.dumps([sections["date"], *(sections[field] for field in CONTEXT_HEADERS.values())])).digest()
 
 
-def load_discovery(path: Path, counts: Counter) -> dict[tuple[str, str], dict]:
-    """(user_id, date) -> {"date", "commercial_preferences", "commercial_interests", "candidates"} for usable
-    user-days. Records are reduced to these fields while reading, so the file is never held in memory."""
-    entries: dict[tuple[str, str], list] = defaultdict(list)
+def categories_key(preferences) -> str | None:
+    """Hash of affinity.shopping.product_categories as (category, description without its final period), or None."""
+    try:
+        categories = preferences["affinity"]["shopping"]["product_categories"]
+        pairs = [(item["category"], " ".join(str(item["description"]).split()).rstrip(".").casefold())
+                 for item in categories]
+    except (KeyError, TypeError):
+        return None
+    return hashlib.md5(orjson.dumps(pairs)).hexdigest() if pairs else None
+
+
+def affinity_key(commercial_preferences: str) -> str | None:
+    return categories_key(json_object(commercial_preferences))
+
+
+def write_user_index(paths: list[Path], output: Path) -> None:
+    """product_categories hash -> user_hash for every Layer 4 commercial preference answer, read from SFT rows
+    ({"messages", "user_hash"}) or step1 rows ({"input": {"user_id"}, "output"}); keys shared by several users are
+    left out."""
+    users: dict[str, set[str]] = defaultdict(set)
+    for path in paths:
+        with path.open("rb") as source:
+            for line in tqdm(source, desc=f"Indexing {path.name}", unit="rows"):
+                record = orjson.loads(line)
+                if "messages" in record:
+                    answer, hashed = json_object(record["messages"][-1]["content"]), record["user_hash"]
+                else:
+                    answer = record.get("output")
+                    hashed = hashlib.sha256(record["input"]["user_id"].encode("utf-8")).hexdigest()[:16]
+                key = categories_key(answer)
+                if key:
+                    users[key].add(hashed)
+    with output.open("wb") as destination:
+        for key, hashes in users.items():
+            if len(hashes) == 1:
+                destination.write(orjson.dumps({"affinity": key, "user_hash": next(iter(hashes))}) + b"\n")
+    print(json.dumps({"affinities": len(users), "written": sum(len(h) == 1 for h in users.values())}))
+
+
+def load_discovery(path: Path, counts: Counter) -> tuple[dict[bytes, list], dict[tuple, bytes]]:
+    """(input id -> [(byte offset, candidate keys)] for each distinct discovery run on that input, (context key,
+    candidate key) -> input id); the input id is the hash of the full input."""
+    calls: dict[bytes, list] = defaultdict(list)
+    seen: set[bytes] = set()
+    owners: dict[tuple, set[bytes]] = defaultdict(set)
+    position = 0
     with path.open("rb") as source:
         for line in tqdm(source, desc=f"Reading {path.name}", unit="rows"):
+            offset, position = position, position + len(line)
+            counts["discovery_lines"] += 1
             record = orjson.loads(line)
             sections = split_input_sections(system_prompt(record), DISCOVERY_HEADERS)
-            key = (record.get("user_id") or "", sections["date"] if sections else "")
-            entries[key].append(discovery_entry(record, sections, counts))
-    counts["discovery_lines"] = sum(len(value) for value in entries.values())
-    counts["discovery_users"] = len({user_id for user_id, _ in entries})
-    counts["discovery_user_days"] = len(entries)
+            if sections is None or not sections["commercial_interests"]:
+                counts["drop_discovery_unparseable"] += 1
+                continue
+            call_id = hashlib.md5(orjson.dumps(sections, option=orjson.OPT_SORT_KEYS)).digest()
+            output = json_object(record.get("output") or "")
+            candidates = (output or {}).get("candidate_missions")
+            if output is None or not isinstance(candidates, list) or not all(isinstance(c, dict) for c in candidates):
+                counts["drop_discovery_bad_output"] += 1
+                continue
+            if not candidates:
+                counts["drop_discovery_no_candidates"] += 1
+                continue
+            keys = [mission_key(c.get("mission_name")) for c in candidates]
+            if not all(keys) or len(set(keys)) < len(keys):
+                counts["drop_discovery_bad_candidates"] += 1
+                continue
+            run_id = hashlib.md5(call_id + orjson.dumps(keys)).digest()
+            if run_id in seen:
+                counts["discovery_identical_run_skipped"] += 1
+                continue
+            seen.add(run_id)
+            context = context_key(sections)
+            calls[call_id].append((offset, keys))
+            for key in keys:
+                owners[(context, key)].add(call_id)
+    ambiguous = {call_id for ids in owners.values() if len(ids) > 1 for call_id in ids}
+    counts["drop_input_ambiguous_candidate"] = len(ambiguous)
+    calls = {call_id: runs for call_id, runs in calls.items() if call_id not in ambiguous}
+    owner = {key: next(iter(ids)) for key, ids in owners.items() if len(ids) == 1 and next(iter(ids)) in calls}
+    counts["discovery_inputs_kept"] = len(calls)
+    counts["discovery_inputs_with_several_runs"] = sum(len(runs) > 1 for runs in calls.values())
+    return calls, owner
 
-    users = {}
-    for key, found in entries.items():
-        if not key[0] or len(found) != 1:
-            counts["drop_discovery_not_one_request_per_user_day"] += 1
-            continue
-        if isinstance(found[0], str):
-            counts[found[0]] += 1
-            continue
-        counts["discovery_personal_context_nonempty"] += bool(found[0]["personal_context"])
-        counts["discovery_professional_context_nonempty"] += bool(found[0]["professional_context"])
-        users[key] = found[0]
-    return users
 
-
-def load_enhancement(path: Path, users: dict[tuple[str, str], dict],
-                     counts: Counter) -> dict[tuple[str, str], dict[str, list]]:
-    """(user_id, date) -> candidate key -> [(query_language, enhanced_missions JSON bytes or None)] for the user-days
-    in `users`. The missions stay serialized until merge_user to keep memory low."""
-    calls: dict[tuple[str, str], dict[str, list]] = defaultdict(lambda: defaultdict(list))
+def load_query_generation(path: Path, owner: dict[tuple, bytes], counts: Counter) -> dict[bytes, dict[str, list]]:
+    """input id -> candidate key -> [enhanced_missions JSON bytes or None]."""
+    calls: dict[bytes, dict[str, list]] = defaultdict(lambda: defaultdict(list))
     with path.open("rb") as source:
         for line in tqdm(source, desc=f"Reading {path.name}", unit="rows"):
-            counts["enhancement_lines"] += 1
+            counts["query_generation_lines"] += 1
             record = orjson.loads(line)
             prompt = system_prompt(record)
-            block = INPUT_BLOCK.search(prompt)
-            date = DATE_LINE.search(block["body"]) if block else None
-            key = (record.get("user_id") or "", date["date"] if date else "")
-            if key not in users:
-                counts["enhancement_user_not_kept"] += 1
+            sections = split_input_sections(prompt, QUERY_GENERATION_HEADERS)
+            if sections is None:
+                counts["query_generation_unparseable"] += 1
                 continue
-            start = prompt.find(ASSIGNED_HEADER)
-            assigned = CANDIDATE.findall(prompt[start:]) if start >= 0 else []
-            language = QUERY_LANGUAGE.search(prompt[:prompt.find("<input>")])
-            if len(assigned) != 1 or language is None:
-                counts["enhancement_unparseable"] += 1
+            assigned = CANDIDATE.findall(sections["assigned"])
+            if len(assigned) != 1:
+                counts["query_generation_unparseable"] += 1
                 continue
-            output = process_data_output(record, stage_counts := Counter())
-            counts.update({f"enhancement_{key}": value for key, value in stage_counts.items()})
+            call_id = owner.get((context_key(sections), mission_key(assigned[0])))
+            if call_id is None:
+                counts["query_generation_owner_not_kept"] += 1
+                continue
+            output = json_object(record.get("output") or "")
             missions = output.get("enhanced_missions") if output is not None else None
-            if output is not None and not isinstance(missions, list):
-                counts["enhancement_bad_enhanced_missions"] += 1
+            if output is None:
+                counts["query_generation_invalid_json"] += 1
+            elif not isinstance(missions, list):
+                counts["query_generation_bad_enhanced_missions"] += 1
                 missions = None
-            calls[key][mission_key(assigned[0])].append(
-                (language[1], orjson.dumps(missions) if missions is not None else None))
+            calls[call_id][mission_key(assigned[0])].append(orjson.dumps(missions) if missions is not None else None)
     return calls
 
 
-def merge_user(user: dict, calls: dict[str, list], counts: Counter) -> tuple[str, list] | None:
-    """(query_language, missions) when every candidate has exactly one usable enhancement call, else None."""
+def select_run(runs: list[tuple], calls: dict[str, list], counts: Counter) -> tuple | None:
+    """The first discovery run whose every candidate has a usable query generation call."""
     if not calls:
-        counts["drop_no_enhancement_calls"] += 1
+        counts["drop_no_query_generation_calls"] += 1
         return None
-    if set(calls) - set(user["candidates"]):
-        counts["drop_enhancement_for_unknown_candidate"] += 1
-        return None
-    missions, languages = [], set()
-    for key in user["candidates"]:
-        results = calls.get(key, [])
-        if len(results) != 1:
-            counts["drop_candidate_missing_enhancement" if not results else "drop_candidate_repeated_enhancement"] += 1
-            return None
-        language, enhanced = results[0]
-        if enhanced is None:
-            counts["drop_enhancement_failed"] += 1
-            return None
-        enhanced = orjson.loads(enhanced)
-        languages.add(language)
-        for mission in enhanced:
+    for index, run in enumerate(runs):
+        if all(any(result is not None for result in calls.get(key, [])) for key in run[1]):
+            counts["selected_later_discovery_run"] += index > 0
+            return run
+    first = runs[0][1]
+    counts["drop_candidate_missing_call" if any(not calls.get(key) for key in first)
+           else "drop_query_generation_failed"] += 1
+    return None
+
+
+def merge_user(candidates: list[str], calls: dict[str, list], counts: Counter) -> list | None:
+    missions = []
+    for key in candidates:
+        results = calls[key]
+        counts["candidate_repeated_call_first_used"] += len(results) > 1
+        usable = next(result for result in results if result is not None)
+        for mission in orjson.loads(usable):
             if not isinstance(mission, dict):
-                counts["drop_enhancement_bad_mission"] += 1
+                counts["drop_bad_mission"] += 1
                 return None
             missions.append({name: value for name, value in mission.items() if name != "input_mission_name"})
-    if len(languages) != 1:
-        counts["drop_mixed_query_language"] += 1
-        return None
-    return languages.pop(), deduplicate_queries(missions, counts)
+    return deduplicate_queries(missions, counts)
 
 
 def deduplicate_queries(missions: list[dict], counts: Counter) -> list[dict]:
     """Keep each query (case- and space-insensitive) only in its first mission and drop missions left without queries.
-
-    The candidates were enhanced in separate calls, so two missions can repeat a query. A query-level copy of the
-    mission's enrichment_sources (a GPT-5.6 slip) is removed as well.
-    """
+    A query-level copy of the mission's enrichment_sources is removed as well."""
     seen: set[str] = set()
     kept = []
     for mission in missions:
@@ -207,43 +260,59 @@ def deduplicate_queries(missions: list[dict], counts: Counter) -> list[dict]:
 
 
 def main() -> None:
-    data = Path(__file__).resolve().parents[2] / "data" / "ProcessData"
-    parser = argparse.ArgumentParser(description="Merge GPT-5.6 hyper discovery + enhancement into one row per "
-                                                 "user-day.")
-    parser.add_argument("--discovery", type=Path, default=data / "layer4_hyper_commercial_interest_mission.jsonl")
-    parser.add_argument("--enhancement", type=Path, default=data / "layer4_hyper_commercial_interest_query.jsonl")
-    parser.add_argument("--output", required=True, type=Path, help="Merged JSONL path")
+    parser = argparse.ArgumentParser(description="Merge GPT-5.6 Final hyper discovery + query generation into one row "
+                                                 "per user-day.")
+    parser.add_argument("--discovery", type=Path, help="l4_hyper_mission_discovery.jsonl")
+    parser.add_argument("--query-generation", type=Path, help="l4_hyper_query_generation.jsonl")
+    parser.add_argument("--output", type=Path, help="Merged JSONL path")
+    parser.add_argument("--user-index", type=Path, help="affinity -> user_hash JSONL (see --write-user-index)")
+    parser.add_argument("--write-user-index", nargs="+", type=Path, metavar="PATH",
+                        help="Only write the product_categories -> user_hash index (last PATH) from the Layer 4 "
+                             "commercial preference SFT train/test or step1 files (the other PATHs), then exit")
     args = parser.parse_args()
+    if args.write_user_index:
+        if len(args.write_user_index) < 2:
+            parser.error("--write-user-index needs at least one input and the index path")
+        write_user_index(args.write_user_index[:-1], args.write_user_index[-1])
+        return
+    if not (args.discovery and args.query_generation and args.output):
+        parser.error("--discovery, --query-generation and --output are required")
 
     counts: Counter = Counter()
-    users = load_discovery(args.discovery, counts)
-    counts["users_after_discovery"] = len(users)
-    calls = load_enhancement(args.enhancement, users, counts)
+    user_index = {}
+    if args.user_index:
+        with args.user_index.open("rb") as source:
+            user_index = {row["affinity"]: row["user_hash"] for row in map(orjson.loads, source)}
+    discovery, owner = load_discovery(args.discovery, counts)
+    calls = load_query_generation(args.query_generation, owner, counts)
 
-    languages: Counter = Counter()
     args.output.parent.mkdir(parents=True, exist_ok=True)
     temporary = args.output.with_suffix(args.output.suffix + ".tmp")
-    with temporary.open("wb") as destination:
-        for (user_id, _), user in users.items():
-            merged = merge_user(user, calls.get((user_id, user["date"]), {}), counts)
-            if merged is None:
+    with args.discovery.open("rb") as source, temporary.open("wb") as destination:
+        for call_id, runs in tqdm(sorted(discovery.items(), key=lambda item: item[1][0][0]), desc="Writing",
+                                  unit="rows"):
+            run = select_run(runs, calls.get(call_id, {}), counts)
+            missions = merge_user(run[1], calls[call_id], counts) if run else None
+            if missions is None:
                 continue
-            language, missions = merged
+            source.seek(run[0])
+            sections = split_input_sections(system_prompt(orjson.loads(source.readline())), DISCOVERY_HEADERS)
+            user_hash = user_index.get(affinity_key(sections["commercial_preferences"]) or "")
+            counts["user_from_index" if user_hash else "user_from_context_hash"] += 1
+            row = {"input": {"user_hash": user_hash or context_key(sections).hex()[:16], "date": sections["date"],
+                             "personal_context": sections["personal_context"],
+                             "professional_context": sections["professional_context"],
+                             "commercial_preferences": sections["commercial_preferences"],
+                             "commercial_interests": INTENT_LINE.sub("", sections["commercial_interests"])},
+                   "output": {"missions": missions}}
+            destination.write(orjson.dumps(row) + b"\n")
             counts["rows_written"] += 1
             counts["rows_with_no_mission"] += not missions
             counts["missions_written"] += len(missions)
-            languages[language] += 1
-            row = {"input": {"user_id": user_id, "date": user["date"], "query_language": language,
-                             "personal_context": user["personal_context"],
-                             "professional_context": user["professional_context"],
-                             "commercial_preferences": user["commercial_preferences"],
-                             "commercial_interests": user["commercial_interests"]},
-                   "output": {"missions": missions}}
-            destination.write(orjson.dumps(row) + b"\n")
     os.replace(temporary, args.output)
 
-    report = {"discovery": str(args.discovery), "enhancement": str(args.enhancement), "output": str(args.output),
-              **dict(sorted(counts.items())), "query_languages": dict(languages.most_common())}
+    report = {"discovery": str(args.discovery), "query_generation": str(args.query_generation),
+              "output": str(args.output), **dict(sorted(counts.items()))}
     args.output.with_name(args.output.stem + ".report.json").write_text(json.dumps(report, indent=2) + "\n",
                                                                          encoding="utf-8")
     print(json.dumps(report, indent=2))

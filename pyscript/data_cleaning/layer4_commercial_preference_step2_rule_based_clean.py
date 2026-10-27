@@ -38,7 +38,7 @@ where every value / level is "Low"|"Medium-Low"|"Medium"|"Medium-High"|"High" (v
 CATEGORIES_V2 / FLAG_CATEGORIES_V2: Unknown exactly when there are no details, a known value within the range of its
 detail levels, the V1 affinity checks, a non-empty life_stage (the biography may have failed for the user), and English
 free text (fastText vote, layer1_step2 helpers). The report is also
-written to <output stem>.report.json.
+written to <output stem>.report.json. --version v3 (GPT-5.6 Final) applies the v2 rules without the English check.
 
 The JSON-format checker, cleaning loop, and summary printer come from layer4_biography_step2_rule_based_clean.py.
 
@@ -305,7 +305,7 @@ def check_row_v2(record: dict, model, t2s, s2t, args) -> CheckResult:
     details += shopping["shopper_type"]["details"] + output["affinity"]["dining"]["restrictions"]["details"]
     texts = [item["description"] for item in shopping["product_categories"]]
     texts += [text for detail in details for text in (detail["area"], detail["evidence"])]
-    if not is_english(texts, model, t2s, s2t, args):
+    if args.version == "v2" and not is_english(texts, model, t2s, s2t, args):
         reasons.add("non_english")
     if not categories:
         flags.add("empty_product_categories")
@@ -319,9 +319,11 @@ def main() -> None:
         print_summary(report, CATEGORIES)
         return
     model, t2s, s2t = load_language(args)
-    report = clean(args, lambda record: check_row_v2(record, model, t2s, s2t, args), CATEGORIES_V2,
+    categories = CATEGORIES_V2 if args.version == "v2" else \
+        {name: text for name, text in CATEGORIES_V2.items() if name != "non_english"}
+    report = clean(args, lambda record: check_row_v2(record, model, t2s, s2t, args), categories,
                    FLAG_CATEGORIES_V2)
-    print_summary(report, CATEGORIES_V2)
+    print_summary(report, categories)
     write_report(report, args)
 
 
