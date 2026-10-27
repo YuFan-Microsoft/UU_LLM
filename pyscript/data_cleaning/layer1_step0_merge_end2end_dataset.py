@@ -6,7 +6,8 @@ Source files (Training_Data_InferredByGPT56_Final/process_dataset/L1/) hold one 
 
     l1_delta   user:   "Date: <yyyymmdd>\\nUser ID: <id>\\nUser Demographics / Facts:\\n...\\n\\n"
                        "Today's Denoised Signals (<n> events):\\n<[{"idx", "Date", "Source", "Action"}] JSON>"
-               output: {"interests": [{"topics": [{"evidence": [idx], "topic"}], "interest_name"}]}
+               output: {"interests": [{"interest_name", "topics": [{"topic", "evidence": [idx]}]}]}
+                       (F7 key order; earlier Final runs wrote topics before interest_name and evidence before topic)
     l1_actual  user:   "User ID: <id>\\nDate: <yyyymmdd>\\n\\nDelta Interests:\\n"
                        "<[{"interest_name", "topics": [{"topic", "evidence": [{"action"}]}]}] JSON>"
                output: {"interests": [{"interest_name", "actual_activity"}]}
@@ -22,8 +23,9 @@ interest_name. Join keys seen more than once in either file are dropped entirely
 Each kept row is:
     {"user_hash": sha256(user_id)[:16],
      "input":  {"signals": [{"idx", "Date", "Source", "Action"}]},
-     "output": {"interests": [{"topics": [{"evidence", "topic"}], "interest_name", "actual_activity"}]}}
-with the teacher's key order. Rows with GPT-5.6 failures are dropped (invalid JSON, wrong keys, actual missing,
+     "output": {"interests": [{"interest_name", "topics": [{"topic", "evidence"}], "actual_activity"}]}}
+keeping the teacher's key order for interest_name / topics and topic / evidence (shown for F7), with actual_activity
+appended. Rows with GPT-5.6 failures are dropped (invalid JSON, wrong keys, actual missing,
 duplicated, or not aligned with delta); each dropped delta row is counted under its first failing reason.
 Delta rows with no interests have no actual call and are kept as {"interests": []} unless --drop-empty-interests
 is set. Content-level rules are left to layer1_step1_rule_based_clean.py.
@@ -214,9 +216,11 @@ def merge(args: argparse.Namespace) -> dict:
                     drops[f"actual:{activities}"] += 1
                     continue
                 matched.add(key)
+                # Keep the teacher's key order (the F7 teacher writes interest_name before topics and topic
+                # before evidence; earlier runs wrote the reverse) and append actual_activity.
                 merged_interests = [
-                    {"topics": [{"evidence": topic["evidence"], "topic": topic["topic"]} for topic in interest["topics"]],
-                     "interest_name": interest["interest_name"], "actual_activity": activity}
+                    {**{name: ([dict(topic) for topic in value] if name == "topics" else value)
+                        for name, value in interest.items()}, "actual_activity": activity}
                     for interest, activity in zip(interests, activities)
                 ]
 

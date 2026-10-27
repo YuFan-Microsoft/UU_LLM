@@ -12,8 +12,8 @@ original order within a day), re-numbered 0..n-1 in that reading order, and writ
 one minified JSON object per line (the GPT-5.6 Final signals carry no DetailedSource):
     {"idx":0,"date":"YYYY-MM-DD","source":"Bing","action":"..."}
     {"idx":1,"date":"YYYY-MM-DD","source":"MSN","action":"..."}
-Answer `evidence` indices are remapped to the new idx and sorted; the answer keeps the teacher's key order
-    {"interests": [{"topics": [{"evidence", "topic"}], "interest_name", "actual_activity"}]}.
+Answer `evidence` indices are remapped to the new idx and sorted; the answer keeps the teacher's key order, which
+prompt_l1.md states (F7: {"interests": [{"interest_name", "topics": [{"topic", "evidence"}], "actual_activity"}]}).
 
 The "\\nInput:\\n" marker and this input layout match what
 code/trainer/SFT/user_profile_rules.py parses. JSON is minified.

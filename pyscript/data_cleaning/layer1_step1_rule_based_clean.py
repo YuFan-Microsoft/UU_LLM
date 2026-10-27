@@ -5,7 +5,8 @@ per user-day-window).
 Input line format:
     {"user_hash",
      "input":  {"signals": [{"idx", "Date", "Source", "Action"}]},
-     "output": {"interests": [{"topics": [{"evidence", "topic"}], "interest_name", "actual_activity"}]}}
+     "output": {"interests": [{"interest_name", "topics": [{"topic", "evidence"}], "actual_activity"}]}}
+(keys in the teacher's order; only the key sets are checked)
 
 Any row that violates a rule is dropped. Kept rows are written as:
     {"user_hash", "signals", "interests"}

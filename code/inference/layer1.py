@@ -3,7 +3,7 @@ record (V3: no intent call and no content locale)."""
 
 from utils import HERE, INPUT_MARKER, MAX_SIGNAL_ACTIONS, PROMPT_BUDGET, cap, dumps, layer1_keys_valid
 
-# Must stay identical to UU_LLM/prompts/prompt_l1.md, the prompt of the V3 SFT data.
+# Must stay identical to UU_LLM/prompts/prompt_l1.md, the prompt of the V35 SFT data.
 PROMPT = (HERE / "prompts" / "prompt_l1.md").read_text(encoding="utf-8")
 
 

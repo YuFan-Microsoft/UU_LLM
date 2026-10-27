@@ -4,6 +4,6 @@ An interest is a broad, reusable category such as American Football, Politics, o
 
 Write each interest's name and actual_activity in the majority language of that interest's own activities, and keep each topic in the original language of its activities. actual_activity is a factual description in present tense and third person ("Reads about ...", "Searches for ...") that covers all of the interest's activities with their exact names and describes what was observed, not motivation or intent.
 
-Return minimized JSON, with evidence before topic and topics before interest_name:
-`{"interests":[{"topics":[{"evidence":[0],"topic":"..."}],"interest_name":"...","actual_activity":"..."}]}`
+Return minimized JSON, with interest_name before topics and topic before evidence:
+`{"interests":[{"interest_name":"...","topics":[{"topic":"...","evidence":[0]}],"actual_activity":"..."}]}`
 Return `{"interests":[]}` when no valid interest remains.

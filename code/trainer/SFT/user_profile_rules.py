@@ -487,8 +487,8 @@ def l3_commercial_keys_valid(output):
 
 
 def l3_commercial_entry_valid(entry):
-    """commercial true: valid score and stage, 1-3 queries. commercial false: null score and stage, 0-3 queries
-    (entities and queries are listed for every interest)."""
+    """commercial true: valid score and stage, 1-3 queries. commercial false: null score and stage, and no entities
+    or queries."""
     if not has_text(entry.get("interest_name")) or not isinstance(entry.get("commercial"), bool):
         return False
     if not all(string_list(entry.get(key)) for key in L3C_LIST_KEYS) or len(entry["predicted_queries"]) > 3:
@@ -497,7 +497,8 @@ def l3_commercial_entry_valid(entry):
         return (one_of(entry.get("commercial_score"), L3C_SCORES)
                 and one_of(entry.get("intent_funnel_stage"), L3C_STAGES)
                 and bool(entry["predicted_queries"]))
-    return entry.get("commercial_score") is None and entry.get("intent_funnel_stage") is None
+    return (entry.get("commercial_score") is None and entry.get("intent_funnel_stage") is None
+            and not any(entry[key] for key in L3C_LIST_KEYS))
 
 
 def check_l3_commercial(payload, output):

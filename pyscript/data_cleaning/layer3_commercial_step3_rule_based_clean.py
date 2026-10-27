@@ -5,9 +5,9 @@ Input/output row format (unchanged by this step):
     {"input":  {"user_id", "date", "interests": [{"interest_name", "actual_activity", "sources",
                                                   "topics": [{"topic", "actions"}]}]},
      "output": {"interest_commercial": [...]}}
-GPT-5.6 Final writes brands / retailers / products / predicted_queries for every interest, commercial or not
-("BRQP scope"), in the language of the evidence actions; there is no query_language input any more, so the step2
-language detection is not used for this data.
+The F7 teacher writes brands / retailers / products / predicted_queries only for commercial interests (all four are
+[] when commercial is false; the earlier Final run filled them for every interest), in the language of the evidence
+actions; there is no query_language input any more, so the step2 language detection is not used for this data.
 
 1. Skeleton: `output` must match OUTPUT_SCHEMA (the legal output format of the GPT-5.6 Final
    Layer 3 commercial prompt, "Output" + "Validate before output" #1/#7) and every entry
@@ -17,8 +17,8 @@ language detection is not used for this data.
           "commercial": bool,
           "commercial_score": "low"|"medium"|"high",               # null when commercial=false
           "intent_funnel_stage": "discovery"|"research"|"consideration"|"purchase"|"post-purchase",  # null when false
-          "brands": [str], "retailers": [str], "products": [str],  # non-empty strings, may be []
-          "predicted_queries": [str]}]}                            # 0-3 non-empty strings; >= 1 when commercial
+          "brands": [str], "retailers": [str], "products": [str],  # non-empty strings; [] when false
+          "predicted_queries": [str]}]}                            # 1-3 non-empty strings when commercial; [] when false
    A row whose output breaks the skeleton is dropped as "schema_violation"; the report breaks the
    violations down by field and failed check.
 2. Rows with a valid skeleton are then checked against the content RULES (alignment with the input
@@ -79,6 +79,7 @@ ENTRY_SCHEMA = {
     "else": {"properties": {
         "commercial_score": {"const": None},
         "intent_funnel_stage": {"const": None},
+        **{key: {"maxItems": 0} for key in (*ENTITY_KEYS, "predicted_queries")},
     }},
 }
 OUTPUT_SCHEMA = {
@@ -152,7 +153,7 @@ def evidence_text(interest: dict) -> str:
 
 
 def check_entry(entry: dict, evidence: str, reasons: set[str], flags: set[str]) -> None:
-    """Content rules for one skeleton-valid entry (commercial or not: both carry entities and queries)."""
+    """Content rules for one skeleton-valid entry (a non-commercial entry has no entities or queries)."""
     queries = entry["predicted_queries"]
     if any(has_duplicates(entry[key]) for key in ENTITY_KEYS):
         reasons.add("duplicate_entity")
