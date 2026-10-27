@@ -6,7 +6,7 @@
 set -eu
 cd "$(dirname "$0")"
 
-DEFAULT_CHECKPOINT=/yufan/MAI_Profile/checkpoints/unified_slm_V3/epoch_0_step_6000_ppl_1.337
+DEFAULT_CHECKPOINT=/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT
 CHECKPOINT=${1:-${CHECKPOINT:-$DEFAULT_CHECKPOINT}}
 OUTPUT_DIR=${OUTPUT_DIR:-./outputs/$(basename "$CHECKPOINT")}
 SEED=${SEED:-0}
