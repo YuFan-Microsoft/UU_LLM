@@ -343,7 +343,7 @@ ROLLOUT_EVAL_SAMPLES=256 sh run_user_profile_multi_gpu_4B.sh      # roll out 256
 sh run_user_profile_multi_gpu_2B.sh                                # the same run with Qwen3.5-2B
 ```
 
-The script evaluates on the whole V3 test split (39,946 rows over the 8 configs, at most 5,000 per config) every 2000
+The script evaluates on the whole V35 test split (39,926 rows over the 8 configs, at most 5,000 per config) every 2000
 steps (`--checkpoint_steps 2000`, no `--max_eval_steps`; perplexity is ~500 eval steps on 40 GPUs with
 `--per_device_eval_batch_size 2`) and rolls out every test example (`ROLLOUT_EVAL_SAMPLES=-1`), also at step 0 and at
 the end of training. A full rollout generates up to 16,384 tokens for each of the ~40k examples, so every eval takes
@@ -359,20 +359,22 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 
 - Hugging Face dataset with `train` / `test` splits and a `messages` column
   (`[{"role": "user", ...}, {"role": "assistant", ...}]`).
-- User-profile SFT loads `yufan/user_profile_dataset` with the eight `V3_` configs (L1, L1 Negative, L2, L3 Persona,
-  L3 Commercial, L4 Biography, L4 Commercial Preference, L4 Hyper; GPT-5.6, multilingual, each with its V3 task prompt,
-  rows ≤ 25,600 Qwen3.5-4B tokens; schema in `docs/V3_user_profile_dataset_schema.md`). Rollout scoring rules exist for all eight configs (see the rollout metrics below).
-- The train split is mixed with `--dataset_mixing_weights` (`V3_MIXTURE` in `deepspeed_user_profile_trainer.py`):
-  each epoch has the rows of one natural epoch (1,922,110), split across configs by these shares: L1 21%, L1
-  Negative 4%, L2 20%, L3 Persona 8%, L3 Commercial 14%, L4 Biography 10%, L4 Commercial Preference 9%, L4 Hyper
-  14%. Passes per epoch: L1 1.40, L2 1.48, L3 Persona 0.94, L3 Commercial 1.34, L4 Biography 1.19, L4 Commercial
-  Preference 1.11, L4 Hyper 1.97, L1 Negative 0.14. The loss is a token mean, so a config's share of the gradient
-  follows its share of answer tokens rather than rows (average V3 answers: L3 Persona 1,362 and L3 Commercial 1,300
-  tokens vs L4 Biography 423; at these shares L3 Commercial gets ~25% of answer tokens, L1 ~20%, L2 ~16%, L3 Persona
-  ~15%, L4 Hyper ~10%, L4 Commercial Preference ~9%, L4 Biography ~6%). The shares favor L1 / L2 (they run every
+- User-profile SFT loads `yufan/user_profile_dataset` with the eight `V35_` configs (L1, L1 Negative, L2, L3 Persona,
+  L3 Commercial, L4 Biography, L4 Commercial Preference, L4 Hyper; GPT-5.6 F7 teacher data, multilingual, each with its
+  task prompt, rows ≤ 25,600 Qwen3.5-4B tokens; schema in `docs/V3_user_profile_dataset_schema.md`, except that V35 L1
+  answers write interest_name before topics and topic before evidence, and V35 L3 Commercial leaves the entity and
+  query lists empty for non-commercial interests; L1 Negative is the V3 copy). Rollout scoring rules exist for all eight configs (see the rollout metrics below).
+- The train split is mixed with `--dataset_mixing_weights` (`V35_MIXTURE` in `deepspeed_user_profile_trainer.py`):
+  each epoch has the rows of one natural epoch (1,915,345), split across configs by these shares (the V3 ones): L1
+  21%, L1 Negative 4%, L2 20%, L3 Persona 8%, L3 Commercial 14%, L4 Biography 10%, L4 Commercial Preference 9%, L4
+  Hyper 14%. Passes per epoch: L1 1.41, L2 1.49, L3 Persona 0.95, L3 Commercial 1.29, L4 Biography 1.19, L4
+  Commercial Preference 1.15, L4 Hyper 2.01, L1 Negative 0.14. The loss is a token mean, so a config's share of the
+  gradient follows its share of answer tokens rather than rows (average V35 answers: L3 Persona 1,478 and L3
+  Commercial 1,278 tokens vs L4 Biography 430; at these shares L3 Commercial gets ~24% of answer tokens, L1 ~22%, L3
+  Persona ~16%, L2 ~13%, L4 Hyper ~10%, L4 Commercial Preference ~9%, L4 Biography ~6%). The shares favor L1 / L2 (they run every
   window at inference, and L2 errors carry over), L3 Commercial (its predicted queries drive behavior retrieval) and
-  L4 Hyper (the hardest task, only ~6% of answer tokens at the natural mix); L3 Persona stays below one pass (V3 has
-  twice the V2 rows), and L1 Negative is cut (short, highly redundant: 74% single-signal rows; not used at
+  L4 Hyper (the hardest task, only ~6% of answer tokens at the natural mix); L3 Persona stays below one pass (V3 / V35
+  have twice the V2 rows), and L1 Negative is cut (short, highly redundant: 74% single-signal rows; not used at
   inference). `--dataset_mixing_alpha` (shares proportional to `rows ** alpha`) is the alternative when no weights
   are given. The test split is not mixed. The per-config quotas, shares and passes are printed at startup.
 - The chat template is applied with `enable_thinking=False`. Loss is computed only on the assistant answer
@@ -460,18 +462,18 @@ Saved under `--output_dir` as `epoch_<e>_step_<s>_ppl_<ppl>/`:
   gen tok/s, prompts/s, outputs that hit `max_tokens`).
 
 **Metrics** (wandb `<Task>_Evaluation/<metric>`, next to the task's eval perplexity `token_ppl`, x-axis `eval_step`).
-One section per V3 task: every section has the 4 shared charts plus 1-4 task charts.
+One section per V35 task: every section has the 4 shared charts plus 1-4 task charts.
 
 | Section (config) | Charts |
 | --- | --- |
-| `L1_Interest` (`V3_User_Profile_L1_gpt56`) | shared + `topic_evidence_valid_ratio`, `avg_interest_num`, `language_match_ratio_en`, `language_match_ratio_glb` |
-| `L1_Negative` (`V3_User_Profile_L1_Negative_gpt56`) | shared + `signal_coverage_ratio`, `field_consistent_ratio` |
-| `L2_Merge` (`V3_User_Profile_L2_gpt56`) | shared + `input_match_ratio`, `merge_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
-| `L3_Persona` (`V3_User_Profile_L3_Persona_gpt56`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
-| `L3_Commercial` (`V3_User_Profile_L3_Commercial_gpt56`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb`, `avg_query_num` |
-| `L4_Biography` (`V3_User_Profile_L4_Biography_gpt56`) | shared + `declared_match_ratio`, `source_grounded_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
-| `L4_CommercialPreference` (`V3_User_Profile_L4_CommercialPreference_gpt56`) | shared + `value_detail_consistent_ratio` |
-| `L4_Hyper` (`V3_User_Profile_L4_Hyper_gpt56`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L1_Interest` (`V35_User_Profile_L1_gpt56`) | shared + `topic_evidence_valid_ratio`, `avg_interest_num`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L1_Negative` (`V35_User_Profile_L1_Negative_gpt56`) | shared + `signal_coverage_ratio`, `field_consistent_ratio` |
+| `L2_Merge` (`V35_User_Profile_L2_gpt56`) | shared + `input_match_ratio`, `merge_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L3_Persona` (`V35_User_Profile_L3_Persona_gpt56`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L3_Commercial` (`V35_User_Profile_L3_Commercial_gpt56`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb`, `avg_query_num` |
+| `L4_Biography` (`V35_User_Profile_L4_Biography_gpt56`) | shared + `declared_match_ratio`, `source_grounded_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L4_CommercialPreference` (`V35_User_Profile_L4_CommercialPreference_gpt56`) | shared + `value_detail_consistent_ratio` |
+| `L4_Hyper` (`V35_User_Profile_L4_Hyper_gpt56`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
 
 | Task | Metric | Meaning |
 | --- | --- | --- |
@@ -509,8 +511,8 @@ Closed vs open vocabulary: fields with a fixed label set (enums above) are stric
 personas, entities, queries, keywords, L4 Biography home_location / occupation / company / education_area, and L4
 Commercial Preference dining restrictions (any labels, or `["Unknown"]` alone, still matching their details).
 
-Language (V3 is multilingual: no `query_language`, nothing must be English). Each unit's output is compared with
-the language of its input anchor, as the V3 prompts ask: L1 activity <- the actions its topics cite; L2 merged /
+Language (V3 / V35 are multilingual: no `query_language`, nothing must be English). Each unit's output is compared with
+the language of its input anchor, as the prompts ask: L1 activity <- the actions its topics cite; L2 merged /
 added activity <- the activities of the merged delta and snapshot interests / of the delta; L3 Persona persona <- the
 interest's `actual_activity`; L3 Commercial queries <- the actions of the interest's topics; L4 Biography biography
 and evidence <- all interests' `actual_activity`; L4 Hyper mission name and queries <- the names and Existing queries
@@ -519,8 +521,8 @@ with probability >= 0.5 votes, the top language needs >= 60%, otherwise "mix"; C
 `zh-Hant` with OpenCC), and languages match by family (`LANGUAGE_FAMILIES` of
 `pyscript/data_cleaning/layer1_step2_language_detection.py`, plus Chinese). A unit is skipped when either side is
 "mix" or has no taggable text. `wrong_language` needs more than half of an output's checked units to mismatch, since
-single short names and queries are often brand-only. On the V3 test references every task passes the rules at
->= 99.7%, and English rewrites of non-English L1 / L3 Persona outputs are flagged. It needs `fasttext-wheel` and `opencc-python-reimplemented` (in the Dockerfile and
+single short names and queries are often brand-only. On the V35 test references every task passes the rules at
+>= 99.3% (L1 99.3%, L3 Commercial 99.6%, L4 Hyper 99.9%, the others 100%), and English rewrites of non-English L1 / L3 Persona outputs are flagged. It needs `fasttext-wheel` and `opencc-python-reimplemented` (in the Dockerfile and
 `requirements_inference.txt`). The model is read from `$LID_MODEL_PATH` (default `UU_LLM/models/lid.176.bin`) and
 downloaded there on first use when missing.
 

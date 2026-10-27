@@ -14,9 +14,9 @@ is unrolled recursively over several draft steps, the same way vLLM reuses it at
 
 | File | Environment | Purpose |
 |---|---|---|
-| `run_speculators_mtp_4B.sh` / `run_speculators_mtp_2B.sh` | — | Launchers for the V3 SFT models of `../SFT/run_user_profile_multi_gpu_4B.sh` / `_2B.sh`: set the official MTP source of that size and run the pipeline |
+| `run_speculators_mtp_4B.sh` / `run_speculators_mtp_2B.sh` | — | Launchers for the V35 SFT models of `../SFT/run_user_profile_multi_gpu_4B.sh` / `_2B.sh`: set the official MTP source of that size and run the pipeline |
 | `run_speculators_mtp.sh` | — | End-to-end pipeline: merge → generate → prepare → train → stitch → check |
-| `generate_self_distill_data.py` | vLLM | The SFT model answers the V3 SFT train prompts (on-policy data); writes Speculators-format rows (`input_ids` + `loss_mask`) |
+| `generate_self_distill_data.py` | vLLM | The SFT model answers the V35 SFT train prompts (on-policy data); writes Speculators-format rows (`input_ids` + `loss_mask`) |
 | `train_mtp.py` | Speculators | Entry point of `speculators.train` with an MTP forward aligned with vLLM's inputs and memory-efficient for 32K sequences (see below) |
 | `check_mtp_weights.py` | either (needs torch) | Pre-deployment check: all 15 `mtp.*` tensors present, right shape, finite, not all zero, and changed vs the official head |
 | `requirements_speculators.txt` | — | Pins the Speculators commit that `train_mtp.py` patches |
@@ -40,9 +40,9 @@ python -m venv spec_venv && spec_venv/bin/pip install -r requirements_speculator
 export HF_TOKEN=...                       # reads yufan/user_profile_dataset
 export VLLM_PYTHON=/path/to/vllm_venv/bin/python SPEC_PYTHON=/path/to/spec_venv/bin/python
 # 4B: a checkpoint saved by ../SFT/run_user_profile_multi_gpu_4B.sh (run without SFT_CHECKPOINT to list them)
-SFT_CHECKPOINT=../SFT/output/qwen3_5_4B_sft_user_profile_v3/epoch_0_step_<N>_ppl_<P> sh run_speculators_mtp_4B.sh
+SFT_CHECKPOINT=../SFT/output/qwen3_5_4B_sft_user_profile_v35/epoch_0_step_<N>_ppl_<P> sh run_speculators_mtp_4B.sh
 # 2B: a checkpoint saved by ../SFT/run_user_profile_multi_gpu_2B.sh
-SFT_CHECKPOINT=../SFT/output/qwen3_5_2B_sft_user_profile_v3/epoch_0_step_<N>_ppl_<P> sh run_speculators_mtp_2B.sh
+SFT_CHECKPOINT=../SFT/output/qwen3_5_2B_sft_user_profile_v35/epoch_0_step_<N>_ppl_<P> sh run_speculators_mtp_2B.sh
 ```
 
 - The SFT trainer saves checkpoints without the MTP head, so the merge stage first adds the official head of the same
@@ -69,7 +69,7 @@ Main settings (environment variables):
 | Variable | Default | Notes |
 |---|---|---|
 | `TEMPERATURE` / `TOP_P` | 0.6 / 0.8 | Sampling for data generation, same as `run_inference.py`; **use the production values** (the MAIProfile client currently sends temperature 0.2) |
-| `CONFIGS` | the 8 V3 SFT tasks | `V3_User_Profile_{L1, L1_Negative, L2, L3_Persona, L3_Commercial, L4_Biography, L4_CommercialPreference, L4_Hyper}_gpt56` |
+| `CONFIGS` | the 8 V35 SFT tasks | `V35_User_Profile_{L1, L1_Negative, L2, L3_Persona, L3_Commercial, L4_Biography, L4_CommercialPreference, L4_Hyper}_gpt56` |
 | `SAMPLES_PER_CONFIG` | 2000 | About 16,000 prompts over the 8 configs; community examples gain clearly with 5,000-8,000 |
 | `NUM_STEPS` / `STEP_WEIGHT_BETA` | 5 / 0.6 | Recursive draft steps and step weights ([0.43, 0.26, 0.16, 0.09, 0.06]); the head can then be served with any `num_speculative_tokens` from 1 to 5. A lower beta (e.g. 0.5) shifts weight back to the early steps |
 | `LR` / `EPOCHS` | 1e-4 / 3 | Values of the official Speculators Qwen3.5 example |

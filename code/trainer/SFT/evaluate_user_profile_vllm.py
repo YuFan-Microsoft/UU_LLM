@@ -25,14 +25,14 @@ from vllm_colocate_rollout import load_rollout_eval_examples
 QWEN3_5_FULL_ARCH = "Qwen3_5ForConditionalGeneration"
 DEFAULT_DATASET = "yufan/user_profile_dataset"
 DEFAULT_CONFIGS = [
-    "V3_User_Profile_L1_gpt56",
-    "V3_User_Profile_L1_Negative_gpt56",
-    "V3_User_Profile_L2_gpt56",
-    "V3_User_Profile_L3_Persona_gpt56",
-    "V3_User_Profile_L3_Commercial_gpt56",
-    "V3_User_Profile_L4_Biography_gpt56",
-    "V3_User_Profile_L4_CommercialPreference_gpt56",
-    "V3_User_Profile_L4_Hyper_gpt56",
+    "V35_User_Profile_L1_gpt56",
+    "V35_User_Profile_L1_Negative_gpt56",
+    "V35_User_Profile_L2_gpt56",
+    "V35_User_Profile_L3_Persona_gpt56",
+    "V35_User_Profile_L3_Commercial_gpt56",
+    "V35_User_Profile_L4_Biography_gpt56",
+    "V35_User_Profile_L4_CommercialPreference_gpt56",
+    "V35_User_Profile_L4_Hyper_gpt56",
 ]
 
 

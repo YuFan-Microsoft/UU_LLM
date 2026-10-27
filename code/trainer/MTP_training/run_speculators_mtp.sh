@@ -1,11 +1,11 @@
 #!/bin/sh
 # Finetune the MTP head of an SFT Qwen3.5 checkpoint with vLLM Speculators and stitch it back for vLLM serving.
-# Model-size launchers: run_speculators_mtp_4B.sh / run_speculators_mtp_2B.sh (V3 SFT checkpoints).
+# Model-size launchers: run_speculators_mtp_4B.sh / run_speculators_mtp_2B.sh (V35 SFT checkpoints).
 #
 # Stages (STAGES, default all, in order):
 #   merge     the official mtp.* of MTP_SOURCE are added to SFT_CHECKPOINT             -> $VERIFIER
 #             (code/inference/merge_official_mtp.py; skipped when VERIFIER already exists)
-#   generate  vLLM env: the SFT model answers the V3 SFT train prompts (on-policy data) -> $WORK_DIR/self_distill/
+#   generate  vLLM env: the SFT model answers the V35 SFT train prompts (on-policy data) -> $WORK_DIR/self_distill/
 #   prepare   Speculators env: tokenized rows -> Speculators dataset                  -> $WORK_DIR/data/
 #   train     vLLM serves last-layer hidden states on VLLM_GPUS; train_mtp.py trains
 #             the MTP head on TRAIN_GPUS (online, nothing cached on disk)             -> $WORK_DIR/checkpoints/
@@ -42,10 +42,10 @@ SPEC_PYTHON=${SPEC_PYTHON:-python3}   # requirements_speculators.txt
 SPECULATORS_REPO=${SPECULATORS_REPO:-$WORK_DIR/speculators}  # for scripts/launch_vllm.py
 
 # Data generation (defaults follow run_inference.py; the MAIProfile client currently uses temperature 0.2). CONFIGS are
-# the eight V3 SFT tasks.
-CONFIGS=${CONFIGS:-"V3_User_Profile_L1_gpt56 V3_User_Profile_L1_Negative_gpt56 V3_User_Profile_L2_gpt56 \
-V3_User_Profile_L3_Persona_gpt56 V3_User_Profile_L3_Commercial_gpt56 V3_User_Profile_L4_Biography_gpt56 \
-V3_User_Profile_L4_CommercialPreference_gpt56 V3_User_Profile_L4_Hyper_gpt56"}
+# the eight V35 SFT tasks.
+CONFIGS=${CONFIGS:-"V35_User_Profile_L1_gpt56 V35_User_Profile_L1_Negative_gpt56 V35_User_Profile_L2_gpt56 \
+V35_User_Profile_L3_Persona_gpt56 V35_User_Profile_L3_Commercial_gpt56 V35_User_Profile_L4_Biography_gpt56 \
+V35_User_Profile_L4_CommercialPreference_gpt56 V35_User_Profile_L4_Hyper_gpt56"}
 SAMPLES_PER_CONFIG=${SAMPLES_PER_CONFIG:-2000}
 TEMPERATURE=${TEMPERATURE:-0.6}
 TOP_P=${TOP_P:-0.8}

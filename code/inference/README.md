@@ -11,13 +11,13 @@
 | `utils.py` | Input loading and cleaning, weekly windows, signal dedupe / cap, query language, the answer key checks of every task, `generate()` with retries, MTP acceptance counters |
 | `user_profile_rules.py` | Copy of `code/trainer/SFT/user_profile_rules.py` (keep it identical): the V3 rollout checks that score every call's first sample for `rule_metrics`; it is reporting only (the answer key checks in `utils.py` decide retries) |
 | `merge_official_mtp.py` | Adds the official Qwen3.5 MTP head (`mtp.*`) to an SFT checkpoint saved without it (see [MTP speculative decoding](#mtp-speculative-decoding)) |
-| `prompts/` | The prompts (`prompt_l1.md` ... `prompt_l4_hyper.md`, plus `prompt_negative.md`, kept in sync but not used: the input has no negative feedback), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V3 SFT configs) |
+| `prompts/` | The prompts (`prompt_l1.md` ... `prompt_l4_hyper.md`, plus `prompt_negative.md`, kept in sync but not used: the input has no negative feedback), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V35 SFT configs) |
 
 The prompt files are read as-is (line endings normalized to `\n`); the script builds each user message as
-`prompt + "\nInput:\n" + input`, exactly like the V3 SFT data: rebuilt from their own inputs, every
-`V3_User_Profile_*_gpt56` L1, L2, L3 Persona and L3 Commercial test row gives the identical user message, the L4
+`prompt + "\nInput:\n" + input`, exactly like the V35 SFT data: rebuilt from their own inputs, every
+`V35_User_Profile_*_gpt56` L1, L2, L3 Persona and L3 Commercial test row gives the identical user message, the L4
 inputs have the same fields (without user context: no declared attributes, facts or personal / professional context,
-which this script never has), and every V3 test answer passes the answer checks. The model was trained on these exact strings, so edit them only together with the SFT data (and retrain).
+which this script never has), and every V35 test answer passes the answer checks. The model was trained on these exact strings, so edit them only together with the SFT data (and retrain).
 
 Run inside the same environment as the SFT evaluation (`../trainer/SFT/requirements_inference.txt`: vLLM,
 transformers, datasets). The directory is self-contained, so it can be uploaded on its own: the few helpers it shares
