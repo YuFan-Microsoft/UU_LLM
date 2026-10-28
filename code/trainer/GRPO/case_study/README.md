@@ -11,11 +11,13 @@ data, or takes the answers a GRPO run generated at one validation step, and scor
 The reward of one answer is 0 when it breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation,
 or cut at max_tokens), else the mean of three signals, in [0, 1], with K = 10:
 
-- `coverage`: share of the input signals cited as evidence by some interest.
+- `coverage`: share of the input signals cited as evidence by some interest, scored as min(coverage / 0.7, 1) (no
+  gain past 0.7: noisy signals may be skipped; the logged `coverage` is the raw share).
 - `future_recall@K`: each interest is one query, `<interest name>: <top topic>` (the topic citing the most distinct
   signals), ranking a pool of actions with Qwen3-Embedding (the distractor pool plus this user's next-week actions);
   share of the user's next-week actions in the top K of some interest.
-- `future_interest_hit@K`: share of interests whose top K hold one of the user's next-week actions.
+- `future_interest_hit@K`: share of interests matched one-to-one to a distinct next-week action in their top K
+  (maximum matching: interests that only hit the same action count once).
 
 ```python
 reward_fn = L1Reward()                     # Qwen3-Embedding + fastText language model
@@ -105,9 +107,9 @@ summary and, for the first `--report_prompts` prompts, the input signals and eve
 | `json_valid` | Exactly the V3 Layer-1 schema `{"interests":[{"topics":[{"evidence","topic"}],"interest_name","actual_activity"}]}` with the right value types (no topic source, intent or content locale) |
 | `rule_pass` | The in-training rollout judgement (`user_profile_rules.score_example`) and not cut at max_tokens: JSON-valid and no violation (empty text, duplicate interest / topic name, evidence not a non-empty list of existing idx, duplicate evidence idx, 40+ interests, `wrong_language`: most interests' `actual_activity` not in the language of the actions they cite, `truncated`) |
 | `n_interests` | Number of interests, not in the reward (watch it: `coverage` and `future_recall@K` grow with it) |
-| `coverage` | Share of the input signals cited by some interest (reward signal) |
+| `coverage` | Share of the input signals cited by some interest (raw; the reward scores min(coverage / 0.7, 1)) |
 | `future_recall@K` | Share of this user's next-week actions in the top K of some interest (reward signal) |
-| `future_interest_hit@K` | Share of interests whose top K hold one of this user's next-week actions (reward signal) |
+| `future_interest_hit@K` | Share of interests matched one-to-one to a distinct next-week action in their top K (reward signal) |
 
 Content signals are 0 for an answer that is not JSON-valid; a JSON-valid answer that breaks a rule still gets them,
 but its reward is 0. For GRPO only the variation within a group matters, so the summary reports each signal's mean,

@@ -7,7 +7,8 @@
 # the GRPO advantage (group mean subtracted, divided by the group std). Each step rolls out N answers for each of
 # TRAIN_BATCH_SIZE prompts with vLLM (colocated, asleep while the actor trains) and makes one on-policy update.
 #
-# Reward: l1/verl_reward.py -> l1/l1_reward.py L1Reward (0 when the Layer-1 rules fail, else the mean of coverage,
+# Reward: l1/verl_reward.py -> l1/l1_reward.py L1Reward (0 when the Layer-1 rules fail, else the mean of coverage
+# (capped: min(coverage / 0.7, 1)),
 # future_recall@10 and future_interest_hit@10), every answer ranked against the next-week actions of all users of
 # its batch. The batches are fixed by l1/prepare_data.py, run first when DATA_DIR has no train.parquet.
 #
@@ -22,8 +23,9 @@
 # fails in a minute instead of after the rollout engines are up.
 #
 # Every TEST_FREQ (100) steps, and before training, the 64 validation users get N answers each, sampled as in
-# training and in case_study/ (temperature 1.0): verl logs the reward and each of its signals
-# (val-core/user_profile_l1/reward/mean@16, val-aux/user_profile_l1/<signal>/mean@16) and dumps the answers to
+# training and in case_study/ (temperature 1.0): verl logs only the mean over all answers of the reward, n_interests,
+# coverage (raw), future_recall, future_interest_hit, json_valid and rule_pass (val-core/user_profile_l1/<signal>) and
+# dumps the answers to
 # OUTPUT_DIR/validation/<step>.jsonl, read by case_study.py trend (all steps) and from_val (one step's report). A
 # checkpoint is saved every SAVE_FREQ (100) steps, with a Hugging Face copy for the case study.
 #
@@ -33,7 +35,7 @@
 #   bash run_l1_grpo.sh trainer.total_training_steps=20     # extra args: Hydra overrides, last wins
 # A crashed run resumes from its latest checkpoint when launched again (trainer.resume_mode=auto); run
 # `ray stop --force` first if its Ray workers still hold GPUs. watchdog.sh does both.
-# W&B (as the SFT trainer, project MAI_SLM_V3): WANDB_API_KEY, else the first line of wandb_key.txt in UU_LLM or in
+# W&B (project MAI_SLM_V3_RL): WANDB_API_KEY, else the first line of wandb_key.txt in UU_LLM or in
 #   the directory above it (git-ignored), else the login the SFT trainer's wandb.login() saved in ~/.netrc.
 # Optional env: CHECKPOINT (default: DEFAULT_CHECKPOINT below), EXPERIMENT_NAME, OUTPUT_DIR, DATA_DIR,
 #   NUM_TRAIN_BATCHES (0 = all), NUM_VAL,
@@ -56,7 +58,7 @@ export L1_REWARD_NUM_THREADS=${L1_REWARD_NUM_THREADS:-8}
 DEFAULT_CHECKPOINT=/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT
 CHECKPOINT=${CHECKPOINT:-$DEFAULT_CHECKPOINT}
 EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO_L1_no_kl_qwen3_5_4B_$(basename "$CHECKPOINT")}
-PROJECT_NAME=${PROJECT_NAME:-MAI_SLM_V3}
+PROJECT_NAME=${PROJECT_NAME:-MAI_SLM_V3_RL}
 OUTPUT_DIR=${OUTPUT_DIR:-$HERE/outputs/$EXPERIMENT_NAME}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 N=${N:-16}
@@ -197,5 +199,6 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.save_freq="${SAVE_FREQ:-100}" \
     trainer.test_freq="${TEST_FREQ:-100}" \
     trainer.validation_data_dir="$OUTPUT_DIR/validation" \
+    +trainer.val_core_metrics="['reward','n_interests','coverage','future_recall','future_interest_hit','json_valid','rule_pass']" \
     trainer.total_epochs=1 \
     "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"

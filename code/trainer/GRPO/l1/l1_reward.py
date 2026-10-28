@@ -4,9 +4,12 @@ The reward of one answer:
     0                                   if it breaks the Layer-1 rules: not V3 JSON, a user_profile_rules violation
                                         (duplicate interest / topic, bad evidence, language, ...) or cut at max_tokens
     the mean of the three signals       otherwise, in [0, 1]:
-        coverage                share of the input signals cited as evidence by some interest
+        coverage                share of the input signals cited as evidence by some interest, scored as
+                                min(coverage / COVERAGE_TARGET, 1): no gain past the target, since noisy signals may
+                                be skipped (the logged coverage is the raw share)
         future_recall@K         share of the user's next-week actions in the top K of some interest
-        future_interest_hit@K   share of interests whose top K hold one of the user's next-week actions
+        future_interest_hit@K   share of interests matched one-to-one to a distinct next-week action in their top K
+                                (a maximum matching: two interests that only hit the same action count once)
 Each interest is one embedding query (interest_query) ranking a pool of actions: the distractor pool (set_pool) plus
 this user's next-week actions. The embeddings are Qwen3-Embedding-4B's, computed in process (Embedder) or by a vLLM
 embedding server (EmbeddingClient, `vllm serve <model> --runner pooling`; GRPO runs it on a GPU of its own) on the
@@ -34,6 +37,7 @@ import user_profile_rules  # noqa: E402
 from utils import parse_json_object  # noqa: E402
 
 TOP_K = 10
+COVERAGE_TARGET = 0.7
 INVALID_REWARD = 0.0
 SIGNALS = ("coverage", "future_recall", "future_interest_hit")
 DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B"
@@ -75,6 +79,23 @@ def interest_query(interest: dict) -> str:
         return interest["interest_name"]
     top = max(topics, key=lambda topic: len(set(topic["evidence"])))  # max keeps the first on ties
     return f"{interest['interest_name']}: {top['topic'].strip()}"
+
+
+def matched_interests(hits: list[list[list[int]]]) -> int:
+    """The size of a maximum matching between interests and the next-week actions in their top K (hits: per interest,
+    its [position in future, rank] pairs): each action credits at most one interest and each interest needs one."""
+    owner: dict[int, int] = {}  # future position -> the interest it is matched to
+
+    def augment(interest: int, seen: set) -> bool:
+        for position, _ in hits[interest]:
+            if position not in seen:
+                seen.add(position)
+                if position not in owner or augment(owner[position], seen):
+                    owner[position] = interest
+                    return True
+        return False
+
+    return sum(augment(interest, set()) for interest in range(len(hits)))
 
 
 class Embedder:
@@ -222,9 +243,10 @@ class L1Reward:
             "n_interests": len(output["interests"]),
             "coverage": len(cited) / len(indices) if indices else 0.0,
             "future_recall": len(retrieved) / len(future) if future else 0.0,
-            "future_interest_hit": sum(bool(interest_hits) for interest_hits in hits) / len(hits) if hits else 0.0,
+            "future_interest_hit": matched_interests(hits) / len(hits) if hits else 0.0,
             "queries": queries, "hits": hits,
         })
         if rules["rule_pass"]:
-            result["reward"] = statistics.mean(result[name] for name in SIGNALS)
+            scored = {**result, "coverage": min(result["coverage"] / COVERAGE_TARGET, 1.0)}
+            result["reward"] = statistics.mean(scored[name] for name in SIGNALS)
         return result

@@ -24,9 +24,11 @@ GRPO/
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, cut at the response
 length), else the mean of three signals in [0, 1]:
 
-- `coverage`: share of the input signals cited as evidence by some interest;
+- `coverage`: share of the input signals cited as evidence by some interest, scored as min(coverage / 0.7, 1) (no
+  gain past 0.7: noisy signals may be skipped; the logged `coverage` is the raw share);
 - `future_recall@10`: share of the user's next-week actions in the top 10 of some interest;
-- `future_interest_hit@10`: share of interests whose top 10 hold one of the user's next-week actions.
+- `future_interest_hit@10`: share of interests matched one-to-one to a distinct next-week action in their top 10
+  (maximum matching: interests that only hit the same action count once).
 
 Each interest is one query, `<interest name>: <top topic>`, ranking with Qwen3-Embedding-4B the next-week actions
 of every user of the answer's batch (64 users). See `case_study/README.md` for the details and the rule list.
@@ -67,7 +69,7 @@ Credentials (key files hold the key on their first line, are git-ignored, and ma
 directory above it, e.g. the job directory `UU_LLM` was copied into):
 
 - Hugging Face, for the data step (gated `yufan/user_profile_dataset`): `HF_TOKEN`, else `hf_token.txt`, else `HF_Key`.
-- W&B (SFT project `MAI_SLM_V3`, run `GRPO_L1_no_kl_qwen3_5_4B_Final_CKPT`): `WANDB_API_KEY`, else `wandb_key.txt`,
+- W&B (project `MAI_SLM_V3_RL`, run `GRPO_L1_no_kl_qwen3_5_4B_Final_CKPT`): `WANDB_API_KEY`, else `wandb_key.txt`,
   else the login in `~/.netrc`; the launcher stops at once without one (`LOGGER="['console']"` skips W&B).
 
 ```bash
@@ -102,10 +104,11 @@ script.
 
 ## Following the reward
 
-Every validation logs the reward and each of its signals (W&B / console): `val-core/user_profile_l1/reward/mean@16`
-(and `best@16`), `val-aux/user_profile_l1/<signal>/mean@16` for `json_valid`, `rule_pass`, `n_interests`, `coverage`,
-`future_recall`, `future_interest_hit`. Step 0 is the starting checkpoint, scored like `case_study/` scores it. Each
-training step logs the batch reward as `critic/score/mean`. The dumped answers are read without a GPU:
+Every validation logs only the mean over all validation answers of seven signals (W&B / console, set by
+`trainer.val_core_metrics` in the launcher): `val-core/user_profile_l1/<signal>` for `reward`, `n_interests`,
+`coverage` (the raw share), `future_recall`, `future_interest_hit`, `json_valid` and `rule_pass`. Step 0 is the
+starting checkpoint, scored like `case_study/` scores it. Each training step logs the batch reward as
+`critic/score/mean`. The dumped answers are read without a GPU:
 
 ```bash
 cd case_study

@@ -719,6 +719,20 @@ class RayPPOTrainer:
         return self._val_metrics_update(data_sources, sample_uids, reward_extra_infos_dict, sample_turns)
 
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
+        # trainer.val_core_metrics (optional list): log only val-core/<data_source>/<name>, the mean of each of these
+        # reward signals over all validation answers, instead of the full mean / std / best / worst set.
+        val_core_metrics = self.config.trainer.get("val_core_metrics", None)
+        if val_core_metrics is not None:
+            metric_dict = {}
+            for data_source in np.unique(data_sources):
+                selected = data_sources == data_source
+                for name in val_core_metrics:
+                    if name not in reward_extra_infos_dict:
+                        raise KeyError(f"trainer.val_core_metrics: no reward signal {name!r}")
+                    values = np.asarray(reward_extra_infos_dict[name], dtype=np.float64)[selected]
+                    metric_dict[f"val-core/{data_source}/{name}"] = float(values.mean())
+            return metric_dict
+
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
         for data_source, var2metric2val in data_src2var2metric2val.items():
