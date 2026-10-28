@@ -10,6 +10,8 @@ are generated once; `score` can be re-run as the reward definition changes.
   `huggingface_hub`), the same environment as `code/inference/run_inference.py`.
 - The SFT checkpoint directory (full `Qwen3_5ForConditionalGeneration` checkpoint with its processor).
 - Access to the gated `yufan/user_profile_dataset`: `HF_TOKEN`, else `UU_LLM/hf_token.txt`.
+- `fasttext` and `UU_LLM/models/lid.176.bin` (or `LID_MODEL_PATH`) for the language rule of `score`, as for
+  `run_inference.py`; downloaded once when missing.
 - Optional: Qwen3-Embedding-0.6B for the embedding signals (`EMBEDDING_MODEL`, default
   `/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-0.6B`; `none` skips them).
 
@@ -48,21 +50,20 @@ are no retries: every sample is kept as generated.
 **score** writes per-sample signals (`scores.jsonl`), their summary (`summary.json`, also printed), `report.md` and
 `report.html`. Open `report.html` in a browser (self-contained, works offline, follows light / dark mode) to read
 every rollout's actual output (rendered, or the raw text) next to its reward signals and violations, one prompt at
-a time, with the prompt's input signals on the side (hover an interest to highlight the signals it cites; `j` / `k`
-switch prompts; "Model input" shows the exact prompt text). `report.md` has the summary and, for the first
-`--report_prompts` prompts, the input signals and every sample's interests.
+a time, with the prompt's input signals on the side (hover an interest to highlight the signals it cites and the
+next-week actions it retrieves; `j` / `k` switch prompts; "Model input" shows the exact prompt text). With the
+embedding model, every interest lists this user's next-week actions in its top K (`--top_k`, 10) with their rank,
+and each rollout shows how many next-week actions some interest retrieves. `report.md` has the
+summary and, for the first `--report_prompts` prompts, the input signals and every sample's interests.
 
 | Signal | Meaning |
 | --- | --- |
-| `json_valid`, `rule_pass`, `truncated` | The in-training rollout checks (`user_profile_rules.score_example`) |
-| `n_interests`, `n_topics`, `valid_topic_ratio` | Size, and share of topics whose evidence exists and whose `source` equals their evidence sources |
+| `json_valid` | Exactly the V3 Layer-1 schema `{"interests":[{"topics":[{"evidence","topic"}],"interest_name","actual_activity"}]}` with the right value types (no topic source, intent or content locale) |
+| `rule_pass` | The in-training rollout judgement (`user_profile_rules.score_example`) and not cut at max_tokens: JSON-valid and no violation (empty text, duplicate interest / topic name, evidence not a non-empty list of existing idx, duplicate evidence idx, 40+ interests, `wrong_language`: most interests' `actual_activity` not in the language of the actions they cite, `truncated`) |
+| `n_interests` | Number of interests (watch it against the recall signals, which grow with it) |
 | `coverage` | Share of the input signals cited by some interest |
-| `evidence_reuse` | Share of cited signals cited by more than one interest |
-| `evidence_per_interest`, `singleton_interest_ratio` | Distinct signals per interest; share of interests backed by one signal |
-| `future_recall@K` | Each interest (name + topic names) retrieves its top K actions, with Qwen3-Embedding as in `code/evaluation`, from the pool of every prompt's next-week actions: share of this user's next-week actions retrieved |
+| `future_recall@K` | Each interest is one query, `<interest name>: <top topic>` (the topic citing the most distinct signals; joining every topic blurs the embedding, a query per topic rewards padding topics), and retrieves its top K actions, with Qwen3-Embedding as in `code/evaluation`, from the pool of every prompt's next-week actions: share of this user's next-week actions retrieved by some interest |
 | `future_interest_hit@K` | Share of interests whose top K hold one of this user's next-week actions |
-| `past_recall@K`, `past_interest_hit@K` | The same against the current-week (input) actions |
-| `evidence_sim` | Mean cosine between each topic and the actions it cites |
 
 Content signals are 0 for an answer that is not JSON-valid. For GRPO only the variation within a group matters, so
 the summary reports each signal's mean, its mean within-group standard deviation, the share of groups where it does

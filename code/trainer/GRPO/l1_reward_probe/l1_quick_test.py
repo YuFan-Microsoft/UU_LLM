@@ -265,41 +265,39 @@ def rollout(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def interest_query(interest: dict) -> str:
-    topics = [topic["topic"] for topic in interest["topics"] if isinstance(topic.get("topic"), str)]
-    return f"{interest['interest_name']}: {'; '.join(topics)}" if topics else interest["interest_name"]
+    """The retrieval query of one interest: "<interest name>: <top topic>", the topic citing the most distinct
+    signals (the first on ties), or the name alone without a topic. Joining every topic blurs the embedding, and a
+    query per topic would reward padding interests with topics."""
+    topics = [topic for topic in interest["topics"] if isinstance(topic.get("topic"), str) and topic["topic"].strip()]
+    if not topics:
+        return interest["interest_name"]
+    top = max(topics, key=lambda topic: len(set(topic["evidence"])))  # max keeps the first on ties
+    return f"{interest['interest_name']}: {top['topic'].strip()}"
 
 
 def structure_metrics(sample: dict, row: dict) -> dict:
-    """Format and structure signals of one sample. Content metrics are 0 when the output is not JSON-valid."""
+    """The trainer's Layer-1 rollout judgement (user_profile_rules.score_example, V3 schema: no topic source, no
+    inferred_intent, no predicted_content_locale, multilingual) and structure signals of one sample. A generation cut
+    at max_tokens is the violation "truncated", so it fails rule_pass. Content metrics are 0 when the output is not
+    JSON-valid."""
     rules = user_profile_rules.score_example([{"role": "user", "content": row["content"]}], sample["text"])
+    violations = rules["violations"] + (["truncated"] if sample["finish_reason"] == "length" else [])
     output = parse_json_object(sample["text"])
     valid = output is not None and layer1_keys_valid(output)
     metrics = {
-        "json_valid": int(valid), "rule_pass": int(rules["rule_pass"]),
-        "truncated": int(sample["finish_reason"] == "length"), "output_tokens": sample["output_tokens"],
-        "n_interests": 0, "n_topics": 0, "valid_topic_ratio": 0.0, "coverage": 0.0, "evidence_reuse": 0.0,
-        "evidence_per_interest": 0.0, "singleton_interest_ratio": 0.0,
+        "json_valid": int(valid), "rule_pass": int(rules["rule_pass"] and "truncated" not in violations),
+        "n_interests": 0, "coverage": 0.0,
     }
     if not valid:
-        return {"metrics": metrics, "violations": rules["violations"], "output": None}
+        return {"metrics": metrics, "violations": violations, "output": None}
     n_signals = len(row["signals"])
-    stats = rules["stats"]
-    interest_evidence = []
-    for interest in output["interests"]:
-        cited = {idx for topic in interest["topics"] for idx in topic["evidence"] if 0 <= idx < n_signals}
-        interest_evidence.append(cited)
-    cited_by = Counter(idx for cited in interest_evidence for idx in cited)
+    cited = {idx for interest in output["interests"] for topic in interest["topics"] for idx in topic["evidence"]
+             if 0 <= idx < n_signals}
     metrics.update({
-        "n_interests": stats["interests"], "n_topics": stats["topics"],
-        "valid_topic_ratio": stats["valid_topics"] / stats["topics"] if stats["topics"] else 0.0,
-        "coverage": len(cited_by) / n_signals if n_signals else 0.0,
-        "evidence_reuse": sum(count > 1 for count in cited_by.values()) / len(cited_by) if cited_by else 0.0,
-        "evidence_per_interest": (float(statistics.mean(len(c) for c in interest_evidence))
-                                  if interest_evidence else 0.0),
-        "singleton_interest_ratio": (sum(len(c) <= 1 for c in interest_evidence) / len(interest_evidence)
-                                     if interest_evidence else 0.0),
+        "n_interests": len(output["interests"]),
+        "coverage": len(cited) / n_signals if n_signals else 0.0,
     })
-    return {"metrics": metrics, "violations": rules["violations"], "output": output}
+    return {"metrics": metrics, "violations": violations, "output": output}
 
 
 class Embedder:
@@ -337,54 +335,40 @@ class Embedder:
         return self.torch.stack([self.cache[key] for key in keys]) if keys else None
 
 
-def retrieval_metrics(embedder: Embedder, output: dict | None, row: dict, pools: dict, top_ks: list[int]) -> dict:
-    """Embedding signals of one sample. Each interest (name + topic names) is a query.
+def retrieval_metrics(embedder: Embedder, output: dict | None, row: dict, pool: tuple,
+                      k: int) -> tuple[dict, list]:
+    """Embedding signals of one sample, and per interest the [future position, rank] of this user's next-week
+    actions in its top K (rank from 1), for the report.
 
-    {future,past}_recall@K: retrieve the top K actions per interest from the pool of every quick-test prompt's
-    next-week (future) / current-week (past) actions; the share of this user's actions retrieved by any interest.
-    {future,past}_interest_hit@K: share of interests whose top K hold at least one of this user's actions (a
+    Each interest is one query, "<interest name>: <top topic>" (see interest_query), and retrieves its top K actions.
+    future_recall@K: retrieve the top K actions per interest from the pool of every quick-test prompt's next-week
+    actions; the share of this user's next-week actions retrieved by any interest.
+    future_interest_hit@K: share of interests whose top K hold at least one of this user's next-week actions (a
     precision-like check that penalizes interests that predict nothing).
-    evidence_sim: mean cosine between each topic and the actions it cites (are the cited signals on topic?).
     """
-    metrics = {}
     interests = output["interests"] if output else []
     queries = [interest_query(interest) for interest in interests]
     query_vectors = embedder.encode(queries, query=True) if queries else None
-    for name, (index_of, vectors) in pools.items():
-        targets = {index_of[behavior["action"]] for behavior in row[name_key(name)]}
-        for k in top_ks:
-            if query_vectors is None or not targets:
-                metrics[f"{name}_recall@{k}"] = metrics[f"{name}_interest_hit@{k}"] = 0.0
-                continue
-            top = (query_vectors @ vectors.T).topk(min(k, vectors.shape[0]), dim=1).indices.tolist()
-            retrieved = {index for indices in top for index in indices}
-            metrics[f"{name}_recall@{k}"] = len(retrieved & targets) / len(targets)
-            metrics[f"{name}_interest_hit@{k}"] = sum(bool(set(indices) & targets) for indices in top) / len(top)
-    topics = [(topic["topic"], [row["signals"][idx]["action"] for idx in topic["evidence"]
-                                if 0 <= idx < len(row["signals"])])
-              for interest in interests for topic in interest["topics"]]
-    topics = [(name, actions) for name, actions in topics if actions]
-    sims = []
-    if topics:
-        topic_vectors = embedder.encode([name for name, _ in topics], query=True)
-        for topic_vector, (_, actions) in zip(topic_vectors, topics):
-            sims.append(float((embedder.encode(actions, query=False) @ topic_vector).mean()))
-    metrics["evidence_sim"] = statistics.mean(sims) if sims else 0.0
-    return metrics
+    index_of, vectors = pool
+    # Pool index -> position in row["future"] (the cleaned next-week actions are distinct).
+    position = {index_of[behavior["action"]]: pos for pos, behavior in enumerate(row["future"])}
+    top = ((query_vectors @ vectors.T).topk(min(k, vectors.shape[0]), dim=1).indices.tolist()
+           if query_vectors is not None else [])
+    retrieved = {index for indices in top for index in indices}
+    metrics = {
+        f"future_recall@{k}": len(retrieved & position.keys()) / len(position) if position else 0.0,
+        f"future_interest_hit@{k}": (sum(bool(set(indices) & position.keys()) for indices in top) / len(top)
+                                     if top else 0.0),
+    }
+    hits = [[[position[index], rank] for rank, index in enumerate(indices, 1) if index in position]
+            for indices in top]
+    return metrics, hits
 
 
-def name_key(pool_name: str) -> str:
-    return {"future": "future", "past": "signals"}[pool_name]
-
-
-def build_pools(embedder: Embedder, rows: list[dict]) -> dict:
-    """{"future" | "past": ({action: row index in vectors}, vectors)} over every prompt's distinct actions."""
-    pools = {}
-    for name in ("future", "past"):
-        actions = list(dict.fromkeys(b["action"] for row in rows for b in row[name_key(name)]))
-        pools[name] = ({action: index for index, action in enumerate(actions)},
-                       embedder.encode(actions, query=False))
-    return pools
+def build_pool(embedder: Embedder, rows: list[dict]) -> tuple:
+    """({action: row index in vectors}, vectors) over every prompt's distinct next-week actions."""
+    actions = list(dict.fromkeys(b["action"] for row in rows for b in row["future"]))
+    return {action: index for index, action in enumerate(actions)}, embedder.encode(actions, query=False)
 
 
 def centered_correlation(groups: list[list[dict]], a: str, b: str) -> float | None:
@@ -430,28 +414,27 @@ def write_report(path: Path, rows: list[dict], scored: list[list[dict]], summary
     for a in names:
         lines.append(f"| {a} | " + " | ".join(fmt(summary["centered_correlation"][a][b]) for b in names) + " |")
 
-    columns = [name for name in names if name not in ("output_tokens", "n_topics")]
     for row, samples in list(zip(rows, scored))[:report_prompts]:
         lines += ["", f"## Prompt {row['prompt_id']} ({row['user_id']}, {len(row['signals'])} signals, "
                       f"{len(row['future'])} next-week actions)", "", "<details><summary>Input signals</summary>", "",
                   "```"]
         lines += [f"{i:>3} {s['date']} {s['source']:<13} {s['action']}" for i, s in enumerate(row["signals"])]
-        lines += ["```", "", "</details>", "", "| # | " + " | ".join(columns) + " | interests | violations |",
-                  "| ---: |" + " ---: |" * len(columns) + " --- | --- |"]
+        lines += ["```", "", "</details>", "", "| # | " + " | ".join(names) + " | interests | violations |",
+                  "| ---: |" + " ---: |" * len(names) + " --- | --- |"]
         for index, sample in enumerate(samples):
             output = sample["output"]
             interests = "; ".join(f"{i['interest_name']} ({sum(len(t['evidence']) for t in i['topics'])})"
                                   for i in output["interests"]) if output else "_invalid_"
-            lines.append(f"| {index} | " + " | ".join(fmt(sample["metrics"][c]) for c in columns)
+            lines.append(f"| {index} | " + " | ".join(fmt(sample["metrics"][c]) for c in names)
                          + f" | {interests.replace('|', '/')} | {', '.join(sample['violations'])} |")
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings: dict) -> None:
+def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings: dict, top_k: int) -> None:
     """report_template.html with the data embedded: a self-contained page (no network) showing every rollout's
-    output next to its reward signals."""
+    output next to its reward signals and, per interest, the next-week actions it retrieves."""
     data = {
-        "settings": settings,
+        "settings": settings, "top_k": top_k,
         "prompts": [{
             "id": row["prompt_id"], "user_id": row["user_id"], "prompt_tokens": row["prompt_tokens"],
             "model_input": row.get("model_input") or row["content"],
@@ -459,7 +442,9 @@ def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings:
             "signals": [[s["date"], s["source"], s["action"]] for s in row["signals"]],
             "future": [[b["date"], b["source"], b["action"]] for b in row["future"]],
             "samples": [{"metrics": result["metrics"], "violations": result["violations"], "output": result["output"],
-                         "text": sample["text"]}
+                         "queries": ([interest_query(interest) for interest in result["output"]["interests"]]
+                                     if result["output"] else None),
+                         "future_hits": result.get("future_hits"), "text": sample["text"]}
                         for sample, result in zip(row["samples"], samples)],
         } for row, samples in zip(rows, scored)],
     }
@@ -469,10 +454,14 @@ def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings:
 
 
 def score(args: argparse.Namespace) -> None:
+    import run_inference
+
+    # The Layer-1 rules check the language of every interest (fastText lid.176.bin, downloaded once if missing).
+    run_inference.prepare_language_tools()
     rows = read_jsonl(args.output_dir / "rollouts.jsonl")
     embedder = None if args.embedding_model.lower() == "none" else Embedder(args.embedding_model,
                                                                              args.embedding_batch_size)
-    pools = build_pools(embedder, rows) if embedder else None
+    pool = build_pool(embedder, rows) if embedder else None
     scored = []
     with (args.output_dir / "scores.jsonl").open("w", encoding="utf-8") as sink:
         for row in rows:
@@ -480,7 +469,9 @@ def score(args: argparse.Namespace) -> None:
             for index, sample in enumerate(row["samples"]):
                 result = structure_metrics(sample, row)
                 if embedder:
-                    result["metrics"].update(retrieval_metrics(embedder, result["output"], row, pools, args.top_k))
+                    metrics, result["future_hits"] = retrieval_metrics(embedder, result["output"], row, pool,
+                                                                       args.top_k)
+                    result["metrics"].update(metrics)
                 samples.append(result)
                 sink.write(dumps({"prompt_id": row["prompt_id"], "sample": index, **result["metrics"],
                                   "violations": result["violations"]}) + "\n")
@@ -493,7 +484,7 @@ def score(args: argparse.Namespace) -> None:
     write_report(args.output_dir / "report.md", rows, scored, summary, args.report_prompts)
     settings_path = args.output_dir / "rollout_settings.json"
     settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
-    write_html(args.output_dir / "report.html", rows, scored, settings)
+    write_html(args.output_dir / "report.html", rows, scored, settings, args.top_k)
 
     print(f"{summary['prompts']} prompts, {summary['samples']} samples")
     print(f"{'metric':<28}{'mean':>10}{'grp std':>10}{'zero-var':>10}")
@@ -538,7 +529,7 @@ def parse_args() -> argparse.Namespace:
     s.add_argument("--embedding_model", default=DEFAULT_EMBEDDING_MODEL,
                    help="Qwen3-Embedding path for the retrieval signals, or 'none' to skip them")
     s.add_argument("--embedding_batch_size", type=int, default=256)
-    s.add_argument("--top_k", type=int, nargs="+", default=[10, 50])
+    s.add_argument("--top_k", type=int, default=10, help="Actions each interest retrieves (the K of the metrics)")
     s.add_argument("--report_prompts", type=int, default=16, help="Prompts shown sample by sample in report.md")
     return parser.parse_args()
 

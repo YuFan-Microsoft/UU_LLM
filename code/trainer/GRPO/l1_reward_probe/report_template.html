@@ -85,6 +85,13 @@ pre.minput { margin: 0 14px 14px; padding: 12px; border-radius: 10px; background
 .topic { display: flex; flex-wrap: wrap; align-items: center; gap: 5px; font-size: 12.5px; margin-top: 5px; padding-left: 12px; border-left: 2px solid var(--line); }
 .ev { font-family: var(--mono); font-size: 10.5px; color: var(--blue); background: var(--blue-soft); border-radius: 5px; padding: 0 5px; }
 .ev.bad { color: var(--red); background: var(--red-soft); }
+.fut { margin-top: 8px; font-size: 12px; }
+.fut summary { cursor: pointer; color: var(--green); font-weight: 500; list-style: none; }
+.fut summary::-webkit-details-marker { display: none; }
+.fut.none summary { color: var(--faint); cursor: default; }
+.fut .row { display: grid; grid-template-columns: 34px 72px auto 1fr; gap: 6px; align-items: baseline; padding: 2px 0 2px 12px; border-left: 2px solid var(--green-soft); }
+.fut .row .d { font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.rk { font-family: var(--mono); font-size: 10.5px; color: var(--green); background: var(--green-soft); border-radius: 5px; padding: 0 5px; text-align: center; }
 pre { margin: 0; font: 12px/1.55 var(--mono); white-space: pre-wrap; word-break: break-word; max-height: 640px; overflow: auto; }
 .empty { color: var(--muted); font-size: 13px; }
 .note { font-size: 12px; color: var(--red); margin-bottom: 8px; }
@@ -119,7 +126,8 @@ function src(name) {
   return `<span class="src" style="background:${dark ? `hsla(${h},${s}%,55%,.22)` : `hsla(${h},${s}%,50%,.13)`};color:${dark ? `hsl(${h},${s}%,72%)` : `hsl(${h},${s}%,32%)`}">${esc(name)}</span>`;
 }
 const fmt = v => v == null ? "–" : Number.isInteger(v) ? String(v) : v.toFixed(3);
-const HIDDEN = new Set(["json_valid", "rule_pass", "truncated", "output_tokens"]);  // shown as badges / token count
+const HIDDEN = new Set(["json_valid", "rule_pass"]);  // shown as badges
+const K = D.top_k;
 
 let P = 0, view = "rendered";
 const S = D.settings || {};
@@ -130,27 +138,42 @@ function signalRows(list) {
   return list.map((s, i) => `<div class="sig" data-i="${i}"><span class="i">${i}</span><span class="d">${esc(s[0])}</span>${src(s[1])}<span class="a">${esc(s[2])}</span></div>`).join("");
 }
 
-function rendered(out, n) {
-  return `<div class="locale">predicted_content_locale <b>${esc(out.predicted_content_locale)}</b> · ${out.interests.length} interests</div>` +
-    (out.interests.length ? out.interests.map(it => {
+// V3 answers carry no topic source: as layer1.to_record, it is rebuilt from the sources of the evidence signals.
+// hits[j]: [[next-week position, rank], ...] of interest j in its top K (absent without an embedding model).
+function rendered(out, sigs, hits, fut, queries) {
+  const n = sigs.length, ok = i => Number.isInteger(i) && i >= 0 && i < n;
+  const covered = hits ? new Set(hits.flat().map(([i]) => i)).size : null;
+  return `<div class="locale">${out.interests.length} interests${hits ? ` · next-week actions in some top ${K}: <b>${covered} / ${fut.length}</b>` : ""}</div>` +
+    (out.interests.length ? out.interests.map((it, j) => {
       const ev = [...new Set(it.topics.flatMap(t => t.evidence))];
-      return `<div class="interest" data-ev="${ev.join(",")}"><div class="nm">${esc(it.interest_name)}</div>
-        <div class="txt"><b>Activity</b>${esc(it.actual_activity)}</div><div class="txt"><b>Intent</b>${esc(it.inferred_intent)}</div>
-        ${it.topics.map(t => `<div class="topic"><span>${esc(t.topic)}</span>${(t.source || []).map(src).join("")}
-          ${t.evidence.map(i => `<span class="ev ${Number.isInteger(i) && i >= 0 && i < n ? "" : "bad"}">${esc(i)}</span>`).join("")}</div>`).join("")}</div>`;
+      return `<div class="interest" data-ev="${ev.join(",")}" data-fut="${hits ? hits[j].map(([i]) => i).join(",") : ""}"><div class="nm">${esc(it.interest_name)}</div>
+        <div class="txt"><b>Activity</b>${esc(it.actual_activity)}</div>${hits && queries ? `<div class="txt"><b>Query</b>${esc(queries[j])}</div>` : ""}
+        ${it.topics.map(t => `<div class="topic"><span>${esc(t.topic)}</span>${[...new Set(t.evidence.filter(ok).map(i => sigs[i][1]))].map(src).join("")}
+          ${t.evidence.map(i => `<span class="ev ${ok(i) ? "" : "bad"}">${esc(i)}</span>`).join("")}</div>`).join("")}
+        ${hits ? futureHits(hits[j], fut) : ""}</div>`;
     }).join("") : `<div class="empty">No interests.</div>`);
+}
+
+// The user's next-week actions in this interest's top K, by rank.
+function futureHits(h, fut) {
+  if (!h.length) return `<details class="fut none"><summary>Next week: none in top ${K}</summary></details>`;
+  return `<details class="fut" open><summary>Next week: ${h.length} in top ${K}</summary>` +
+    h.map(([i, r]) => `<div class="row"><span class="rk">#${r}</span><span class="d">${esc(fut[i][0])}</span>${src(fut[i][1])}<span>${esc(fut[i][2])}</span></div>`).join("") +
+    `</details>`;
 }
 
 function raw(text) {
   try { return `<pre>${esc(JSON.stringify(JSON.parse(text), null, 2))}</pre>`; } catch { return `<pre>${esc(text)}</pre>`; }
 }
 
-function highlight(ev) {
+function mark(box, set) {
   let first = null;
-  $("signals").querySelectorAll(".sig").forEach(r => { const on = ev.has(+r.dataset.i); r.classList.toggle("hl", on); if (on && !first) first = r; });
-  const box = $("signals");
+  box.querySelectorAll(".sig").forEach(r => { const on = set.has(+r.dataset.i); r.classList.toggle("hl", on); if (on && !first) first = r; });
   if (first && (first.offsetTop < box.scrollTop || first.offsetTop > box.scrollTop + box.clientHeight - 30)) box.scrollTop = first.offsetTop - 40;
 }
+
+// Hovering an interest highlights the input signals it cites and the next-week actions it retrieves.
+function highlight(ev, fut) { mark($("signals"), ev); mark($("future"), fut); }
 
 function render() {
   const p = D.prompts[P], n = p.signals.length;
@@ -162,20 +185,21 @@ function render() {
   $("future").innerHTML = signalRows(p.future);
   $("minput").textContent = p.model_input || "";
   $("rollouts").innerHTML = p.samples.map((s, k) => {
-    const m = s.metrics;
+    const m = s.metrics, truncated = s.violations.includes("truncated");
     const badge = !m.json_valid ? `<span class="badge b-invalid">invalid JSON</span>` : m.rule_pass ? `<span class="badge b-pass">pass</span>` : `<span class="badge b-rule">rule broken</span>`;
     const rewards = Object.entries(m).filter(([key]) => !HIDDEN.has(key)).map(([key, v]) => `<span class="r"><span>${esc(key)}</span>${fmt(v)}</span>`).join("")
-      + s.violations.map(v => `<span class="r v">${esc(v)}</span>`).join("");
-    const note = m.truncated ? "Cut off at max_tokens, so the JSON is incomplete. Raw text below."
+      + s.violations.filter(v => v !== "truncated").map(v => `<span class="r v">${esc(v)}</span>`).join("");
+    const note = truncated ? "Cut off at max_tokens, so the JSON is incomplete. Raw text below."
       : "Not valid Layer-1 JSON (does not parse, or keys / types differ from the trained schema). Raw text below.";
-    const body = view === "raw" ? raw(s.text) : s.output ? rendered(s.output, n) : `<div class="note">${note}</div>${raw(s.text)}`;
-    return `<div class="card ro"><div class="top"><span class="id">Rollout ${k}</span>${badge}${m.truncated ? `<span class="badge b-trunc">truncated</span>` : ""}
-      <span class="tok">${m.output_tokens} tokens</span></div><div class="rewards">${rewards}</div><div class="body">${body}</div></div>`;
+    const body = view === "raw" ? raw(s.text) : s.output ? rendered(s.output, p.signals, s.future_hits, p.future, s.queries) : `<div class="note">${note}</div>${raw(s.text)}`;
+    return `<div class="card ro"><div class="top"><span class="id">Rollout ${k}</span>${badge}${truncated ? `<span class="badge b-trunc">truncated</span>` : ""}
+      </div><div class="rewards">${rewards}</div><div class="body">${body}</div></div>`;
   }).join("");
   $("rollouts").querySelectorAll(".interest").forEach(el => {
-    const ev = new Set(el.dataset.ev.split(",").filter(Boolean).map(Number));
-    el.addEventListener("mouseenter", () => highlight(ev));
-    el.addEventListener("mouseleave", () => highlight(new Set()));
+    const ids = key => new Set(el.dataset[key].split(",").filter(Boolean).map(Number));
+    const ev = ids("ev"), fut = ids("fut");
+    el.addEventListener("mouseenter", () => highlight(ev, fut));
+    el.addEventListener("mouseleave", () => highlight(new Set(), new Set()));
   });
 }
 
