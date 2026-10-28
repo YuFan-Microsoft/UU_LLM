@@ -442,6 +442,18 @@ def save_hf_checkpoint(model, processor, save_dir, zero_stage):
         processor.save_pretrained(save_dir)
     torch.distributed.barrier()
 
+def wandb_api_key():
+    """WANDB_API_KEY, else the first line of wandb_key.txt in UU_LLM or in the directory above it (git-ignored), else
+    None: wandb.login() then uses the login saved in ~/.netrc, and fails without one."""
+    if os.environ.get("WANDB_API_KEY"):
+        return os.environ["WANDB_API_KEY"]
+    uu_llm = Path(__file__).resolve().parents[3]
+    for path in (uu_llm / "wandb_key.txt", uu_llm.parent / "wandb_key.txt"):
+        if path.exists() and path.read_text(encoding="utf-8").split():
+            return path.read_text(encoding="utf-8").split()[0]
+    return None
+
+
 def get_all_reduce_mean(tensor):
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
     tensor = tensor / torch.distributed.get_world_size()
@@ -931,7 +943,7 @@ def main(argument_defaults=None, rollout_scorer=None, train_augmenters=None):
         import wandb
 
         os.environ["WANDB_PROJECT"] = args.wandb_project
-        wandb.login(key="3f14084582ffbf0986b305f813aea34ca59c77c5")
+        wandb.login(key=wandb_api_key())
         wandb_config = vars(args).copy()
         wandb_config.pop("hf_token", None)
         init_kwargs = {

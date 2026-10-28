@@ -435,7 +435,8 @@ def parse_args() -> argparse.Namespace:
                    help="test: the 2,000 rows of held-out users (the GRPO run's validation users come first)")
     p.add_argument("--data_dir", type=Path,
                    help=f"Local {HF_CONFIG} files (<split>-*.jsonl); default: download them from {HF_REPO} to a "
-                        f"temporary directory (token: HF_TOKEN, else UU_LLM/hf_token.txt or UU_LLM/HF_Key)")
+                        f"temporary directory (token: HF_TOKEN, else hf_token.txt or HF_Key in UU_LLM or the "
+                        f"directory above it)")
     p.add_argument("--num_prompts", type=int, default=64)
     p.add_argument("--min_signals", type=int, default=1, help="Allowed, deduped past signals a row needs")
 

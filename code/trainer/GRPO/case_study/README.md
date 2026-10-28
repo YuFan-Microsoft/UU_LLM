@@ -28,8 +28,8 @@ reward_fn(content, text, finish_reason, next_week_actions)["reward"]
 - One or more GPUs (one vLLM engine per visible GPU), inside the project Docker image (`UU_LLM/Dockerfile`: torch 2.11, vLLM 0.24, transformers 5,
   `huggingface_hub`), the same environment as `code/inference/run_inference.py`.
 - The SFT checkpoint directory (full `Qwen3_5ForConditionalGeneration` checkpoint with its processor).
-- Access to the gated `yufan/user_profile_dataset`: `HF_TOKEN`, else `UU_LLM/hf_token.txt`, else `UU_LLM/HF_Key`
-  (first line; both files are git-ignored).
+- Access to the gated `yufan/user_profile_dataset`: `HF_TOKEN`, else `hf_token.txt`, else `HF_Key`, in `UU_LLM/` or
+  in the directory above it (first line; the files are git-ignored).
 - `fasttext` and `UU_LLM/models/lid.176.bin` (or `LID_MODEL_PATH`) for the language rule of `score`, as for
   `run_inference.py`; downloaded once when missing.
 - Qwen3-Embedding-4B for the reward (`EMBEDDING_MODEL`, default

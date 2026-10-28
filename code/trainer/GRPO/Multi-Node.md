@@ -2,8 +2,8 @@
 
 > Copied from `code/trainer/SFT/Multi-Node.md`: the record of the SFT (DeepSpeed) multi-node run. The cluster checks
 > (shared working directory, InfiniBand devices, NCCL/IB variables and how to confirm IB is used, gated-dataset
-> credentials) apply to GRPO as well. The launch itself does not: GRPO runs on verl / Ray, and `run_l1_grpo.sh`
-> is single-node for now (7 GPUs train, 1 serves the reward embeddings).
+> credentials) apply to GRPO as well. The launch itself does not: GRPO runs on verl / Ray and trains on one node;
+> a second node can serve the reward embeddings (`EMBEDDING_NODE=node-1`, see README.md).
 
 This document records the complete setup, the problems encountered, and troubleshooting lessons from launching `run_user_profile_multi_gpu_4B.sh` in an AzureML/Singularity environment on 2 nodes with 8 NVIDIA A100 GPUs per node (16 GPUs total).
 

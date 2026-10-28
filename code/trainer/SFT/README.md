@@ -413,7 +413,7 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 | `--checkpoint_steps` | 5000 | Eval + checkpoint interval |
 | `--save_checkpoints` | on | `--no-save_checkpoints` keeps the evaluations but never writes a model |
 | `--do_eval` / `--max_eval_steps` | 1 / -1 | Perplexity on the test split |
-| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `Train/*`, `Eval/*`, `<Task>_Evaluation/*` |
+| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `Train/*`, `Eval/*`, `<Task>_Evaluation/*`. Login: `WANDB_API_KEY`, else the first line of `wandb_key.txt` in `UU_LLM` or the directory above it (git-ignored), else `~/.netrc` |
 
 Eval perplexity (x-axis `eval_step`):
 

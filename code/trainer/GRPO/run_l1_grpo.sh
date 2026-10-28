@@ -11,9 +11,15 @@
 # future_recall@10 and future_interest_hit@10), every answer ranked against the next-week actions of all users of
 # its batch. The batches are fixed by l1/prepare_data.py, run first when DATA_DIR has no train.parquet.
 #
-# GPUs (one node): the last visible GPU serves the reward's Qwen3-Embedding-4B with vLLM (/v1/embeddings,
-# OUTPUT_DIR/embedding_server.log; stopped when the script exits), the other GPUs train and roll out. verl splits each
-# step's TRAIN_BATCH_SIZE x N answers evenly over them.
+# GPUs: verl trains on one node. The reward's Qwen3-Embedding-4B is served by vLLM (serve_embedding.sh), either on
+# the last visible GPU of this node (default; OUTPUT_DIR/embedding_server.log, stopped when the script exits; the
+# other GPUs train), or with EMBEDDING_NODE=<node> on GPU 0 of another node (left running and reused by the next
+# launch; all GPUs of this node train), or at EMBEDDING_URL (a server already running; all GPUs train). verl splits
+# each step's TRAIN_BATCH_SIZE x N answers evenly over the training GPUs.
+#
+# Before Ray starts, a preflight scores one validation row through l1/verl_reward.py (fastText and its lid.176.bin,
+# downloaded here once rather than by every reward worker; the pool file; the embedding server), so a broken reward
+# fails in a minute instead of after the rollout engines are up.
 #
 # Every TEST_FREQ (100) steps, and before training, the 64 validation users get N answers each, sampled as in
 # training and in case_study/ (temperature 1.0): verl logs the reward and each of its signals
@@ -23,17 +29,20 @@
 #
 # Usage (inside the UU_LLM Docker image, verlai/verl:vllm024.dev2):
 #   nohup bash run_l1_grpo.sh > l1_grpo_launch.out 2>&1 &
+#   EMBEDDING_NODE=node-1 nohup bash run_l1_grpo.sh > l1_grpo_launch.out 2>&1 &   # embeddings on node-1, 8 GPUs train
 #   bash run_l1_grpo.sh trainer.total_training_steps=20     # extra args: Hydra overrides, last wins
-# W&B (as the SFT trainer, project MAI_SLM_V3): WANDB_API_KEY, else the first line of UU_LLM/wandb_key.txt
-#   (git-ignored), else the login the SFT trainer's wandb.login() saved in ~/.netrc on this machine.
+# A crashed run resumes from its latest checkpoint when launched again (trainer.resume_mode=auto); run
+# `ray stop --force` first if its Ray workers still hold GPUs. watchdog.sh does both.
+# W&B (as the SFT trainer, project MAI_SLM_V3): WANDB_API_KEY, else the first line of wandb_key.txt in UU_LLM or in
+#   the directory above it (git-ignored), else the login the SFT trainer's wandb.login() saved in ~/.netrc.
 # Optional env: CHECKPOINT (default: DEFAULT_CHECKPOINT below), EXPERIMENT_NAME, OUTPUT_DIR, DATA_DIR,
 #   NUM_TRAIN_BATCHES (0 = all), NUM_VAL,
 #   TRAIN_BATCH_SIZE (64), N (16), LR (7e-7), MAX_PROMPT_LENGTH (12288), MAX_RESPONSE_LENGTH (4096), SEED,
-#   EMBEDDING_MODEL (Qwen3-Embedding-4B), EMBEDDING_GPU (last visible), TRAIN_GPUS (the others), EMBEDDING_PORT
-#   (8100), EMBEDDING_URL (an embedding server already running: none is started), GEN_TP (1), ROLLOUT_GPU_MEM_UTIL (0.6),
+#   EMBEDDING_MODEL (Qwen3-Embedding-4B), EMBEDDING_NODE, EMBEDDING_URL, EMBEDDING_GPU (this node: last visible),
+#   EMBEDDING_PORT (8100), TRAIN_GPUS (all but the embedding GPU), GEN_TP (1), ROLLOUT_GPU_MEM_UTIL (0.6),
 #   PPO_MAX_TOKEN_LEN_PER_GPU (32768), SAVE_FREQ (100), TEST_FREQ (100), VAL_N (16), LOGGER, PROJECT_NAME,
 #   L1_REWARD_NUM_THREADS (8, CPU threads of each of the 8 reward workers, which rank the embeddings),
-#   HF_TOKEN (data download; else UU_LLM/hf_token.txt or UU_LLM/HF_Key).
+#   HF_TOKEN (data download; else hf_token.txt or HF_Key in UU_LLM or in the directory above it).
 # ============================================================================
 set -euo pipefail
 
@@ -60,13 +69,18 @@ LOGGER=${LOGGER:-"['console','wandb']"}
 
 mkdir -p "$OUTPUT_DIR"
 
+UU_LLM="$(cd "$HERE/../../.." && pwd)"
 if [[ "$LOGGER" == *wandb* ]] && [ -z "${WANDB_API_KEY:-}" ]; then
-  WANDB_KEY_FILE="$HERE/../../../wandb_key.txt"
-  if [ -f "$WANDB_KEY_FILE" ]; then
-    WANDB_API_KEY=$(head -n 1 "$WANDB_KEY_FILE" | tr -d '[:space:]')
-    export WANDB_API_KEY
-  elif ! grep -qs "api.wandb.ai" "$HOME/.netrc"; then
-    echo "No W&B login: set WANDB_API_KEY, put the key in UU_LLM/wandb_key.txt, or LOGGER=\"['console']\"" >&2
+  for WANDB_KEY_FILE in "$UU_LLM/wandb_key.txt" "$UU_LLM/../wandb_key.txt"; do
+    if [ -s "$WANDB_KEY_FILE" ]; then
+      WANDB_API_KEY=$(head -n 1 "$WANDB_KEY_FILE" | tr -d '[:space:]')
+      export WANDB_API_KEY
+      break
+    fi
+  done
+  if [ -z "${WANDB_API_KEY:-}" ] && ! grep -qs "api.wandb.ai" "$HOME/.netrc"; then
+    echo "No W&B login: set WANDB_API_KEY, put the key in UU_LLM/wandb_key.txt (or the directory above UU_LLM)," \
+         "or LOGGER=\"['console']\"" >&2
     exit 1
   fi
 fi
@@ -85,34 +99,47 @@ if meta["batch_size"] != int(sys.argv[2]) or meta["max_prompt_length"] > int(sys
              f"match TRAIN_BATCH_SIZE {sys.argv[2]} / MAX_PROMPT_LENGTH {sys.argv[3]}; use another DATA_DIR")
 EOF
 
-# The last visible GPU serves the reward embeddings, the others train (all of them with an EMBEDDING_URL given).
+# The reward embeddings: a server already running, one on another node, or one on this node's last visible GPU.
 ALL_GPUS=${CUDA_VISIBLE_DEVICES:-$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd, -)}
 if [ -n "${EMBEDDING_URL:-}" ]; then
   TRAIN_GPUS=${TRAIN_GPUS:-$ALL_GPUS}
+elif [ -n "${EMBEDDING_NODE:-}" ]; then
+  TRAIN_GPUS=${TRAIN_GPUS:-$ALL_GPUS}
+  EMBEDDING_URL=$(EMBEDDING_MODEL="$EMBEDDING_MODEL" EMBEDDING_GPU="${EMBEDDING_GPU:-0}" \
+                  bash "$HERE/serve_embedding.sh" "$EMBEDDING_NODE" | tail -n 1)
 else
   EMBEDDING_GPU=${EMBEDDING_GPU:-${ALL_GPUS##*,}}
   TRAIN_GPUS=${TRAIN_GPUS:-$(echo "$ALL_GPUS" | tr ',' '\n' | grep -vx "$EMBEDDING_GPU" | paste -sd, -)}
+  export EMBEDDING_MODEL EMBEDDING_GPU EMBEDDING_LOG="$OUTPUT_DIR/embedding_server.log"
+  trap 'bash "$HERE/serve_embedding.sh" stop || true' EXIT
+  EMBEDDING_URL=$(bash "$HERE/serve_embedding.sh" | tail -n 1)
 fi
 N_TRAIN_GPUS=$(echo "$TRAIN_GPUS" | tr ',' '\n' | grep -c .)
-if [ -z "${EMBEDDING_URL:-}" ]; then
-  EMBEDDING_URL=http://127.0.0.1:${EMBEDDING_PORT:-8100}
-  echo "Embedding server: $EMBEDDING_MODEL on GPU $EMBEDDING_GPU at $EMBEDDING_URL; training on GPUs $TRAIN_GPUS"
-  CUDA_VISIBLE_DEVICES="$EMBEDDING_GPU" vllm serve "$EMBEDDING_MODEL" --runner pooling \
-    --served-model-name l1-embedding --host 127.0.0.1 --port "${EMBEDDING_PORT:-8100}" \
-    --max-model-len 1024 --gpu-memory-utilization 0.9 > "$OUTPUT_DIR/embedding_server.log" 2>&1 &
-  EMBEDDING_PID=$!
-  trap 'kill "$EMBEDDING_PID" 2>/dev/null || true' EXIT
-  for _ in $(seq 1 120); do
-    curl -sf "$EMBEDDING_URL/health" > /dev/null && break
-    if ! kill -0 "$EMBEDDING_PID" 2>/dev/null; then
-      tail -n 50 "$OUTPUT_DIR/embedding_server.log" >&2
-      echo "The embedding server exited (log: $OUTPUT_DIR/embedding_server.log)" >&2
-      exit 1
-    fi
-    sleep 5
-  done
-  curl -sf "$EMBEDDING_URL/health" > /dev/null || { echo "The embedding server is not up after 10 min" >&2; exit 1; }
-fi
+echo "Reward embeddings at $EMBEDDING_URL; training on GPUs $TRAIN_GPUS"
+
+# Preflight: score one validation row as a reward worker will (an invalid answer, then a JSON-valid one).
+python3 - "$DATA_DIR" "$EMBEDDING_URL" "$EMBEDDING_MODEL" <<'EOF'
+import json, sys
+sys.path.insert(0, "l1")
+try:
+    import fasttext  # noqa: F401  (the language rule)
+except ImportError:
+    sys.exit("Preflight: no fasttext module; pip install fasttext-wheel opencc-python-reimplemented "
+             "(as UU_LLM/Dockerfile does)")
+import pyarrow.parquet as pq
+import user_profile_rules
+from verl_reward import compute_score
+
+user_profile_rules.language_tools()  # downloads lid.176.bin once, before the reward workers need it
+data_dir, url, model = sys.argv[1:]
+row = pq.read_table(f"{data_dir}/val.parquet").to_pylist()[0]
+answer = json.dumps({"interests": [{"topics": [{"evidence": [0], "topic": "test"}], "interest_name": "Test",
+                                    "actual_activity": "Test"}]})
+for text in ("not json", answer):
+    result = compute_score(row["data_source"], text, row["reward_model"]["ground_truth"], row["extra_info"],
+                           f"{data_dir}/pools.parquet", embedding_url=url, embedding_model=model)
+    print(f"Preflight reward of {text[:20]!r}: {result}", flush=True)
+EOF
 
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
@@ -126,7 +153,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     data.shuffle=False \
     data.filter_overlong_prompts=False \
     data.truncation='error' \
-    data.apply_chat_template_kwargs='{enable_thinking:false}' \
+    +data.apply_chat_template_kwargs.enable_thinking=False \
     actor_rollout_ref.model.path="$CHECKPOINT" \
     actor_rollout_ref.model.use_remove_padding=True \
     actor_rollout_ref.model.enable_gradient_checkpointing=True \

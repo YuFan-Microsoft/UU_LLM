@@ -24,16 +24,17 @@ from utils import dedupe, load_users  # noqa: E402
 DEFAULT_CHECKPOINT = "/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT"
 HF_REPO = "yufan/user_profile_dataset"
 HF_CONFIG = "User_Profile_Weekly_For_RL"
-HF_TOKEN_FILES = (UU_LLM / "hf_token.txt", UU_LLM / "HF_Key")
+# Key files, git-ignored: in UU_LLM, or in the directory above it (the job directory UU_LLM was copied into).
+HF_TOKEN_FILES = tuple(directory / name for directory in (UU_LLM, UU_LLM.parent) for name in ("hf_token.txt", "HF_Key"))
 
 
 def hf_token() -> str | None:
-    """HF_TOKEN, else the first line of UU_LLM/hf_token.txt, else of UU_LLM/HF_Key."""
+    """HF_TOKEN, else the first line of the first existing HF_TOKEN_FILES."""
     if os.environ.get("HF_TOKEN"):
         return os.environ["HF_TOKEN"]
     for path in HF_TOKEN_FILES:
-        if path.exists():
-            return path.read_text(encoding="utf-8").strip().splitlines()[0].strip()
+        if path.exists() and path.read_text(encoding="utf-8").split():
+            return path.read_text(encoding="utf-8").split()[0]
     return None
 
 

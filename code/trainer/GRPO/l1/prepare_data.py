@@ -16,16 +16,23 @@ validation answers apart by prompt).
 
 Rows without an allowed past signal, without a next-week action, or whose prompt has more than --max_prompt_length
 tokens (chat template included) are skipped before the batches are cut, so verl must not filter any.
+
+Rows are indexed by file offset (the raw lines are not held in memory) and turned into prompts by --num_workers
+processes, each with the checkpoint's tokenizer, in order; progress is printed every --log_every rows. All 139,629
+training rows take minutes; --num_train_batches 2 takes seconds.
 """
 
 import argparse
 import json
+import multiprocessing as mp
+import os
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from rl_data import DEFAULT_CHECKPOINT, clean_behaviors, iter_lines, rl_data_files, row_key  # noqa: E402  (also puts code/inference first)
+from rl_data import DEFAULT_CHECKPOINT, clean_behaviors, rl_data_files, row_key  # noqa: E402  (also puts code/inference first)
 import layer1  # noqa: E402
 from utils import build_prompt_ids  # noqa: E402
 
@@ -33,15 +40,18 @@ DATA_SOURCE = "user_profile_l1"
 VAL_BATCH_ID = "val"
 
 
-def row_order(paths: list[Path], seed: int) -> list[tuple[int, str, int]]:
-    """(row_key, file, line number) of every row, by key: the seeded random order."""
-    return sorted((row_key(seed, line), file_name, line_number) for file_name, line_number, line in iter_lines(paths))
-
-
-def read_lines(paths: list[Path], wanted: set[tuple[str, int]]) -> dict[tuple[str, int], bytes]:
-    """The raw lines of the wanted rows, parsed only when used."""
-    return {(file_name, line_number): line for file_name, line_number, line in iter_lines(paths)
-            if (file_name, line_number) in wanted}
+def row_index(paths: list[Path], seed: int) -> list[tuple[str, int, int]]:
+    """(path, byte offset, line number) of every row, in the seeded random order of row_key."""
+    rows = []
+    for path in paths:
+        with path.open("rb") as source:
+            offset = 0
+            for line_number, line in enumerate(source):
+                if line.strip():
+                    rows.append((row_key(seed, line), str(path), offset, line_number))
+                offset += len(line)
+    rows.sort()
+    return [row[1:] for row in rows]
 
 
 def build_example(row: dict, encode, max_prompt_length: int) -> dict | None:
@@ -65,35 +75,80 @@ def build_example(row: dict, encode, max_prompt_length: int) -> dict | None:
     }
 
 
-def accepted(paths: list[Path], args: argparse.Namespace, encode, wanted: int | None, distinct: bool):
+_worker: dict = {}
+
+
+def init_worker(tokenizer: str, max_prompt_length: int, encode=None) -> None:
+    """State of one prompt-building process: the checkpoint's chat template (or `encode`, given in process)."""
+    if encode is None:
+        from transformers import AutoProcessor
+
+        chat_tokenizer = AutoProcessor.from_pretrained(tokenizer, trust_remote_code=True).tokenizer
+
+        def encode(content: str) -> list[int]:
+            return build_prompt_ids(chat_tokenizer, [{"role": "user", "content": content}])
+
+    _worker.update(encode=encode, max_prompt_length=max_prompt_length, files={})
+
+
+def build_at(location: tuple[str, int, int]) -> dict | None:
+    """build_example of the row at (path, byte offset, line number)."""
+    path, offset, line_number = location
+    if path not in _worker["files"]:
+        _worker["files"][path] = open(path, "rb")
+    source = _worker["files"][path]
+    source.seek(offset)
+    example = build_example(json.loads(source.readline()), _worker["encode"], _worker["max_prompt_length"])
+    if example is not None:
+        example["extra_info"].update(file=Path(path).name, line=line_number)
+    return example
+
+
+def accepted(paths: list[Path], args: argparse.Namespace, split: str, wanted: int | None, distinct: bool,
+             encode=None) -> tuple[list[dict], int]:
     """(verl rows, rows skipped) of the first `wanted` accepted rows (all when None) in the seeded order, with
-    distinct prompts when `distinct`."""
-    order = row_order(paths, args.seed)
-    # Read only as many candidate rows as needed, with a margin for skipped rows (all rows when every row is kept).
+    distinct prompts when `distinct`. Prompts are built by args.num_workers processes, or in process with `encode`."""
+    start = time.time()
+    order = row_index(paths, args.seed)
+    # Only as many candidate rows as needed, with a margin for skipped rows (all rows when every row is kept).
     candidates = order if wanted is None else order[:2 * wanted + 1024]
-    raw = read_lines(paths, {(file_name, line_number) for _, file_name, line_number in candidates})
-    rows, contents, skipped = [], set(), 0
-    for _, file_name, line_number in candidates:
-        if wanted is not None and len(rows) == wanted:
-            break
-        example = build_example(json.loads(raw.pop((file_name, line_number))), encode, args.max_prompt_length)
-        if example is None or (distinct and example["extra_info"]["content"] in contents):
-            skipped += 1
-            continue
-        contents.add(example["extra_info"]["content"])
-        example["extra_info"].update(file=file_name, line=line_number)
-        rows.append(example)
+    print(f"[{split}] indexed {len(order)} rows in {time.time() - start:.0f}s; building up to "
+          f"{wanted or len(candidates)} prompts from {len(candidates)} rows", flush=True)
+    initargs = (args.tokenizer, args.max_prompt_length, encode)
+    pool = mp.Pool(args.num_workers, init_worker, initargs) if encode is None and args.num_workers > 1 else None
+    if pool is None:
+        init_worker(*initargs)
+    results = pool.imap(build_at, candidates, chunksize=16) if pool else map(build_at, candidates)
+    rows, contents, skipped, start = [], set(), 0, time.time()
+    try:
+        for done, example in enumerate(results, 1):
+            if example is None or (distinct and example["extra_info"]["content"] in contents):
+                skipped += 1
+            else:
+                contents.add(example["extra_info"]["content"])
+                rows.append(example)
+            finished = wanted is not None and len(rows) == wanted
+            if done % args.log_every == 0 or finished or done == len(candidates):
+                rate = done / max(time.time() - start, 1e-6)
+                print(f"[{split}] {done}/{len(candidates)} rows, {len(rows)} kept, {skipped} skipped, {rate:.0f} rows/s"
+                      f", {(len(candidates) - done) / rate / 60:.1f} min left at most", flush=True)
+            if finished:
+                break
+    finally:
+        if pool:
+            pool.terminate()
+            pool.join()
     return rows, skipped
 
 
-def select(args: argparse.Namespace, encode) -> tuple[list[dict], list[dict]]:
+def select(args: argparse.Namespace, encode=None) -> tuple[list[dict], list[dict]]:
     """(val rows from the test split, train rows from the train split); the train rows are a whole number of
-    batches."""
+    batches. `encode` (in process) replaces the checkpoint's tokenizer, for tests."""
     with rl_data_files(args.data_dir, "test") as paths:
-        val, val_skipped = accepted(paths, args, encode, args.num_val, distinct=True)
+        val, val_skipped = accepted(paths, args, "test", args.num_val, distinct=True, encode=encode)
     wanted_train = args.num_train_batches * args.batch_size if args.num_train_batches else None
     with rl_data_files(args.data_dir, "train") as paths:
-        train, train_skipped = accepted(paths, args, encode, wanted_train, distinct=False)
+        train, train_skipped = accepted(paths, args, "train", wanted_train, distinct=False, encode=encode)
     train = train[:len(train) // args.batch_size * args.batch_size]
     if len(val) < args.num_val or not train or (wanted_train is not None and len(train) < wanted_train):
         raise SystemExit(f"Not enough rows: {len(val)} val, {len(train)} train")
@@ -143,25 +198,21 @@ def main() -> None:
                         help="The checkpoint to train (its tokenizer / chat template)")
     parser.add_argument("--data_dir", type=Path,
                         help="Local User_Profile_Weekly_For_RL files (train-*.jsonl, test-*.jsonl); default: download "
-                             "them from Hugging Face to a temporary directory (token: HF_TOKEN, else "
-                             "UU_LLM/hf_token.txt or UU_LLM/HF_Key)")
+                             "them from Hugging Face to a temporary directory (token: HF_TOKEN, else hf_token.txt "
+                             "or HF_Key in UU_LLM or the directory above it)")
     parser.add_argument("--batch_size", type=int, default=64, help="data.train_batch_size of the run (prompts)")
     parser.add_argument("--num_train_batches", type=int, default=0, help="Training batches to keep (0 = all)")
     parser.add_argument("--num_val", type=int, default=64,
                         help="Validation prompts, from the test split (one batch, one pool)")
     parser.add_argument("--max_prompt_length", type=int, default=12288, help="data.max_prompt_length of the run")
     parser.add_argument("--seed", type=int, default=0)
+    parser.add_argument("--num_workers", type=int, default=min(32, os.cpu_count() or 1),
+                        help="Prompt-building processes, each with the tokenizer (1 = in process)")
+    parser.add_argument("--log_every", type=int, default=5000, help="Rows between progress lines")
     args = parser.parse_args()
-
-    from transformers import AutoProcessor
-
-    tokenizer = AutoProcessor.from_pretrained(args.tokenizer, trust_remote_code=True).tokenizer
-
-    def encode(content: str) -> list[int]:
-        return build_prompt_ids(tokenizer, [{"role": "user", "content": content}])
-
-    write(args, *select(args, encode))
+    write(args, *select(args))
 
 
 if __name__ == "__main__":
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
     main()

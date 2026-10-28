@@ -120,9 +120,10 @@ class Embedder:
 class EmbeddingClient:
     """The same embeddings from a vLLM embedding server (`vllm serve <Qwen3-Embedding> --runner pooling
     --served-model-name l1-embedding`): its /v1/embeddings pools the last token and normalizes, as Embedder does, and
-    truncates to EMBEDDING_MAX_LENGTH tokens. Same interface as Embedder; texts are cached until clear()."""
+    truncates to EMBEDDING_MAX_LENGTH tokens. Same interface as Embedder; texts are cached until clear(). A request
+    is retried for about 3 minutes (backoff up to 60 s), the time a restarted server takes to come back."""
 
-    def __init__(self, url: str, batch_size: int = 256, timeout: float = 600, retries: int = 5):
+    def __init__(self, url: str, batch_size: int = 256, timeout: float = 600, retries: int = 9):
         import torch
 
         self.torch = torch
@@ -147,7 +148,7 @@ class EmbeddingClient:
             except (urllib.error.URLError, TimeoutError, ConnectionError):
                 if attempt == self.retries - 1:
                     raise
-                time.sleep(2 ** attempt)
+                time.sleep(min(2 ** attempt, 60))
 
     def encode(self, texts: list[str], query: bool):
         import torch.nn.functional as functional
