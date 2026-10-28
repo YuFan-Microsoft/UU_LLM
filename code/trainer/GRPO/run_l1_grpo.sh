@@ -129,8 +129,9 @@ except ImportError:
     sys.exit("Preflight: no fasttext module; pip install fasttext-wheel opencc-python-reimplemented "
              "(as UU_LLM/Dockerfile does)")
 import pyarrow.parquet as pq
-import user_profile_rules
+# verl_reward (through l1_reward) puts code/inference on sys.path, where user_profile_rules lives: import it first.
 from verl_reward import compute_score
+import user_profile_rules
 
 user_profile_rules.language_tools()  # downloads lid.176.bin once, before the reward workers need it
 data_dir, url, model = sys.argv[1:]
