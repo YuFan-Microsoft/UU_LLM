@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """Layer-1 GRPO quick test: roll out a group of samples per prompt on a fixed subset of User_Profile_Weekly_For_RL
-and score every sample with candidate reward signals, to decide how to define the Layer-1 reward.
+and score every sample with the Layer-1 reward (../l1_reward.py, shared with the GRPO trainer) and diagnostic signals.
 
 Three steps (see README.md), so that the rollouts are generated once and can be re-scored as the reward changes:
     prepare  fixed seeded sample of RL rows -> prompts.jsonl (cleaned past signals, cleaned next-week behaviors)
     rollout  vLLM, --n samples per prompt with the inference Layer-1 prompt -> rollouts.jsonl
-    score    candidate reward signals per sample -> scores.jsonl, summary.json, report.md, report.html
+    score    reward and diagnostic signals per sample -> scores.jsonl, summary.json, report.md, report.html
 
 The Layer-1 input is built with the inference code (code/inference: load_users, dedupe, layer1.fit_prompt /
 build_message), so the prompts are exactly what run_inference.py sends for one weekly window.
@@ -31,19 +31,15 @@ HERE = Path(__file__).resolve().parent
 UU_LLM = HERE.parents[3]
 INFERENCE_DIR = UU_LLM / "code" / "inference"
 sys.path.insert(0, str(INFERENCE_DIR))
+sys.path.insert(0, str(HERE.parent))
 
 import layer1  # noqa: E402
-import user_profile_rules  # noqa: E402
-from utils import (MAX_MODEL_LEN, build_prompt_ids, dedupe, dumps, layer1_keys_valid, load_users,  # noqa: E402
-                   new_item, parse_json_object)
+from l1_reward import DEFAULT_EMBEDDING_MODEL, TOP_K, L1Reward  # noqa: E402
+from utils import MAX_MODEL_LEN, build_prompt_ids, dedupe, dumps, load_users, new_item  # noqa: E402
 
 HF_REPO = "yufan/user_profile_dataset"
 HF_CONFIG = "User_Profile_Weekly_For_RL"
 HF_TOKEN_FILE = UU_LLM / "hf_token.txt"
-DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-0.6B"
-# Same query instruction as code/evaluation/evaluate_behavior_retrieval.py; documents (actions) have none.
-EMBEDDING_INSTRUCTION = "Given a web search query, retrieve relevant documents that answer the query"
-EMBEDDING_MAX_LENGTH = 512
 
 
 # ---------------------------------------------------------------------------
@@ -264,111 +260,11 @@ def rollout(args: argparse.Namespace) -> None:
 # score: candidate reward signals
 # ---------------------------------------------------------------------------
 
-def interest_query(interest: dict) -> str:
-    """The retrieval query of one interest: "<interest name>: <top topic>", the topic citing the most distinct
-    signals (the first on ties), or the name alone without a topic. Joining every topic blurs the embedding, and a
-    query per topic would reward padding interests with topics."""
-    topics = [topic for topic in interest["topics"] if isinstance(topic.get("topic"), str) and topic["topic"].strip()]
-    if not topics:
-        return interest["interest_name"]
-    top = max(topics, key=lambda topic: len(set(topic["evidence"])))  # max keeps the first on ties
-    return f"{interest['interest_name']}: {top['topic'].strip()}"
-
-
-def structure_metrics(sample: dict, row: dict) -> dict:
-    """The trainer's Layer-1 rollout judgement (user_profile_rules.score_example, V3 schema: no topic source, no
-    inferred_intent, no predicted_content_locale, multilingual) and structure signals of one sample. A generation cut
-    at max_tokens is the violation "truncated", so it fails rule_pass. Content metrics are 0 when the output is not
-    JSON-valid."""
-    rules = user_profile_rules.score_example([{"role": "user", "content": row["content"]}], sample["text"])
-    violations = rules["violations"] + (["truncated"] if sample["finish_reason"] == "length" else [])
-    output = parse_json_object(sample["text"])
-    valid = output is not None and layer1_keys_valid(output)
-    metrics = {
-        "json_valid": int(valid), "rule_pass": int(rules["rule_pass"] and "truncated" not in violations),
-        "n_interests": 0, "coverage": 0.0,
-    }
-    if not valid:
-        return {"metrics": metrics, "violations": violations, "output": None}
-    n_signals = len(row["signals"])
-    cited = {idx for interest in output["interests"] for topic in interest["topics"] for idx in topic["evidence"]
-             if 0 <= idx < n_signals}
-    metrics.update({
-        "n_interests": len(output["interests"]),
-        "coverage": len(cited) / n_signals if n_signals else 0.0,
-    })
-    return {"metrics": metrics, "violations": violations, "output": output}
-
-
-class Embedder:
-    """Qwen3-Embedding, as code/evaluation/evaluate_behavior_retrieval.py: last-token pooling, L2-normalized,
-    queries with the instruction prefix, documents as is. Texts are cached."""
-
-    def __init__(self, model_path: str, batch_size: int):
-        import torch
-        from transformers import AutoModel, AutoTokenizer
-
-        self.torch = torch
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-        self.tokenizer = AutoTokenizer.from_pretrained(model_path, padding_side="left")
-        self.model = AutoModel.from_pretrained(model_path, dtype=torch.bfloat16).to(self.device).eval()
-        self.batch_size = batch_size
-        self.cache = {}
-
-    def encode(self, texts: list[str], query: bool):
-        import torch.nn.functional as functional
-
-        keys = [(query, text) for text in texts]
-        missing = list(dict.fromkeys(key for key in keys if key not in self.cache))
-        for start in range(0, len(missing), self.batch_size):
-            batch = missing[start:start + self.batch_size]
-            inputs = self.tokenizer([f"Instruct: {EMBEDDING_INSTRUCTION}\nQuery:{text}" if is_query else text
-                                     for is_query, text in batch], padding=True, truncation=True,
-                                    max_length=EMBEDDING_MAX_LENGTH, return_tensors="pt").to(self.device)
-            with self.torch.inference_mode():
-                hidden = self.model(**inputs).last_hidden_state
-            lengths = inputs["attention_mask"].sum(dim=1) - 1  # left padding: the last token is at -1 anyway
-            pooled = hidden[:, -1] if bool((inputs["attention_mask"][:, -1] == 1).all()) else \
-                hidden[self.torch.arange(hidden.shape[0], device=hidden.device), lengths]
-            for key, vector in zip(batch, functional.normalize(pooled.float(), p=2, dim=1).cpu()):
-                self.cache[key] = vector
-        return self.torch.stack([self.cache[key] for key in keys]) if keys else None
-
-
-def retrieval_metrics(embedder: Embedder, output: dict | None, row: dict, pool: tuple,
-                      k: int) -> tuple[dict, list]:
-    """Embedding signals of one sample, and per interest the [future position, rank] of this user's next-week
-    actions in its top K (rank from 1), for the report.
-
-    Each interest is one query, "<interest name>: <top topic>" (see interest_query), and retrieves its top K actions.
-    future_recall@K: retrieve the top K actions per interest from the pool of every quick-test prompt's next-week
-    actions; the share of this user's next-week actions retrieved by any interest.
-    future_interest_hit@K: share of interests whose top K hold at least one of this user's next-week actions (a
-    precision-like check that penalizes interests that predict nothing).
-    """
-    interests = output["interests"] if output else []
-    queries = [interest_query(interest) for interest in interests]
-    query_vectors = embedder.encode(queries, query=True) if queries else None
-    index_of, vectors = pool
-    # Pool index -> position in row["future"] (the cleaned next-week actions are distinct).
-    position = {index_of[behavior["action"]]: pos for pos, behavior in enumerate(row["future"])}
-    top = ((query_vectors @ vectors.T).topk(min(k, vectors.shape[0]), dim=1).indices.tolist()
-           if query_vectors is not None else [])
-    retrieved = {index for indices in top for index in indices}
-    metrics = {
-        f"future_recall@{k}": len(retrieved & position.keys()) / len(position) if position else 0.0,
-        f"future_interest_hit@{k}": (sum(bool(set(indices) & position.keys()) for indices in top) / len(top)
-                                     if top else 0.0),
-    }
-    hits = [[[position[index], rank] for rank, index in enumerate(indices, 1) if index in position]
-            for indices in top]
-    return metrics, hits
-
-
-def build_pool(embedder: Embedder, rows: list[dict]) -> tuple:
-    """({action: row index in vectors}, vectors) over every prompt's distinct next-week actions."""
-    actions = list(dict.fromkeys(b["action"] for row in rows for b in row["future"]))
-    return {action: index for index, action in enumerate(actions)}, embedder.encode(actions, query=False)
+def sample_metrics(sample: dict, k: int) -> dict:
+    """The reward of one sample and the signals it is computed from (l1_reward.L1Reward), with the judgement."""
+    return {"reward": sample["reward"], "json_valid": int(sample["json_valid"]), "rule_pass": int(sample["rule_pass"]),
+            "n_interests": sample["n_interests"], "coverage": sample["coverage"],
+            f"future_recall@{k}": sample["future_recall"], f"future_interest_hit@{k}": sample["future_interest_hit"]}
 
 
 def centered_correlation(groups: list[list[dict]], a: str, b: str) -> float | None:
@@ -442,8 +338,7 @@ def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings:
             "signals": [[s["date"], s["source"], s["action"]] for s in row["signals"]],
             "future": [[b["date"], b["source"], b["action"]] for b in row["future"]],
             "samples": [{"metrics": result["metrics"], "violations": result["violations"], "output": result["output"],
-                         "queries": ([interest_query(interest) for interest in result["output"]["interests"]]
-                                     if result["output"] else None),
+                         "queries": result["queries"],
                          "future_hits": result.get("future_hits"), "text": sample["text"]}
                         for sample, result in zip(row["samples"], samples)],
         } for row, samples in zip(rows, scored)],
@@ -454,24 +349,19 @@ def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings:
 
 
 def score(args: argparse.Namespace) -> None:
-    import run_inference
-
-    # The Layer-1 rules check the language of every interest (fastText lid.176.bin, downloaded once if missing).
-    run_inference.prepare_language_tools()
+    """The pool of distractor actions is every prompt's next-week actions."""
     rows = read_jsonl(args.output_dir / "rollouts.jsonl")
-    embedder = None if args.embedding_model.lower() == "none" else Embedder(args.embedding_model,
-                                                                             args.embedding_batch_size)
-    pool = build_pool(embedder, rows) if embedder else None
+    reward_fn = L1Reward(args.embedding_model, args.embedding_batch_size, top_k=args.top_k)
+    reward_fn.set_pool([behavior["action"] for row in rows for behavior in row["future"]])
     scored = []
     with (args.output_dir / "scores.jsonl").open("w", encoding="utf-8") as sink:
         for row in rows:
             samples = []
-            for index, sample in enumerate(row["samples"]):
-                result = structure_metrics(sample, row)
-                if embedder:
-                    metrics, result["future_hits"] = retrieval_metrics(embedder, result["output"], row, pool,
-                                                                       args.top_k)
-                    result["metrics"].update(metrics)
+            future = [behavior["action"] for behavior in row["future"]]
+            for index, raw in enumerate(row["samples"]):
+                sample = reward_fn(row["content"], raw["text"], raw["finish_reason"], future)
+                result = {"metrics": sample_metrics(sample, args.top_k), "violations": sample["violations"],
+                          "output": sample["output"], "queries": sample["queries"], "future_hits": sample["hits"]}
                 samples.append(result)
                 sink.write(dumps({"prompt_id": row["prompt_id"], "sample": index, **result["metrics"],
                                   "violations": result["violations"]}) + "\n")
@@ -527,9 +417,9 @@ def parse_args() -> argparse.Namespace:
 
     s = sub.add_parser("score", parents=[common], help="Candidate reward signals of rollouts.jsonl")
     s.add_argument("--embedding_model", default=DEFAULT_EMBEDDING_MODEL,
-                   help="Qwen3-Embedding path for the retrieval signals, or 'none' to skip them")
+                   help="Qwen3-Embedding path of the reward")
     s.add_argument("--embedding_batch_size", type=int, default=256)
-    s.add_argument("--top_k", type=int, default=10, help="Actions each interest retrieves (the K of the metrics)")
+    s.add_argument("--top_k", type=int, default=TOP_K, help="Actions each interest retrieves (the K of the reward)")
     s.add_argument("--report_prompts", type=int, default=16, help="Prompts shown sample by sample in report.md")
     return parser.parse_args()
 

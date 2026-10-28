@@ -1,8 +1,26 @@
 # Layer-1 reward probe
 
 What should the Layer-1 GRPO reward be? `l1_quick_test.py` rolls out a GRPO-sized group of samples per prompt with
-an SFT checkpoint on a fixed subset of the RL data and scores every sample with candidate reward signals. Rollouts
-are generated once; `score` can be re-run as the reward definition changes.
+an SFT checkpoint on a fixed subset of the RL data and scores every sample with the reward of `../l1_reward.py`, the
+single Layer-1 reward definition shared with the GRPO trainer, next to diagnostic signals. Rollouts are generated
+once; `score` can be re-run as the reward definition changes.
+
+## Reward (`../l1_reward.py`)
+
+The reward of one answer is 0 when it breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation,
+or cut at max_tokens), else the mean of three signals, in [0, 1], with K = 10:
+
+- `coverage`: share of the input signals cited as evidence by some interest.
+- `future_recall@K`: each interest is one query, `<interest name>: <top topic>` (the topic citing the most distinct
+  signals), ranking a pool of actions with Qwen3-Embedding (the distractor pool plus this user's next-week actions);
+  share of the user's next-week actions in the top K of some interest.
+- `future_interest_hit@K`: share of interests whose top K hold one of the user's next-week actions.
+
+```python
+reward_fn = L1Reward()                     # Qwen3-Embedding + fastText language model
+reward_fn.set_pool(distractor_actions)     # quick test: every prompt's next-week actions
+reward_fn(content, text, finish_reason, next_week_actions)["reward"]
+```
 
 ## Requirements
 
@@ -12,8 +30,8 @@ are generated once; `score` can be re-run as the reward definition changes.
 - Access to the gated `yufan/user_profile_dataset`: `HF_TOKEN`, else `UU_LLM/hf_token.txt`.
 - `fasttext` and `UU_LLM/models/lid.176.bin` (or `LID_MODEL_PATH`) for the language rule of `score`, as for
   `run_inference.py`; downloaded once when missing.
-- Optional: Qwen3-Embedding-0.6B for the embedding signals (`EMBEDDING_MODEL`, default
-  `/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-0.6B`; `none` skips them).
+- Qwen3-Embedding-0.6B for the reward (`EMBEDDING_MODEL`, default
+  `/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-0.6B`; a GPU is used when available).
 
 ```bash
 cd UU_LLM/code/trainer/GRPO/l1_reward_probe
@@ -22,7 +40,7 @@ sh run_l1_quick_test.sh <ckpt_dir>                                          # ->
 # or step by step
 python l1_quick_test.py prepare --output_dir <out>                          # fixed subset, downloads the RL data
 python l1_quick_test.py rollout --output_dir <out> --checkpoint <ckpt_dir>  # one GPU
-python l1_quick_test.py score   --output_dir <out>                          # --embedding_model none: no GPU
+python l1_quick_test.py score   --output_dir <out>
 ```
 
 `prepare` is skipped by the script when `<out>/prompts.jsonl` exists, so every checkpoint run on the same output
@@ -51,20 +69,21 @@ are no retries: every sample is kept as generated.
 `report.html`. Open `report.html` in a browser (self-contained, works offline, follows light / dark mode) to read
 every rollout's actual output (rendered, or the raw text) next to its reward signals and violations, one prompt at
 a time, with the prompt's input signals on the side (hover an interest to highlight the signals it cites and the
-next-week actions it retrieves; `j` / `k` switch prompts; "Model input" shows the exact prompt text). With the
-embedding model, every interest lists this user's next-week actions in its top K (`--top_k`, 10) with their rank,
+next-week actions it retrieves; `j` / `k` switch prompts; "Model input" shows the exact prompt text). Every interest lists this user's next-week actions in its top K (`--top_k`, 10) with their rank,
 and each rollout shows how many next-week actions some interest retrieves. `report.md` has the
 summary and, for the first `--report_prompts` prompts, the input signals and every sample's interests.
 
 | Signal | Meaning |
 | --- | --- |
+| `reward` | The GRPO reward of `../l1_reward.py` (above) |
 | `json_valid` | Exactly the V3 Layer-1 schema `{"interests":[{"topics":[{"evidence","topic"}],"interest_name","actual_activity"}]}` with the right value types (no topic source, intent or content locale) |
 | `rule_pass` | The in-training rollout judgement (`user_profile_rules.score_example`) and not cut at max_tokens: JSON-valid and no violation (empty text, duplicate interest / topic name, evidence not a non-empty list of existing idx, duplicate evidence idx, 40+ interests, `wrong_language`: most interests' `actual_activity` not in the language of the actions they cite, `truncated`) |
-| `n_interests` | Number of interests (watch it against the recall signals, which grow with it) |
-| `coverage` | Share of the input signals cited by some interest |
-| `future_recall@K` | Each interest is one query, `<interest name>: <top topic>` (the topic citing the most distinct signals; joining every topic blurs the embedding, a query per topic rewards padding topics), and retrieves its top K actions, with Qwen3-Embedding as in `code/evaluation`, from the pool of every prompt's next-week actions: share of this user's next-week actions retrieved by some interest |
-| `future_interest_hit@K` | Share of interests whose top K hold one of this user's next-week actions |
+| `n_interests` | Number of interests, not in the reward (watch it: `coverage` and `future_recall@K` grow with it) |
+| `coverage` | Share of the input signals cited by some interest (reward signal) |
+| `future_recall@K` | Share of this user's next-week actions in the top K of some interest (reward signal) |
+| `future_interest_hit@K` | Share of interests whose top K hold one of this user's next-week actions (reward signal) |
 
-Content signals are 0 for an answer that is not JSON-valid. For GRPO only the variation within a group matters, so
-the summary reports each signal's mean, its mean within-group standard deviation, the share of groups where it does
-not vary at all (no learning signal), and correlations computed after subtracting each group's mean.
+Content signals are 0 for an answer that is not JSON-valid; a JSON-valid answer that breaks a rule still gets them,
+but its reward is 0. For GRPO only the variation within a group matters, so the summary reports each signal's mean,
+its mean within-group standard deviation, the share of groups where it does not vary at all (no learning signal),
+and correlations computed after subtracting each group's mean.
