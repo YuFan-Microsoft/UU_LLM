@@ -60,6 +60,7 @@ from verl.trainer.ppo.metric_utils import (
     compute_variance_proxy_metrics,
     get_metric_data_with_optional_routed_experts,
     process_validation_metrics,
+    selected_validation_means,
 )
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics
@@ -1362,6 +1363,9 @@ class PPOTrainer(ABC):
         sample_turns,
         expected_acc_counts: dict[tuple[str, str], int] | None = None,
     ) -> dict[str, float]:
+        val_core_metrics = self.config.trainer.get("val_core_metrics", None)
+        if val_core_metrics is not None:
+            return selected_validation_means(val_core_metrics, data_sources, reward_extra_infos_dict)
         data_src2var2metric2val = process_validation_metrics(
             data_sources,
             sample_uids,
