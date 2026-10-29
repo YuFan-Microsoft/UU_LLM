@@ -14,6 +14,7 @@
 > | 坑 5：全量数据准备慢、无进度、内存大 | 按文件偏移索引、多进程构造 prompt、定期打印进度和剩余时间 |
 > | 坑 6：缺 fasttext 要等 ~12 分钟才暴露 | 启动前预检：检查 fasttext、预先下载一次 `lid.176.bin`、用一条验证数据实际调用 reward |
 > | 看门狗 `pgrep` 匹配到自己 | 仓库里的 `watchdog.sh` 用 `flock` 锁保证单实例 |
+> | 坑 7：`use_fused_kernels=True` 在第一次 actor 更新时报 liger `ImportError` | `torch_functional.py` 放宽为 `except ImportError`，回退到 torch 实现（修复见坑 7 正文） |
 >
 > 用法以 `README.md` 为准。
 
@@ -298,6 +299,68 @@ print(compute_score("user_profile_l1", "not json", row["reward_model"]["ground_t
 PY
 # 期望：{'score': 0.0, 'json_valid': 0.0, ...} 且不抛异常
 ```
+
+### 坑 7：开启 `use_fused_kernels=True` 后，第一次 actor 更新时报 `ImportError`（liger_kernel 版本不对）
+
+**背景**：提交 `3d0bd80`（Speed up Layer-1 GRPO steps）打开了
+`actor_rollout_ref.model.use_fused_kernels=True`，后端用默认的 `torch`。
+
+**现象**：vLLM 启动、step-0 validation 都正常，训练一进入第一次 actor 更新
+（`actor_rollout_update_actor`）就崩了，`launch.log` 里能看到：
+
+```text
+ImportError: cannot import name 'LigerFusedLinearScaledCrossEntropyFunction' from 'liger_kernel.ops'
+```
+
+看门狗检测到进程消失后会自动重启，于是每次都在同一个位置崩溃，形成循环。
+
+**定位**：
+
+```bash
+grep -a "ImportError" outputs/<EXPERIMENT_NAME>/launch.log | tail
+python3 -c "import liger_kernel, importlib.metadata as m; print(m.version('liger-kernel'))"
+```
+
+**根因**：`verl/utils/experimental/torch_functional.py` 在文件开头尝试导入 liger 的融合算子：
+
+```python
+try:
+    from liger_kernel.ops import LigerFusedLinearScaledCrossEntropyFunction as ...
+except ModuleNotFoundError as exc:
+    if exc.name != "liger_kernel":
+        raise
+    _LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY = None
+```
+
+- 镜像里**装了** `liger_kernel`，但版本较旧，没有 `LigerFusedLinearScaledCrossEntropyFunction` 这个符号。
+  这种情况下 Python 抛的是 `ImportError`（模块在、名字不在），而不是 `ModuleNotFoundError`（整个模块不存在），
+  所以没被 `except` 接住，异常直接抛了出来。
+- 这个文件是第一次走 fused 前向时才被导入的（`verl/models/transformers/qwen3_5.py` 的
+  `forward_with_torch_backend` 里），所以要等到第一次 actor 更新才暴露。又因为
+  `skip_on_policy_old_log_prob` 跳过了 old_log_prob 的前向，第一次 fused 前向就落在 `update_actor` 上。
+- 我们用的 `impl_backend` 是 `torch`，本来就不需要 liger：`FusedLinearForPPO.forward` 在
+  `impl_backend == "torch"` 或 liger 不可用时，都会走纯 PyTorch 实现 `FusedLinearForPPOFunction`
+  （按 512 个 token 分块，用 fp32 算 logits，同样不会生成完整词表的 logits）。所以 liger 缺失或版本不对，
+  本应只是回退到 torch 实现，而不是让训练崩溃。
+
+**修复**：放宽异常捕获，liger 不可用（无论是模块不存在，还是版本缺这个符号）时都置为 `None`，回退到 torch 实现：
+
+```python
+try:
+    from liger_kernel.ops import (
+        LigerFusedLinearScaledCrossEntropyFunction as _LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY,
+    )
+except ImportError:  # 没装 liger_kernel，或版本缺这个符号（ModuleNotFoundError 是 ImportError 的子类）
+    _LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY = None
+```
+
+修完后先停看门狗，再 `ray stop --force`，然后重新启动（`resume_mode=auto` 会从最新 checkpoint 续跑）。
+临时绕过的办法是 `actor_rollout_ref.model.use_fused_kernels=False`，代价是 logits 显存回到约 16GB，
+只能把 `PPO_MAX_TOKEN_LEN_PER_GPU` 调回 32768。
+
+**教训**：这类“只有训练到某一步才会被导入”的依赖，最好在启动前预检里提前导入一次
+（例如在 `run_l1_grpo.sh` 的预检里加 `import verl.utils.experimental.torch_functional`），
+1 分钟内就能暴露，不用等 vLLM 启动和 step-0 validation 跑完（约 15 分钟）。
 
 ### 重启前记得清理 Ray
 
