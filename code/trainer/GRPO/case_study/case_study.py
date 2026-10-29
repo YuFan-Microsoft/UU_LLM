@@ -33,7 +33,7 @@ sys.path.insert(0, str(UU_LLM / "code" / "inference"))
 sys.path.insert(0, str(HERE.parent / "l1"))
 
 import layer1  # noqa: E402
-from l1_reward import DEFAULT_EMBEDDING_MODEL, SIGNALS, TOP_K, L1Reward  # noqa: E402
+from l1_reward import CAP_METRICS, DEFAULT_EMBEDDING_MODEL, SIGNALS, TOP_K, L1Reward  # noqa: E402
 from rl_data import DEFAULT_CHECKPOINT, HF_CONFIG, HF_REPO, clean_behaviors, iter_lines, rl_data_files, row_key  # noqa: E402
 import user_profile_rules  # noqa: E402
 from utils import MAX_MODEL_LEN, build_prompt_ids, dumps, new_item  # noqa: E402
@@ -218,7 +218,8 @@ def sample_metrics(sample: dict, k: int) -> dict:
     """The reward of one sample and the signals it is computed from (l1_reward.L1Reward), with the judgement."""
     return {"reward": sample["reward"], "json_valid": int(sample["json_valid"]), "rule_pass": int(sample["rule_pass"]),
             "n_interests": sample["n_interests"], "coverage": sample["coverage"],
-            f"future_recall@{k}": sample["future_recall"], f"future_interest_hit@{k}": sample["future_interest_hit"]}
+            f"future_recall@{k}": sample["future_recall"], f"future_interest_hit@{k}": sample["future_interest_hit"],
+            "coverage_capped": sample["coverage_capped"], f"future_recall_capped@{k}": sample["future_recall_capped"]}
 
 
 def centered_correlation(groups: list[list[dict]], a: str, b: str) -> float | None:
@@ -393,17 +394,22 @@ def from_val(args: argparse.Namespace) -> None:
 
 def trend(args: argparse.Namespace) -> None:
     """Per validation step (verl's dumps, <step>.jsonl): the mean reward, the mean best reward of each prompt's group,
-    the mean of every reward signal and the mean answer length, as recorded by the run's reward."""
-    columns = ["reward", "best_of_group", "json_valid", "rule_pass", "n_interests", *SIGNALS, "answer_chars"]
+    the mean of every reward signal and the mean answer length, as recorded by the run's reward (coverage_capped and
+    future_recall_capped only when every dump has them: runs before the interest cap do not)."""
+    paths = sorted(args.validation_dir.glob("*.jsonl"), key=lambda path: int(path.stem))
+    dumps = [(path, read_validation_dump(path)) for path in paths]
+    dumps = [(path, groups, [entry for group in groups.values() for entry in group]) for path, groups in dumps]
+    cap_metrics = [name for name in CAP_METRICS
+                   if dumps and all(entries and name in entries[0] for _, _, entries in dumps)]
+    signals = ["json_valid", "rule_pass", "n_interests", *SIGNALS, *cap_metrics]
+    columns = ["reward", "best_of_group", *signals, "answer_chars"]
     steps = []
-    for path in sorted(args.validation_dir.glob("*.jsonl"), key=lambda path: int(path.stem)):
-        groups = read_validation_dump(path)
-        entries = [entry for group in groups.values() for entry in group]
+    for path, groups, entries in dumps:
         step = {"step": int(path.stem), "prompts": len(groups), "answers": len(entries),
                 "reward": statistics.mean(entry["score"] for entry in entries),
                 "best_of_group": statistics.mean(max(entry["score"] for entry in group) for group in groups.values()),
                 "answer_chars": statistics.mean(len(entry["output"]) for entry in entries)}
-        for name in ["json_valid", "rule_pass", "n_interests", *SIGNALS]:
+        for name in signals:
             step[name] = statistics.mean(float(entry[name]) for entry in entries)
         steps.append(step)
     if not steps:

@@ -22,13 +22,25 @@ GRPO/
 ## Reward
 
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, cut at the response
-length), else the mean of three signals in [0, 1]:
+length), else the mean of three signals in [0, 1] minus an over-cap penalty (never below 0):
 
-- `coverage`: share of the input signals cited as evidence by some interest, scored as min(coverage / 0.7, 1) (no
-  gain past 0.7: noisy signals may be skipped; the logged `coverage` is the raw share);
-- `future_recall@10`: share of the user's next-week actions in the top 10 of some interest;
-- `future_interest_hit@10`: share of interests matched one-to-one to a distinct next-week action in their top 10
-  (maximum matching: interests that only hit the same action count once).
+- `coverage`: share of the input signals cited as evidence by one of the first `interest_cap` interests, scored as
+  min(coverage / 0.7, 1) (no gain past 0.7: noisy signals may be skipped; logged raw as `coverage_capped`, while the
+  logged `coverage` is the raw share over every interest);
+- `future_recall@10`: share of the user's next-week actions in the top 10 of one of the first `interest_cap`
+  interests (logged as `future_recall_capped`; the logged `future_recall` is over every interest, as
+  `code/evaluation/evaluate_behavior_retrieval.py` counts it);
+- `future_interest_hit@10`: share of interests (all of them) matched one-to-one to a distinct next-week action in
+  their top 10 (maximum matching: interests that only hit the same action count once).
+
+`interest_cap` is the P90 of the SFT Layer-1 interest count at the prompt's number n of input signals, a saturation
+curve fitted to the V3 train split's P90 per signal-count bucket: round(0.9 + 18.2 n / (33 + n)), i.e. 1 at n = 1, 5
+at 10, 9 at 25, 13 at 60, 17 at 200 (the prompt holds at most 200 signals). Recall over every interest grows with
+each extra interest (10 more retrieved
+actions), which made the first run inflate the interest count from 8.7 to 15.4 in 200 steps; past the cap an
+interest adds neither coverage nor recall, lowers `future_interest_hit` and costs 0.5 x (interests - cap) / cap. The
+constants are
+`CAP_BASE`, `CAP_SCALE`, `CAP_HALF` and `OVER_CAP_PENALTY` in `l1/l1_reward.py`.
 
 Each interest is one query, `<interest name>: <top topic>`, ranking with Qwen3-Embedding-4B the next-week actions
 of every user of the answer's batch (64 users). See `case_study/README.md` for the details and the rule list.
@@ -105,11 +117,13 @@ script.
 
 ## Following the reward
 
-Every validation logs only the mean over all validation answers of seven signals (W&B / console, set by
+Every validation logs only the mean over all validation answers of nine signals (W&B / console, set by
 `trainer.val_core_metrics` in the launcher): `val-core/user_profile_l1/<signal>` for `reward`, `n_interests`,
-`coverage` (the raw share), `future_recall`, `future_interest_hit`, `json_valid` and `rule_pass`. Step 0 is the
-starting checkpoint, scored like `case_study/` scores it. Each training step logs the same seven means over its
-rollouts (`trainer.train_core_metrics`): `train-core/user_profile_l1/<signal>`, `reward` being `critic/score/mean`;
+`coverage` (the raw share over every interest), `future_recall` (over every interest), `future_interest_hit`,
+`coverage_capped`, `future_recall_capped`, `json_valid` and `rule_pass`. Step 0 is the starting checkpoint, scored
+like `case_study/` scores it. Each training step logs the same nine means over its rollouts
+(`trainer.train_core_metrics`): `train-core/user_profile_l1/<signal>`,
+`reward` being `critic/score/mean`;
 the `training/`, `num_turns/`, `timing_s/`, `timing_per_token_ms/` and `prompt_length/` metrics are not logged
 (`trainer.drop_metric_prefixes`).
 The dumped answers are read without a GPU:
@@ -123,7 +137,9 @@ python case_study.py score --output_dir outputs/<run>_val_300   # report.html of
 ```
 
 `trend.md` has one row per validation step (reward, best of 16, each signal, answer length); watch `n_interests` and
-the answer length next to the reward, since `coverage` and `future_recall` grow with the number of interests.
+the answer length next to the reward, since `coverage` and `future_recall` grow with the number of
+interests. `from_val` + `score` rescore a step's answers with the current reward, e.g. the steps of a run from before
+the interest cap (`score` needs Qwen3-Embedding-4B: `--embedding_url` of a running server, or a GPU).
 
 ## Crashes, restarts and the watchdog
 

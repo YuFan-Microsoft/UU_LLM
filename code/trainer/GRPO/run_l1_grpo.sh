@@ -17,9 +17,11 @@
 # PPO_MAX_TOKEN_LEN_PER_GPU (49152, at least MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH) tokens per micro-batch.
 #
 # Reward: l1/verl_reward.py -> l1/l1_reward.py L1Reward (0 when the Layer-1 rules fail, else the mean of coverage
-# (capped: min(coverage / 0.7, 1)),
-# future_recall@10 and future_interest_hit@10), every answer ranked against the next-week actions of all users of
-# its batch. The batches are fixed by l1/prepare_data.py, run first when DATA_DIR has no train.parquet.
+# (capped: min(coverage / 0.7, 1)) and future_recall@10, both over the first interest_cap interests, and
+# future_interest_hit@10, minus 0.5 x (interests - interest_cap) / interest_cap past the cap, never below 0;
+# interest_cap is the P90 of the SFT interest count at the prompt's number of input signals), every answer ranked
+# against the next-week actions of all users of its batch. The batches are fixed by l1/prepare_data.py, run first
+# when DATA_DIR has no train.parquet.
 #
 # GPUs: verl trains on one node. The reward's Qwen3-Embedding-4B is served by vLLM (serve_embedding.sh), either on
 # the last visible GPU of this node (default; OUTPUT_DIR/embedding_server.log, stopped when the script exits; the
@@ -33,11 +35,12 @@
 #
 # Every TEST_FREQ (100) steps, and before training, the 64 validation users get N answers each, sampled as in
 # training and in case_study/ (temperature 1.0): verl logs only the mean over all answers of the reward, n_interests,
-# coverage (raw), future_recall, future_interest_hit, json_valid and rule_pass (val-core/user_profile_l1/<signal>) and
+# coverage (raw, over every interest), future_recall (over every interest), future_interest_hit, coverage_capped,
+# future_recall_capped, json_valid and rule_pass (val-core/user_profile_l1/<signal>) and
 # dumps the answers to
 # OUTPUT_DIR/validation/<step>.jsonl, read by case_study.py trend (all steps) and from_val (one step's report). A
 # checkpoint is saved every SAVE_FREQ (100) steps, with a Hugging Face copy for the case study. Every training step
-# logs the same seven means over its rollouts (train-core/user_profile_l1/<signal>); the training/, num_turns/,
+# logs the same nine means over its rollouts (train-core/user_profile_l1/<signal>); the training/, num_turns/,
 # timing_s/, timing_per_token_ms/ and prompt_length/ metrics are not logged (trainer.drop_metric_prefixes).
 #
 # Usage (inside the UU_LLM Docker image, verlai/verl:vllm024.dev2):
@@ -223,8 +226,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.save_freq="${SAVE_FREQ:-100}" \
     trainer.test_freq="${TEST_FREQ:-100}" \
     trainer.validation_data_dir="$OUTPUT_DIR/validation" \
-    +trainer.val_core_metrics="['reward','n_interests','coverage','future_recall','future_interest_hit','json_valid','rule_pass']" \
-    +trainer.train_core_metrics="['reward','n_interests','coverage','future_recall','future_interest_hit','json_valid','rule_pass']" \
+    +trainer.val_core_metrics="['reward','n_interests','coverage','future_recall','future_interest_hit','coverage_capped','future_recall_capped','json_valid','rule_pass']" \
+    +trainer.train_core_metrics="['reward','n_interests','coverage','future_recall','future_interest_hit','coverage_capped','future_recall_capped','json_valid','rule_pass']" \
     +trainer.drop_metric_prefixes="['training/','num_turns/','timing_s/','timing_per_token_ms/','prompt_length/']" \
     trainer.total_epochs=1 \
     "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"
