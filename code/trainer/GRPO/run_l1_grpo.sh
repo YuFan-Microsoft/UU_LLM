@@ -7,6 +7,15 @@
 # the GRPO advantage (group mean subtracted, divided by the group std). Each step rolls out N answers for each of
 # TRAIN_BATCH_SIZE prompts with vLLM (colocated, asleep while the actor trains) and makes one on-policy update.
 #
+# Speed: that update is a single PPO epoch over a single mini-batch, so the PPO ratio is exactly 1 and the
+# old_log_prob forward is skipped (trainer.skip_on_policy_old_log_prob; the loss takes log_prob.detach(), and
+# actor/entropy is not logged; vLLM returns no log-probs, so the rollout_corr/ mismatch metrics are not logged
+# either). vLLM caches prompt prefixes (ENABLE_PREFIX_CACHING) and the N answers of a prompt
+# are routed to one replica, so the prompt is prefilled about once instead of N times. The actor uses fused
+# log-prob kernels (no full-vocabulary logits) and gradient checkpointing (GRADIENT_CHECKPOINTING; without it the
+# activations of one packed micro-batch, at least the longest sequence, do not fit in 80GB), packing
+# PPO_MAX_TOKEN_LEN_PER_GPU (49152, at least MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH) tokens per micro-batch.
+#
 # Reward: l1/verl_reward.py -> l1/l1_reward.py L1Reward (0 when the Layer-1 rules fail, else the mean of coverage
 # (capped: min(coverage / 0.7, 1)),
 # future_recall@10 and future_interest_hit@10), every answer ranked against the next-week actions of all users of
@@ -41,10 +50,12 @@
 #   the directory above it (git-ignored), else the login the SFT trainer's wandb.login() saved in ~/.netrc.
 # Optional env: CHECKPOINT (default: DEFAULT_CHECKPOINT below), EXPERIMENT_NAME, OUTPUT_DIR, DATA_DIR,
 #   NUM_TRAIN_BATCHES (0 = all), NUM_VAL,
-#   TRAIN_BATCH_SIZE (64), N (16), LR (7e-7), MAX_PROMPT_LENGTH (12288), MAX_RESPONSE_LENGTH (4096), SEED,
+#   TRAIN_BATCH_SIZE (64), N (16), LR (7e-7), MAX_PROMPT_LENGTH (12288), MAX_RESPONSE_LENGTH (8192), SEED,
 #   EMBEDDING_MODEL (Qwen3-Embedding-4B), EMBEDDING_NODE, EMBEDDING_URL, EMBEDDING_GPU (this node: last visible),
-#   EMBEDDING_PORT (8100), TRAIN_GPUS (all but the embedding GPU), GEN_TP (1), ROLLOUT_GPU_MEM_UTIL (0.6),
-#   PPO_MAX_TOKEN_LEN_PER_GPU (32768), SAVE_FREQ (100), TEST_FREQ (100), VAL_N (16), LOGGER, PROJECT_NAME,
+#   EMBEDDING_PORT (8100), TRAIN_GPUS (all but the embedding GPU), GEN_TP (1), ROLLOUT_GPU_MEM_UTIL (0.75),
+#   ENABLE_PREFIX_CACHING (True), GRADIENT_CHECKPOINTING (True),
+#   PPO_MAX_TOKEN_LEN_PER_GPU (49152), SAVE_FREQ (100), TEST_FREQ (100),
+#   VAL_N (16), LOGGER, PROJECT_NAME,
 #   L1_REWARD_NUM_THREADS (8, CPU threads of each of the 8 reward workers, which rank the embeddings),
 #   HF_TOKEN (data download; else hf_token.txt or HF_Key in UU_LLM or in the directory above it).
 # ============================================================================
@@ -66,7 +77,14 @@ TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 N=${N:-16}
 SEED=${SEED:-0}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-12288}
-MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-4096}
+MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
+# A packed micro-batch must hold the longest sequence (verl asserts it).
+PPO_MAX_TOKEN_LEN_PER_GPU=${PPO_MAX_TOKEN_LEN_PER_GPU:-49152}
+if [ "$PPO_MAX_TOKEN_LEN_PER_GPU" -lt $((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)) ]; then
+  echo "PPO_MAX_TOKEN_LEN_PER_GPU ($PPO_MAX_TOKEN_LEN_PER_GPU) < MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH" \
+       "($((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)))" >&2
+  exit 1
+fi
 DATA_DIR=${DATA_DIR:-$HERE/outputs/data/seed${SEED}_batch${TRAIN_BATCH_SIZE}_prompt${MAX_PROMPT_LENGTH}}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B}
 LOGGER=${LOGGER:-"['console','wandb']"}
@@ -161,12 +179,13 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     +data.apply_chat_template_kwargs.enable_thinking=False \
     actor_rollout_ref.model.path="$CHECKPOINT" \
     actor_rollout_ref.model.use_remove_padding=True \
-    actor_rollout_ref.model.enable_gradient_checkpointing=True \
+    actor_rollout_ref.model.enable_gradient_checkpointing="${GRADIENT_CHECKPOINTING:-True}" \
+    actor_rollout_ref.model.use_fused_kernels=True \
     actor_rollout_ref.actor.strategy=fsdp2 \
     actor_rollout_ref.actor.optim.lr="${LR:-7e-7}" \
     actor_rollout_ref.actor.ppo_mini_batch_size="$TRAIN_BATCH_SIZE" \
     actor_rollout_ref.actor.use_dynamic_bsz=True \
-    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="${PPO_MAX_TOKEN_LEN_PER_GPU:-32768}" \
+    actor_rollout_ref.actor.ppo_max_token_len_per_gpu="$PPO_MAX_TOKEN_LEN_PER_GPU" \
     actor_rollout_ref.actor.use_kl_loss=False \
     actor_rollout_ref.actor.entropy_coeff=0 \
     actor_rollout_ref.actor.fsdp_config.param_offload=False \
@@ -174,11 +193,12 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.actor.checkpoint.save_contents="['model','optimizer','extra','hf_model']" \
     actor_rollout_ref.rollout.name=vllm \
     actor_rollout_ref.rollout.tensor_model_parallel_size="${GEN_TP:-1}" \
-    actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEM_UTIL:-0.6}" \
+    actor_rollout_ref.rollout.gpu_memory_utilization="${ROLLOUT_GPU_MEM_UTIL:-0.75}" \
     actor_rollout_ref.rollout.max_num_batched_tokens=16384 \
-    actor_rollout_ref.rollout.enable_prefix_caching=False \
+    actor_rollout_ref.rollout.enable_prefix_caching="${ENABLE_PREFIX_CACHING:-True}" \
     actor_rollout_ref.rollout.free_cache_engine=True \
     actor_rollout_ref.rollout.n="$N" \
+    actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
     actor_rollout_ref.rollout.val_kwargs.n="${VAL_N:-16}" \
@@ -192,6 +212,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     +reward.custom_reward_function.reward_kwargs.embedding_url="$EMBEDDING_URL" \
     +reward.custom_reward_function.reward_kwargs.embedding_model="$EMBEDDING_MODEL" \
     trainer.critic_warmup=0 \
+    +trainer.skip_on_policy_old_log_prob=True \
     trainer.logger="$LOGGER" \
     trainer.project_name="$PROJECT_NAME" \
     trainer.experiment_name="$EXPERIMENT_NAME" \

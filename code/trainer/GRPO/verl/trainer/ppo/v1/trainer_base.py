@@ -1668,6 +1668,10 @@ class PPOTrainer(ABC):
             tq.kv_batch_put(keys=batch.keys, partition_id=batch.partition_id, fields=data)
             return batch
 
+        if self._can_skip_on_policy_old_log_prob(batch):
+            # ppo_loss takes old_log_probs = log_prob.detach(): the same values, as the actor has not moved yet.
+            return batch
+
         # 1. compute log probs
         batch.extra_info.update(
             {
@@ -1712,6 +1716,31 @@ class PPOTrainer(ABC):
             metrics.update(calculate_debug_metrics(data))
 
         return batch
+
+    def _can_skip_on_policy_old_log_prob(self, batch: KVBatchMeta) -> bool:
+        """trainer.skip_on_policy_old_log_prob: skip the old_log_prob forward when the update is purely on-policy.
+
+        With one PPO epoch over a single mini-batch, the actor computes the loss once with the weights that would
+        recompute old_log_probs, so the PPO ratio is exactly 1 and the clip never acts. Only the vanilla policy loss
+        is covered, and nothing else may read old_log_probs (KL in reward, rollout correction, distillation).
+        actor/entropy is then not logged.
+        """
+        if not self.config.trainer.get("skip_on_policy_old_log_prob", False):
+            return False
+        actor_config = self.config.actor_rollout_ref.actor
+        mini_batch_samples = actor_config.ppo_mini_batch_size * self.config.actor_rollout_ref.rollout.n
+        # The config always has a rollout_correction block; it only acts with rollout_is / rollout_rs set.
+        rollout_corr_config = self.config.algorithm.get("rollout_correction", None) or {}
+        return (
+            actor_config.ppo_epochs == 1
+            and len(batch) <= mini_batch_samples
+            and actor_config.policy_loss.get("loss_mode", "vanilla") == "vanilla"
+            and not self.config.algorithm.use_kl_in_reward
+            and rollout_corr_config.get("rollout_is", None) is None
+            and rollout_corr_config.get("rollout_rs", None) is None
+            and not self.config.actor_rollout_ref.rollout.calculate_log_probs
+            and not is_distillation_enabled(self.config.get("distillation"))
+        )
 
     def _compute_ref_log_prob(self, batch: KVBatchMeta, metrics: dict) -> KVBatchMeta:
         """Compute the reference log prob of the batch."""

@@ -83,7 +83,9 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
     metrics = {}
 
     # select fields and convert to padded tensor
-    fields = ["response_mask", "old_log_probs", "advantages"]
+    # trainer.skip_on_policy_old_log_prob leaves old_log_probs out: the update is on-policy, so they equal log_prob.
+    on_policy = "old_log_probs" not in data
+    fields = ["response_mask", "advantages"] if on_policy else ["response_mask", "old_log_probs", "advantages"]
     if "rollout_is_weights" in data:
         fields.append("rollout_is_weights")
     if "ref_log_prob" in data:
@@ -92,7 +94,7 @@ def ppo_loss(config: ActorConfig, model_output, data: TensorDict, dp_group=None)
 
     response_mask = data["response_mask"].to(bool)
     # compute policy loss
-    old_log_prob = data["old_log_probs"]
+    old_log_prob = log_prob.detach() if on_policy else data["old_log_probs"]
     advantages = data["advantages"]
     rollout_is_weights = data.get("rollout_is_weights", None)
 

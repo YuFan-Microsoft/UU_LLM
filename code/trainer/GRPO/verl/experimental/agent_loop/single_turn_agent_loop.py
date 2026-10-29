@@ -66,7 +66,14 @@ class SingleTurnAgentLoop(AgentLoopBase):
         # 3. generate sequences
         metrics = {}
         with simple_timer("generate_sequences", metrics):
-            request_id = f"det-{priority}" if getattr(self.rollout_config, "full_determinism", False) else uuid4().hex
+            if getattr(self.rollout_config, "full_determinism", False):
+                request_id = f"det-{priority}"
+            elif self.rollout_config.enable_prefix_caching and kwargs.get("uid") is not None:
+                # Route all rollout.n answers of a prompt to one replica (the request_id is only the sticky
+                # routing key; vLLM gets its own id), so they share its prefix cache.
+                request_id = f"group-{kwargs['uid']}"
+            else:
+                request_id = uuid4().hex
             output: TokenOutput = await self.server_manager.generate(
                 request_id=request_id,
                 prompt_ids=prompt_ids,

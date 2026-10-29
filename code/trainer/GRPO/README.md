@@ -95,9 +95,10 @@ script.
 | Start | `unified_slm_VFinal_F16A/4B/Final_CKPT` (also the case-study default) |
 | Batch | 64 prompts (users) x 16 answers, sampled at temperature 1.0 / top-p 1.0 |
 | Advantage | GRPO: reward minus the group mean, divided by the group std; no KL |
-| Lengths | prompt <= 12288 tokens (longer rows are dropped by the data step), answer <= 4096 tokens |
-| Actor | FSDP2, packed sequences, dynamic batch (32768 tokens per GPU), gradient checkpointing |
-| Rollout | vLLM, TP 1, colocated (asleep while the actor trains), the inference chat template without thinking |
+| Lengths | prompt <= 12288 tokens (longer rows are dropped by the data step), answer <= 8192 tokens |
+| Update | one PPO epoch over one mini-batch (on-policy): the old_log_prob forward is skipped, the ratio being exactly 1 |
+| Actor | FSDP2, packed sequences, dynamic batch (49152 tokens per GPU), fused log-prob kernels, gradient checkpointing |
+| Rollout | vLLM, TP 1, colocated (asleep while the actor trains; 0.75 of GPU memory), prefix caching with the 16 answers of a prompt on one replica, the inference chat template without thinking |
 | Reward embeddings | Qwen3-Embedding-4B, vLLM server on a GPU of its own (this node's last, or `EMBEDDING_NODE`'s GPU 0) |
 | Validation | before training and every 100 steps: 64 held-out users x 16 answers at temperature 1.0 |
 | Checkpoints | every 100 steps, with a Hugging Face copy |
