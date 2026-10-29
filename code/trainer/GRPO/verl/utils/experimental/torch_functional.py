@@ -20,8 +20,9 @@ try:
     from liger_kernel.ops import (
         LigerFusedLinearScaledCrossEntropyFunction as _LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY,
     )
-except ModuleNotFoundError as exc:
-    if exc.name != "liger_kernel":
+except ImportError as exc:
+    # A liger_kernel without this symbol (e.g. 0.8.1) raises a plain ImportError: fall back to the torch kernel too.
+    if isinstance(exc, ModuleNotFoundError) and exc.name != "liger_kernel":
         raise
     _LIGER_FUSED_LINEAR_SCALED_CROSS_ENTROPY = None
 
