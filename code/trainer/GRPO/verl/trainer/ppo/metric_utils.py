@@ -893,21 +893,29 @@ def calc_maj_val(data: list[dict[str, Any]], vote_key: str, val_key: str) -> flo
     return maj_val
 
 
-def selected_validation_means(
-    names: list[str], data_sources: list[str], infos_dict: dict[str, list[Any]]
+def drop_metrics(metrics: dict[str, Any], prefixes: list[str] | None) -> dict[str, Any]:
+    """trainer.drop_metric_prefixes: the metrics without those whose name starts with one of `prefixes` (not logged)."""
+    if not prefixes:
+        return metrics
+    prefixes = tuple(prefixes)
+    return {name: value for name, value in metrics.items() if not name.startswith(prefixes)}
+
+
+def selected_metric_means(
+    section: str, names: list[str], data_sources: list[str], infos_dict: dict[str, list[Any]]
 ) -> dict[str, float]:
-    """trainer.val_core_metrics: val-core/<data_source>/<name>, the mean of each named reward signal over the
-    validation answers of each data source (missing values skipped), instead of process_validation_metrics' full
-    mean / std / best / worst set. A name that is no reward signal raises."""
+    """trainer.val_core_metrics / train_core_metrics: <section>/<data_source>/<name>, the mean of each named reward
+    signal over the answers of each data source (missing values skipped), e.g. instead of process_validation_metrics'
+    full mean / std / best / worst set. A name that is no reward signal raises."""
     data_sources = list(data_sources)
     metrics = {}
     for data_source in dict.fromkeys(data_sources):
         for name in names:
             if name not in infos_dict:
-                raise KeyError(f"trainer.val_core_metrics: no reward signal {name!r}")
+                raise KeyError(f"trainer.{section.replace('-', '_')}_metrics: no reward signal {name!r}")
             values = [float(value) for source, value in zip(data_sources, infos_dict[name], strict=True)
                       if source == data_source and value is not None]
-            metrics[f"val-core/{data_source}/{name}"] = float(np.mean(values)) if values else float("nan")
+            metrics[f"{section}/{data_source}/{name}"] = float(np.mean(values)) if values else float("nan")
     return metrics
 
 

@@ -58,9 +58,10 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    drop_metrics,
     get_metric_data_with_optional_routed_experts,
     process_validation_metrics,
-    selected_validation_means,
+    selected_metric_means,
 )
 from verl.trainer.ppo.padding_utils import upsample_batch_to_divisible_size
 from verl.trainer.ppo.ray_trainer import apply_kl_penalty, compute_spec_decode_metrics
@@ -526,6 +527,7 @@ class PPOTrainer(ABC):
             tq.kv_clear(keys=batch.keys, partition_id=batch.partition_id)
 
             dapo_filtered_reward_counts = metrics.pop(DAPO_FILTERED_REWARD_COUNTS_KEY, None)
+            metrics = drop_metrics(metrics, self.config.trainer.get("drop_metric_prefixes", None))
             self.logger.log(data=metrics, step=self.global_steps)
             if dapo_filtered_reward_counts:
                 self.dapo_filtered_reward_logger.log(
@@ -1365,7 +1367,7 @@ class PPOTrainer(ABC):
     ) -> dict[str, float]:
         val_core_metrics = self.config.trainer.get("val_core_metrics", None)
         if val_core_metrics is not None:
-            return selected_validation_means(val_core_metrics, data_sources, reward_extra_infos_dict)
+            return selected_metric_means("val-core", val_core_metrics, data_sources, reward_extra_infos_dict)
         data_src2var2metric2val = process_validation_metrics(
             data_sources,
             sample_uids,
@@ -1961,6 +1963,24 @@ class PPOTrainer(ABC):
             )
         )
         metrics.update(compute_data_metrics(batch=metrics_batch, use_critic=self.use_critic))
+        train_core_metrics = self.config.trainer.get("train_core_metrics", None)
+        if train_core_metrics is not None:
+            # train-core/<data_source>/<name>: this step's mean of each named reward signal ("reward": the score).
+            info = tq.kv_batch_get(
+                keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields", "data_source"]
+            )
+            keep = non_padding_mask if non_padding_mask.any() else np.ones_like(non_padding_mask)
+            extra_infos = [
+                (field.get("reward_extra_info", {}) if isinstance(field, dict) else {})
+                for field, kept in zip(info.pop("extra_fields").tolist(), keep, strict=True)
+                if kept
+            ]
+            infos = {"reward": metrics_batch.batch["token_level_scores"].sum(-1).tolist()}
+            for name in train_core_metrics:
+                if name != "reward" and any(name in extra_info for extra_info in extra_infos):
+                    infos[name] = [extra_info.get(name) for extra_info in extra_infos]
+            data_sources = [source for source, kept in zip(info.pop("data_source").tolist(), keep, strict=True) if kept]
+            metrics.update(selected_metric_means("train-core", train_core_metrics, data_sources, infos))
         metrics.update(compute_timing_metrics(batch=batch, timing_raw=timing_raw))
         n_gpus = self._get_n_gpus_for_throughput()
         metrics.update(compute_throughout_metrics(batch=batch, timing_raw=timing_raw, n_gpus=n_gpus))

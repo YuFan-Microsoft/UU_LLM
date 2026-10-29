@@ -46,8 +46,9 @@ from verl.trainer.ppo.metric_utils import (
     compute_throughout_metrics,
     compute_timing_metrics,
     compute_variance_proxy_metrics,
+    drop_metrics,
     process_validation_metrics,
-    selected_validation_means,
+    selected_metric_means,
 )
 from verl.trainer.ppo.reward import extract_reward
 from verl.trainer.ppo.utils import (
@@ -722,7 +723,7 @@ class RayPPOTrainer:
     def _val_metrics_update(self, data_sources, sample_uids, reward_extra_infos_dict, sample_turns):
         val_core_metrics = self.config.trainer.get("val_core_metrics", None)
         if val_core_metrics is not None:
-            return selected_validation_means(val_core_metrics, data_sources, reward_extra_infos_dict)
+            return selected_metric_means("val-core", val_core_metrics, data_sources, reward_extra_infos_dict)
 
         data_src2var2metric2val = process_validation_metrics(data_sources, sample_uids, reward_extra_infos_dict)
         metric_dict = {}
@@ -1775,6 +1776,14 @@ class RayPPOTrainer:
                 )
                 # collect metrics
                 metrics.update(compute_data_metrics(batch=batch, use_critic=self.use_critic))
+                train_core_metrics = self.config.trainer.get("train_core_metrics", None)
+                if train_core_metrics is not None:
+                    # train-core/<data_source>/<name>: this step's mean of each named reward signal.
+                    infos = {"reward": batch.batch["token_level_scores"].sum(-1).tolist()}
+                    infos.update({name: list(batch.non_tensor_batch[name]) for name in train_core_metrics
+                                  if name != "reward" and name in batch.non_tensor_batch})
+                    metrics.update(selected_metric_means(
+                        "train-core", train_core_metrics, batch.non_tensor_batch["data_source"], infos))
                 # GDPO per-component reward metrics
                 gdpo_reward_keys = self.config.algorithm.get("gdpo_reward_keys", None)
                 if gdpo_reward_keys and self.config.algorithm.adv_estimator in ("gdpo", AdvantageEstimator.GDPO):
@@ -1804,6 +1813,7 @@ class RayPPOTrainer:
                 )
 
                 # TODO: make a canonical logger that supports various backend
+                metrics = drop_metrics(metrics, self.config.trainer.get("drop_metric_prefixes", None))
                 logger.log(data=metrics, step=self.global_steps)
 
                 progress_bar.update(1)

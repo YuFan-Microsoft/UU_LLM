@@ -107,8 +107,11 @@ script.
 Every validation logs only the mean over all validation answers of seven signals (W&B / console, set by
 `trainer.val_core_metrics` in the launcher): `val-core/user_profile_l1/<signal>` for `reward`, `n_interests`,
 `coverage` (the raw share), `future_recall`, `future_interest_hit`, `json_valid` and `rule_pass`. Step 0 is the
-starting checkpoint, scored like `case_study/` scores it. Each training step logs the batch reward as
-`critic/score/mean`. The dumped answers are read without a GPU:
+starting checkpoint, scored like `case_study/` scores it. Each training step logs the same seven means over its
+rollouts (`trainer.train_core_metrics`): `train-core/user_profile_l1/<signal>`, `reward` being `critic/score/mean`;
+the `training/`, `num_turns/`, `timing_s/`, `timing_per_token_ms/` and `prompt_length/` metrics are not logged
+(`trainer.drop_metric_prefixes`).
+The dumped answers are read without a GPU:
 
 ```bash
 cd case_study

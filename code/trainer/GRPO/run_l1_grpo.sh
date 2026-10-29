@@ -27,7 +27,9 @@
 # coverage (raw), future_recall, future_interest_hit, json_valid and rule_pass (val-core/user_profile_l1/<signal>) and
 # dumps the answers to
 # OUTPUT_DIR/validation/<step>.jsonl, read by case_study.py trend (all steps) and from_val (one step's report). A
-# checkpoint is saved every SAVE_FREQ (100) steps, with a Hugging Face copy for the case study.
+# checkpoint is saved every SAVE_FREQ (100) steps, with a Hugging Face copy for the case study. Every training step
+# logs the same seven means over its rollouts (train-core/user_profile_l1/<signal>); the training/, num_turns/,
+# timing_s/, timing_per_token_ms/ and prompt_length/ metrics are not logged (trainer.drop_metric_prefixes).
 #
 # Usage (inside the UU_LLM Docker image, verlai/verl:vllm024.dev2):
 #   nohup bash run_l1_grpo.sh > l1_grpo_launch.out 2>&1 &
@@ -201,5 +203,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.test_freq="${TEST_FREQ:-100}" \
     trainer.validation_data_dir="$OUTPUT_DIR/validation" \
     +trainer.val_core_metrics="['reward','n_interests','coverage','future_recall','future_interest_hit','json_valid','rule_pass']" \
+    +trainer.train_core_metrics="['reward','n_interests','coverage','future_recall','future_interest_hit','json_valid','rule_pass']" \
+    +trainer.drop_metric_prefixes="['training/','num_turns/','timing_s/','timing_per_token_ms/','prompt_length/']" \
     trainer.total_epochs=1 \
     "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"
