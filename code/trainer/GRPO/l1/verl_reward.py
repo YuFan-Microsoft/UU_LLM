@@ -23,7 +23,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from l1_reward import CAP_METRICS, DEFAULT_EMBEDDING_MODEL, SIGNALS, L1Reward  # noqa: E402
+from l1_reward import DEFAULT_EMBEDDING_MODEL, SIGNALS, L1Reward  # noqa: E402
 
 NUM_THREADS_ENV = "L1_REWARD_NUM_THREADS"
 _lock = threading.Lock()
@@ -62,4 +62,4 @@ def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict
         result = scorer(extra_info["content"], solution_str, None, [str(action) for action in ground_truth])
     return {"score": float(result["reward"]), "json_valid": float(result["json_valid"]),
             "rule_pass": float(result["rule_pass"]), "n_interests": float(result["n_interests"]),
-            **{name: float(result[name]) for name in SIGNALS + CAP_METRICS}}
+            **{name: float(result[name]) for name in SIGNALS}}

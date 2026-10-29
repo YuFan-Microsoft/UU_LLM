@@ -1,24 +1,19 @@
 """Layer-1 GRPO reward: the single definition, used by the GRPO trainer (verl_reward.py) and the case study.
 
-The reward of one answer:
-    0                                   if it breaks the Layer-1 rules: not V3 JSON, a user_profile_rules violation
-                                        (duplicate interest / topic, bad evidence, language, ...) or cut at max_tokens
-    the mean of the three signals       otherwise, in [0, 1], minus the over-cap penalty (never below 0):
-        coverage                share of the input signals cited as evidence by one of the first interest_cap interests,
-                                scored as min(coverage / COVERAGE_TARGET, 1): no gain past the target, since noisy
-                                signals may be skipped (logged raw as coverage_capped; the logged coverage is the raw
-                                share over every interest)
-        future_recall@K         share of the user's next-week actions in the top K of one of the first
-                                interest_cap interests (logged as future_recall_capped; the logged future_recall is
-                                over every interest, as code/evaluation/evaluate_behavior_retrieval.py counts it)
-        future_interest_hit@K   share of interests (all of them) matched one-to-one to a distinct next-week action in
-                                their top K (a maximum matching: two interests that only hit the same action count once)
-    interest_cap is the P90 of the SFT Layer-1 interest count at the answer's number n of input signals, a saturation
-    curve fitted to the per-bucket P90 of the V3 train split: round(0.9 + 18.2 n / (33 + n)) (1 at n = 1, 5 at 10,
-    9 at 25, 13 at 60, 17 at 200; the prompt holds at most 200 signals). Recall grows with every extra interest (K more
-    retrieved actions each), the
-    reason GRPO inflated the interest count; past the cap an interest adds neither coverage nor recall, lowers
-    future_interest_hit and costs OVER_CAP_PENALTY x (interests - cap) / cap.
+The reward of one answer: 0 if it breaks the Layer-1 rules (not V3 JSON, a user_profile_rules violation such as a
+duplicate interest / topic, bad evidence or the wrong language, or cut at max_tokens), else the mean of three signals,
+each in [0, 1]. Only the first N interests earn credit, but every interest written counts in precision's denominator:
+    coverage            share of the input signals cited as evidence by the first N interests, scored as
+                        min(coverage / COVERAGE_TARGET, 1): no gain past the target, since noisy signals may be skipped
+                        (the logged coverage is the raw share)
+    future_recall@K     share of the user's next-week actions in the top K of one of the first N interests
+    future_precision@K  number of the first N interests matched one-to-one to a distinct next-week action in their
+                        top K (a maximum matching: interests that only hit the same action count once), divided by the
+                        number of interests written
+N = interest_cap(n) = round(0.9 + 18.2 n / (33 + n)) for n input signals: the P90 of the SFT Layer-1 interest count,
+a saturation curve fitted to the V3 train split's per-bucket P90 (1 at n = 1, 5 at 10, 9 at 25, 13 at 60, 17 at 200;
+the prompt holds at most 200 signals). Recall grows with every interest (K more retrieved actions), which made GRPO
+inflate the interest count; an interest past N adds no coverage, recall or matched interest and only lowers precision.
 Each interest is one embedding query (interest_query) ranking a pool of actions: the distractor pool (set_pool) plus
 this user's next-week actions. The embeddings are Qwen3-Embedding-4B's, computed in process (Embedder) or by a vLLM
 embedding server (EmbeddingClient, `vllm serve <model> --runner pooling`; GRPO runs it on a GPU of its own) on the
@@ -49,13 +44,11 @@ from utils import parse_json_object  # noqa: E402
 TOP_K = 10
 COVERAGE_TARGET = 0.7
 INVALID_REWARD = 0.0
-SIGNALS = ("coverage", "future_recall", "future_interest_hit")
+SIGNALS = ("coverage", "future_recall", "future_precision")
 # The interest cap (P90 of the SFT interest count) at n input signals: CAP_BASE + CAP_SCALE * n / (CAP_HALF + n),
 # rounded; fitted to the V3 train split's P90 per signal-count bucket (1: 1, 3-4: 3, 8-11: 5, 20-29: 9, 50-74: 12,
 # 100-149: 15, 200: 17).
 CAP_BASE, CAP_SCALE, CAP_HALF = 0.9, 18.2, 33.0
-OVER_CAP_PENALTY = 0.5
-CAP_METRICS = ("coverage_capped", "future_recall_capped")
 DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B"
 SERVED_EMBEDDING_MODEL = "l1-embedding"  # --served-model-name of the vLLM embedding server
 # Same query instruction as code/evaluation/evaluate_behavior_retrieval.py; documents (actions) have none.
@@ -98,8 +91,8 @@ def interest_query(interest: dict) -> str:
 
 
 def interest_cap(n_signals: int) -> int:
-    """The most interests an answer to n_signals input signals may have before the over-cap penalty, and the
-    number of leading interests its recall counts (see the module docstring); at least 1."""
+    """N, the number of leading interests that earn credit in an answer to n_signals input signals (see the module
+    docstring); at least 1."""
     return max(1, math.floor(CAP_BASE + CAP_SCALE * n_signals / (CAP_HALF + n_signals) + 0.5))
 
 
@@ -233,22 +226,17 @@ class L1Reward:
         """The reward of one answer `text` to the Layer-1 user message `content`, whose user does the actions `future`
         next week, with what it is computed from:
             reward, json_valid, rule_pass, violations, output (the parsed answer, None unless JSON-valid), n_interests,
-            coverage, future_recall, future_interest_hit, coverage_capped, future_recall_capped (0 unless JSON-valid),
-            queries (one per interest) and hits
-            (per interest, the [position in the distinct `future`, rank from 1] of its top K; None unless JSON-valid).
+            coverage, future_recall, future_precision (0 unless JSON-valid), queries (one per interest) and hits
+            (per interest, the [position in the distinct `future`, rank from 1] of its top K; None unless JSON-valid;
+            interests past interest_cap get theirs too, for diagnostics, but earn nothing).
         A JSON-valid answer that breaks a rule gets its signals too, for diagnostics, but INVALID_REWARD."""
         rules, output = judge(content, text, finish_reason)
         result = {"reward": INVALID_REWARD, "json_valid": rules["json_valid"], "rule_pass": rules["rule_pass"],
                   "violations": rules["violations"], "output": output, "n_interests": 0,
-                  **{name: 0.0 for name in SIGNALS + CAP_METRICS}, "queries": None, "hits": None}
+                  **{name: 0.0 for name in SIGNALS}, "queries": None, "hits": None}
         if output is None:
             return result
         indices = input_indices(content)
-        cap = interest_cap(len(indices))
-
-        def cited(interests: list[dict]) -> set:
-            return {idx for interest in interests for topic in interest["topics"] for idx in topic["evidence"]} & indices
-
         queries = [interest_query(interest) for interest in output["interests"]]
         hits = [[] for _ in queries]
         future = list(dict.fromkeys(future))
@@ -264,22 +252,20 @@ class L1Reward:
             top = scores.topk(min(self.top_k, scores.shape[1]), dim=1).indices.tolist()
             hits = [[[position[column], rank] for rank, column in enumerate(row, 1) if column in position]
                     for row in top]
-        retrieved = {pos for interest_hits in hits for pos, _ in interest_hits}
-        retrieved_capped = {pos for interest_hits in hits[:cap] for pos, _ in interest_hits}
+        # Only the first N interests earn credit; every interest written counts in precision's denominator.
+        n_credited = interest_cap(len(indices))
+        credited, credited_hits = output["interests"][:n_credited], hits[:n_credited]
+        cited = {idx for interest in credited for topic in interest["topics"] for idx in topic["evidence"]} & indices
+        retrieved = {pos for interest_hits in credited_hits for pos, _ in interest_hits}
         n_interests = len(output["interests"])
         result.update({
             "n_interests": n_interests,
-            "coverage": len(cited(output["interests"])) / len(indices) if indices else 0.0,
+            "coverage": len(cited) / len(indices) if indices else 0.0,
             "future_recall": len(retrieved) / len(future) if future else 0.0,
-            "future_interest_hit": matched_interests(hits) / len(hits) if hits else 0.0,
-            "coverage_capped": len(cited(output["interests"][:cap])) / len(indices) if indices else 0.0,
-            "future_recall_capped": len(retrieved_capped) / len(future) if future else 0.0,
+            "future_precision": matched_interests(credited_hits) / n_interests if n_interests else 0.0,
             "queries": queries, "hits": hits,
         })
         if rules["rule_pass"]:
-            scored = {**result, "coverage": min(result["coverage_capped"] / COVERAGE_TARGET, 1.0),
-                      "future_recall": result["future_recall_capped"]}
-            penalty = OVER_CAP_PENALTY * max(0, n_interests - cap) / cap
-            # Never below an invalid answer's reward, or breaking a rule would beat a long valid answer.
-            result["reward"] = max(INVALID_REWARD, statistics.mean(scored[name] for name in SIGNALS) - penalty)
+            scored = {**result, "coverage": min(result["coverage"] / COVERAGE_TARGET, 1.0)}
+            result["reward"] = statistics.mean(scored[name] for name in SIGNALS)
         return result
