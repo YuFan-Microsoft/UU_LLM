@@ -1887,6 +1887,7 @@ class PPOTrainer(ABC):
         return batch
 
     def _compute_metrics(self, batch: KVBatchMeta, metrics, timing_raw, global_steps, epoch):
+        kv_batch = batch  # `batch` becomes a DataProto below; the TransferQueue reads need these keys
         # 1. collect necessary fields from TransferQueue for computing metrics
         non_padding_mask = np.array([not tag.get("is_padding", False) for tag in batch.tags], dtype=bool)
         fields = [
@@ -1967,7 +1968,7 @@ class PPOTrainer(ABC):
         if train_core_metrics is not None:
             # train-core/<data_source>/<name>: this step's mean of each named reward signal ("reward": the score).
             info = tq.kv_batch_get(
-                keys=batch.keys, partition_id=batch.partition_id, select_fields=["extra_fields", "data_source"]
+                keys=kv_batch.keys, partition_id=kv_batch.partition_id, select_fields=["extra_fields", "data_source"]
             )
             keep = non_padding_mask if non_padding_mask.any() else np.ones_like(non_padding_mask)
             extra_infos = [
