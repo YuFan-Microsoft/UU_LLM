@@ -172,6 +172,8 @@ def main(config):
     """
     # Automatically set `config.trainer.device = npu` when running on Ascend NPU.
     auto_set_device(config)
+    if config.trainer.get("sft_replay") is not None and not config.trainer.use_v1:
+        raise ValueError("SFT replay requires trainer.use_v1=True")
 
     # validate config
     validate_config(

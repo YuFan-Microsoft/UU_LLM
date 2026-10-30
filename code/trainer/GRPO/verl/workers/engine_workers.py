@@ -155,6 +155,7 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.flops_counter = None
 
         self.loss_fn = None
+        self.sft_replay = None
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):
@@ -365,7 +366,17 @@ class TrainingWorker(Worker, DistProfilerExtension):
             self.engine.train_mode(disable_auto_offload=disable_auto_offload),
             Timer(name="train_batch", logger=None) as timer,
         ):
-            output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            if self.sft_replay is None:
+                output = self.engine.train_batch(data, loss_function=self.loss_fn)
+            else:
+                from l1.sft_runtime import replay_loss
+
+                replay = self.sft_replay.batch(int(tu.get(data, "global_steps")))
+                output = self.engine.train_batch(
+                    data, loss_function=self.loss_fn,
+                    auxiliary_batch=(replay, partial(replay_loss, config=None,
+                                                    coefficient=self.sft_replay.coefficient)),
+                )
             # containing loss, model_output and metrics
             # for training, we only care about loss and metrics
         delta_time = timer.last
@@ -529,6 +540,18 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def set_loss_fn(self, loss_fn):
         self.actor.set_loss_fn(loss_fn=loss_fn)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def configure_sft_replay(self, settings: dict):
+        from l1.sft_runtime import ActorReplay
+
+        assert self.actor is not None
+        self.actor.sft_replay = ActorReplay(self.actor, settings)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def evaluate_sft(self):
+        assert self.actor is not None and self.actor.sft_replay is not None
+        return self.actor.sft_replay.evaluate()
 
     @register(dispatch_mode=Dispatch.ONE_TO_ALL)
     def to(self, device, model=True, optimizer=True, grad=True):

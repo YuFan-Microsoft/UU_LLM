@@ -342,7 +342,19 @@ class PPOTrainer(ABC):
 
         # 6. initialize actor and ref model engine
         self.actor_rollout_wg = all_wg[str(actor_role)]
+        sft_replay = self.config.trainer.get("sft_replay")
+        if sft_replay is not None:
+            actor = self.config.actor_rollout_ref.actor
+            if (self.config.trainer.v1.trainer_mode != "sync" or actor.strategy != "fsdp2"
+                    or not self.config.actor_rollout_ref.model.use_remove_padding
+                    or self.config.actor_rollout_ref.rollout.name != "vllm"
+                    or actor.ppo_epochs != 1
+                    or actor.ppo_mini_batch_size != self.config.data.train_batch_size):
+                raise ValueError("SFT replay requires synchronous FSDP2/vLLM, packed sequences, "
+                                 "and one PPO epoch with one mini-batch per rollout batch")
         self.actor_rollout_wg.init_model()
+        if sft_replay is not None:
+            self.actor_rollout_wg.configure_sft_replay(OmegaConf.to_container(sft_replay, resolve=True))
         logger.info("actor and ref model engine initialized")
 
         if self.use_reference_policy and not self.ref_in_actor:
@@ -514,6 +526,12 @@ class PPOTrainer(ABC):
                     if is_last_step:
                         last_val_metrics = val_metrics
                 metrics.update(val_metrics)
+            elif (self.config.trainer.get("sft_replay") is not None
+                  and self.config.trainer.save_freq > 0
+                  and (is_last_step or self.global_steps % self.config.trainer.save_freq == 0)):
+                from l1.sft_runtime import evaluate_sft
+
+                metrics.update(evaluate_sft(self))
 
             # 5. record metrics
             self._compute_metrics(batch, metrics, self.timing_raw, global_steps=self.global_steps, epoch=current_epoch)
@@ -1212,13 +1230,18 @@ class PPOTrainer(ABC):
                 dump_path=val_data_dir,
             )
 
-        return self._val_metrics_update(
+        metrics = self._val_metrics_update(
             data_sources,
             sample_uids,
             reward_extra_infos_dict,
             sample_turns,
             expected_acc_counts=expected_acc_counts,
         )
+        if self.config.trainer.get("sft_replay") is not None:
+            from l1.sft_runtime import evaluate_sft
+
+            metrics.update(evaluate_sft(self))
+        return metrics
 
     def _maybe_log_val_generations(self, inputs, outputs, scores):
         """Log a table of validation samples to the configured logger (wandb or swanlab)"""
@@ -1895,6 +1918,7 @@ class PPOTrainer(ABC):
                 and not distillation_loss_cfg.use_policy_gradient
             )
         extra_info = {
+            "global_steps": self.global_steps,
             "calculate_entropy": calculate_entropy,
             "distillation_use_topk": distillation_use_topk,
             "distillation_only": distillation_only,

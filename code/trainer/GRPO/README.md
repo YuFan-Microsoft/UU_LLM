@@ -1,6 +1,7 @@
 # Layer-1 GRPO
 
-GRPO without KL for the Layer-1 user-profile model (Qwen3.5), on verl. One reward definition, `l1/l1_reward.py`, is
+GRPO without KL for the Layer-1 user-profile model (Qwen3.5), with multi-task SFT replay, on verl.
+One reward definition, `l1/l1_reward.py`, is
 used for training and for the case study, so a case-study report shows what the training reward sees.
 
 ```
@@ -14,9 +15,11 @@ GRPO/
 │   ├── l1_reward.py          the reward (L1Reward)
 │   ├── rl_data.py            User_Profile_Weekly_For_RL: download, cleaning, seeded row order (shared)
 │   ├── prepare_data.py       -> verl train / val parquet with fixed batches + the reward pool of every batch
+│   ├── sft_replay.py         V3 replay preparation, fixed test subsets and deterministic weighted sampling
+│   ├── sft_runtime.py        joint actor updates, held-out PPL and SFT guardrail evaluation
 │   └── verl_reward.py        verl entry point (compute_score): the batch's pool, then L1Reward
 ├── case_study/               read answers and their reward: checkpoint rollouts, a run's validation steps, trend
-└── verl/                     upstream verl v0.9.1, unmodified (Apache-2.0: verl/LICENSE, verl/Notice.txt)
+└── verl/                     upstream verl v0.9.1 with local training/replay patches (Apache-2.0: verl/LICENSE, verl/Notice.txt)
 ```
 
 ## Reward
@@ -84,12 +87,14 @@ directory above it, e.g. the job directory `UU_LLM` was copied into):
 cd UU_LLM/code/trainer/GRPO
 nohup bash run_l1_grpo.sh > l1_grpo_launch.out 2>&1 &
 # smoke test: 2 training batches, 5 steps, console only
-NUM_TRAIN_BATCHES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_grpo_smoke bash run_l1_grpo.sh trainer.total_training_steps=5
+NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_grpo_smoke bash run_l1_grpo.sh trainer.total_training_steps=5
 ```
 
 The launcher builds the data once per `DATA_DIR` (default `outputs/data/seed<SEED>_batch<TRAIN_BATCH_SIZE>_prompt<MAX_PROMPT_LENGTH>`;
 all 139,629 training rows take minutes with one process per CPU core, up to 32, and print their progress;
-`NUM_TRAIN_BATCHES=2` takes seconds) and refuses a `DATA_DIR` cut for another batch size. Before Ray starts, a
+`NUM_TRAIN_BATCHES=2` takes seconds) and refuses a `DATA_DIR` cut for another batch size.
+With replay enabled, its separate preparation downloads the seven V3 SFT training sets once and tokenizes
+the fixed test subsets (see below). Before Ray starts, a
 preflight scores a validation row through `l1/verl_reward.py` (fastText and `UU_LLM/models/lid.176.bin`, downloaded
 once there, the pool file, the embedding server), so a broken reward fails in a minute rather than after the
 rollout engines are up. A run writes to `outputs/<EXPERIMENT_NAME>/`: `train.log`, `validation/<step>.jsonl` and
@@ -103,13 +108,90 @@ script.
 | Start | `unified_slm_VFinal_F16A/4B/Final_CKPT` (also the case-study default) |
 | Batch | 64 prompts (users) x 16 answers, sampled at temperature 1.0 / top-p 1.0 |
 | Advantage | GRPO: reward minus the group mean, divided by the group std; no KL |
-| Lengths | prompt <= 12288 tokens (longer rows are dropped by the data step), answer <= 8192 tokens |
-| Update | one PPO epoch over one mini-batch (on-policy): the old_log_prob forward is skipped, the ratio being exactly 1 |
+| Lengths | total context <= 25600 tokens; prompt <= 17408 (longer rows are dropped by the data step), answer <= 8192 |
+| Update | one PPO epoch over one mini-batch; add 0.1 times SFT replay NLL before the same optimizer step |
 | Actor | FSDP2, packed sequences, dynamic batch (49152 tokens per GPU), fused log-prob kernels, gradient checkpointing |
 | Rollout | vLLM, TP 1, colocated (asleep while the actor trains; 0.75 of GPU memory), prefix caching with the 16 answers of a prompt on one replica, the inference chat template without thinking |
 | Reward embeddings | Qwen3-Embedding-4B, vLLM server on a GPU of its own (this node's last, or `EMBEDDING_NODE`'s GPU 0) |
 | Validation | before training and every 100 steps: 64 held-out users x 16 answers at temperature 1.0 |
 | Checkpoints | every 100 steps, with a Hugging Face copy |
+
+## Multi-task SFT replay and forgetting evaluation
+
+Replay is enabled by default (`SFT_REPLAY=1`); `SFT_REPLAY=0` disables replay and extra evaluation.
+The default experiment name ends in `_replay`, so it does not accidentally resume a previous L1-only run.
+The watchdog uses the same naming rule. An explicit `EXPERIMENT_NAME` still takes precedence.
+
+The source is `yufan/user_profile_dataset`, **exactly the eight `V3_` configs**, not `V35_` or other versions.
+Replay uses the **train** splits of all eight tasks, including normal L1 and L1 Negative.
+The weights are the original SFT `V3_MIXTURE` weights; normal L1 has a 21% row-sampling probability.
+The shared definition and
+non-thinking tokenization live in `../user_profile_data.py`, also used by the SFT trainer.
+
+Each RL step samples exactly **2 replay rows per data-parallel training GPU**, with replacement.
+Each GPU runs **one** SFT micro-batch; there is no accumulation to a separate 64-row replay batch.
+The global replay batch therefore contains 2 times the data-parallel GPU count (14 rows on 7 GPUs,
+16 rows on 8 GPUs). Actor ranks read their own rows by an offset
+index and tokenize them on demand; the full training corpus is not pretokenized or copied into each worker's
+Python memory. Sampling depends on seed, training step and the data-parallel GPU count, so resuming at the
+same step with the same GPU count reproduces the same samples.
+Replay and reference PPL use fixed 2-row micro-batches, not dynamic token-budget packing. An odd final
+PPL row is padded with a zero-loss duplicate, leaving the real test count and loss normalization unchanged.
+Replay uses the SFT assistant-only labels, including EOS, and the same left-truncation policy,
+with a 25600-token sequence limit.
+
+The actor accumulates GRPO gradients and **0.1 times the replay answer-token-mean NLL**, then performs
+**one** optimizer update and one scheduler update. There is no separate SFT optimizer step, no reference model,
+and no change to L1 reward or advantages. The on-policy old-log-prob shortcut remains valid because replay
+does not change weights before the GRPO loss is computed. Replay currently requires the launcher's synchronous
+V1/FSDP2/vLLM packed-sequence setup, with one PPO epoch and one mini-batch per rollout batch.
+
+**Evaluation** includes normal L1 and all seven other tasks. Preparation pins the Hugging Face revision,
+streams the first **up to 500 test rows per task**, and persists those exact rows in `eval.parquet`.
+It does not filter out long test examples silently: an oversized prompt fails preparation and must be
+resolved within the fixed context limit. Test examples are never sampled for replay.
+
+At step 0, at every regular validation, and at every checkpoint save:
+
+- Teacher-forced NLL/PPL on the reference **answer tokens**, at temperature 1, using the same SFT
+  25600-token sequence limit. Loss is normalized by total answer tokens, not by an average of row perplexities.
+- One generated answer per test row, temperature 0.6 / top-p 0.8, scored by the **existing SFT**
+  `user_profile_rules.score_example` and `summarize_records`. This preserves task-specific guardrail metrics
+  and truncation reporting; the L1 GRPO reward is not used for these tasks.
+- Metrics are under `sft-eval/<V3 config>/`: `nll`, `ppl`, `samples`, plus the SFT guardrail metric names.
+  Training logs `actor/sft_replay/nll` and `actor/sft_replay/loss`.
+  Generated outputs and per-example rule results go to `outputs/<run>/sft_validation/<step>.jsonl`.
+
+The original 64-user L1 RL validation and its `val-core` metrics/dumps are unchanged. If save and test
+frequencies differ, a save-only step runs just the additional SFT evaluation, not another L1 validation.
+At 500 rows per task, each evaluation generates up to 4000 answers and can be substantially slower than
+L1-only validation. PPL evaluation sleeps colocated rollout replicas first and restores them afterwards.
+
+| Environment variable | Default |
+| --- | --- |
+| `SFT_REPLAY` | `1`; `0` disables replay and extra evaluation |
+| `SFT_REPLAY_COEF` | `0.1`; replay batch size is fixed at 2 rows per training GPU per step |
+| `SFT_MAX_SEQ_LENGTH` | `25600`, for replay and reference PPL; cannot exceed 25600 |
+| `SFT_EVAL_SAMPLES` | `500` per task; must be between 1 and 500 |
+| `SFT_EVAL_MAX_PROMPT_LENGTH` / `SFT_EVAL_MAX_RESPONSE_LENGTH` | `17408` / `8192`, for guardrail generation |
+| `SFT_DATA_REVISION` | `main`, resolved and pinned when preparing a new directory |
+| `SFT_REPLAY_DIR` | `outputs/data/sft_v2_<checkpoint>_seq25600_prompt17408_test500` |
+
+RL, replay and evaluation share a fixed maximum sequence/context length of **25600** tokens.
+Generated responses are capped at **8192** tokens, leaving **17408** prompt tokens by default.
+Enabling replay never enlarges the rollout context. The 49152-token RL actor budget is the sum of tokens
+in a packed RL micro-batch, not the length of one sequence; SFT uses its separate fixed 2-row micro-batch.
+Replay cache format v2 includes all eight training tasks. The default directory uses a new `sft_v2_`
+prefix; explicitly pointing to an old seven-task cache fails before training. To refresh the data revision,
+choose a new `SFT_REPLAY_DIR`; cached data remains pinned to its original revision.
+
+```bash
+# Normal replay run, embedding server on another node
+EMBEDDING_NODE=node-1 bash run_l1_grpo.sh
+# Small smoke run; still covers every V3 task
+NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_replay_smoke \
+  bash run_l1_grpo.sh trainer.total_training_steps=2 trainer.save_freq=2 trainer.test_freq=2
+```
 
 ## Following the reward
 

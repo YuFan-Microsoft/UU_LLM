@@ -28,7 +28,9 @@ fi
 
 # The run's output directory, as run_l1_grpo.sh names it.
 CHECKPOINT=${CHECKPOINT:-/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT}
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO_L1_no_kl_qwen3_5_4B_$(basename "$CHECKPOINT")}
+REPLAY_SUFFIX=""
+[ "${SFT_REPLAY:-1}" = 0 ] || REPLAY_SUFFIX="_replay"
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO_L1_no_kl_qwen3_5_4B_$(basename "$CHECKPOINT")$REPLAY_SUFFIX}
 OUTPUT_DIR=${OUTPUT_DIR:-$HERE/outputs/$EXPERIMENT_NAME}
 mkdir -p "$OUTPUT_DIR"
 INTERVAL=${WATCHDOG_INTERVAL:-60}

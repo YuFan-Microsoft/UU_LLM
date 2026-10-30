@@ -4,6 +4,11 @@ Full-parameter SFT of `Qwen3_5ForConditionalGeneration` (e.g. Qwen3.5-4B) with D
 Evaluation is perplexity on the test split by default. Optionally, a colocated vLLM engine also rolls out a
 fixed test subset and scores the outputs with the rule checks used for data cleaning.
 
+The V3 task weights and assistant-only, non-thinking tokenization are shared with GRPO replay in
+`../user_profile_data.py`. The SFT entry points still export `V3_MIXTURE` and `encode_sft_example`;
+the SFT mixture, EOS labels and left-truncation behavior are unchanged. GRPO replays all eight V3
+training tasks and evaluates up to 500 test rows from each task; see `../GRPO/README.md`.
+
 ## Training speed optimization log
 
 Benchmark invariants: 5 nodes × 8 A100 80GB, 40 global ranks, per-device batch size 1,

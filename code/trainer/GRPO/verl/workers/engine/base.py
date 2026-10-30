@@ -110,13 +110,17 @@ class BaseEngine:
         """
         raise NotImplementedError
 
-    def train_batch(self, data: TensorDict, loss_function: Callable) -> Any:
+    def train_batch(
+        self, data: TensorDict, loss_function: Callable,
+        auxiliary_batch: Optional[tuple[TensorDict, Callable]] = None,
+    ) -> Any:
         """
         Perform a training step on a batch of data.
 
         Args:
             data: The input data for training, typically containing tensors and metadata.
             loss_function: A function that computes the loss and metrics given a batch and predictions.
+            auxiliary_batch: Optional additional batch and loss; accumulates gradients before the same update.
 
         Returns:
             dict[str, torch.Tensor]: A dictionary containing the aggregated training metrics for the batch.
@@ -125,6 +129,12 @@ class BaseEngine:
 
         self.optimizer_zero_grad()
         outputs = self.forward_backward_batch(data, loss_function, forward_only=False)
+        if auxiliary_batch is not None:
+            auxiliary_data, auxiliary_loss = auxiliary_batch
+            maybe_fix_3d_position_ids(auxiliary_data)
+            auxiliary_outputs = self.forward_backward_batch(auxiliary_data, auxiliary_loss, forward_only=False)
+            outputs["loss"].extend(auxiliary_outputs["loss"])
+            outputs["metrics"].update(auxiliary_outputs["metrics"])
         grad_norm = self.optimizer_step()
         if self.is_mp_src_rank_with_outputs():
             assert "grad_norm" not in outputs["metrics"]

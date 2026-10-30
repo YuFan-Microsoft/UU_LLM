@@ -5,6 +5,7 @@ import json
 import math
 import re
 import socket
+import sys
 import time
 from pathlib import Path
 import torch
@@ -28,53 +29,12 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from datasets import concatenate_datasets, load_dataset
 from tqdm import tqdm
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from user_profile_data import encode_sft_example
+
 QWEN3_5_MULTIMODAL_ARCH = "Qwen3_5ForConditionalGeneration"
 MISNESTED_VISUAL_PREFIX = "model.language_model.visual."
 HF_VISUAL_PREFIX = "model.visual."
-
-def encode_sft_example(messages, tokenizer, max_seq_length):
-    messages = [
-        {"role": message["role"], "content": message["content"]}
-        for message in messages
-    ]
-    input_ids = tokenizer.apply_chat_template(
-        conversation=messages,
-        tokenize=True,
-        return_dict=False,
-        add_generation_prompt=False,
-        enable_thinking=False,
-    )
-    if isinstance(input_ids, dict):
-        input_ids = input_ids["input_ids"]
-    input_ids = np.asarray(input_ids, dtype=np.int64)
-    labels = np.full_like(input_ids, -100)
-
-    generation_prompt_ids = tokenizer.apply_chat_template(
-        conversation=messages[:-1],
-        tokenize=True,
-        return_dict=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
-    if isinstance(generation_prompt_ids, dict):
-        generation_prompt_ids = generation_prompt_ids["input_ids"]
-    generation_prompt_ids = np.asarray(generation_prompt_ids, dtype=np.int64)
-
-    response_start = len(generation_prompt_ids)
-    if not np.array_equal(input_ids[:response_start], generation_prompt_ids):
-        raise RuntimeError(
-            "The training sequence prefix does not match the non-thinking "
-            "generation prompt used for inference."
-        )
-    response_end = int(np.flatnonzero(input_ids == tokenizer.eos_token_id)[-1])
-    labels[response_start:response_end + 1] = input_ids[response_start:response_end + 1]
-
-    if max_seq_length and len(input_ids) > max_seq_length:
-        input_ids = input_ids[-max_seq_length:]
-        labels = labels[-max_seq_length:]
-
-    attention_mask = np.ones_like(input_ids)
-    return input_ids, labels, attention_mask
 
 class LLMDataset(Dataset):
     """With config_names, every item also carries "config_index" (its dataset config), used by the

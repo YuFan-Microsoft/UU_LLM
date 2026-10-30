@@ -1,4 +1,5 @@
 from deepspeed_llm_trainer import main
+from user_profile_data import V3_MIXTURE
 import user_profile_rules
 
 
@@ -10,17 +11,6 @@ import user_profile_rules
 # answer tokens), L4 Hyper 1.97 (the hardest task, ~6% of answer tokens at the natural mix), L3 Persona 0.94 (V3 has
 # twice the V2 rows and long answers already give it ~15% of answer tokens), L4 Biography 1.19 and L4 Commercial
 # Preference 1.11 (long inputs, short answers), and L1 Negative 0.14 (short, highly redundant, not used at inference).
-V3_MIXTURE = {
-    "V3_User_Profile_L1_gpt56": 21.0,
-    "V3_User_Profile_L1_Negative_gpt56": 4.0,
-    "V3_User_Profile_L2_gpt56": 20.0,
-    "V3_User_Profile_L3_Persona_gpt56": 8.0,
-    "V3_User_Profile_L3_Commercial_gpt56": 14.0,
-    "V3_User_Profile_L4_Biography_gpt56": 10.0,
-    "V3_User_Profile_L4_CommercialPreference_gpt56": 9.0,
-    "V3_User_Profile_L4_Hyper_gpt56": 14.0,
-}
-
 USER_PROFILE_DEFAULTS = {
     "dataset_name": "yufan/user_profile_dataset",
     "dataset_configs": list(V3_MIXTURE),
