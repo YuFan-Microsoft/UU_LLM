@@ -9,7 +9,7 @@ GRPO/
 ├── run_l1_grpo.sh            launcher: data (once), embedding server, preflight, then python -m verl.trainer.main_ppo
 ├── serve_embedding.sh        the reward's Qwen3-Embedding-4B on vLLM, on this node or another one (ssh)
 ├── watchdog.sh               restarts a crashed run (and the embedding server) until training finishes
-├── Multi-Node.md             multi-node cluster notes (from SFT: InfiniBand / NCCL checks, credentials)
+├── DISTRIBUTED_TRAINING_GUIDE.md  distributed RL/replay setup, data, checkpoints and monitoring
 ├── GRPO_TRAINING_NOTES.md    record of the first 2-node run: deployment, the problems hit and their fixes (Chinese)
 ├── l1/                       Layer-1 RL code
 │   ├── l1_reward.py          the reward (L1Reward)

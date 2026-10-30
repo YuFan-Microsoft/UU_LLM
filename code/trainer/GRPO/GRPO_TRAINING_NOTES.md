@@ -1,7 +1,8 @@
 # Layer-1 GRPO 训练：部署记录与踩坑手册
 
-本文件记录在 AzureML / Singularity 2-node × 8×A100-80GB 环境上启动
-`UU_LLM/code/trainer/GRPO/run_l1_grpo.sh` 的全过程、遇到的问题和修复方法。
+本文件记录在 AzureML / Singularity 上启动
+`UU_LLM/code/trainer/GRPO/run_l1_grpo.sh` 的部署过程、问题和修复方法，
+包括首次双节点部署，以及后续扩展到四个训练节点、32 张 GPU 的 GRPO + SFT replay 记录。
 
 > **之后的代码修复（2026-10-28）**：下面记录的问题大多已在代码里修掉，正文保留当时的原始记录。
 >
@@ -18,6 +19,10 @@
 > | 坑 8：SFT replay 的 loss 回调不接受 `dp_group` | `replay_loss` 接收并透传 `dp_group`，保持原有 NLL、系数和联合更新方式 |
 >
 > 用法以 `README.md` 为准。
+
+坑 9–12 记录用户于 2026-10-30 提供的四训练节点部署截图。处理方式和运行结果来自集群记录，
+不表示这些部署侧修复已全部合入当前仓库。分布式准备流程另见
+[DISTRIBUTED_TRAINING_GUIDE.md](./DISTRIBUTED_TRAINING_GUIDE.md)，其中双训练节点的示例不能直接当作四节点配置使用。
 
 - 作业根目录：`/scratch/azureml/cr/j/d98cd3b6e1554da7b3931050f217e754/exe/wd`
 - 代码：`UU_LLM/code/trainer/GRPO`（verl v0.9.1 vendored）
@@ -398,7 +403,97 @@ def replay_loss(config, model_output, data: TensorDict, dp_group=None, *, coeffi
 该记录是报告中的集群结果，不是本地重新跑过的 GPU 验证。
 报告另有训练结束后的非致命 DataLoader worker 退出异常，其根因未确定，未在此修复中屏蔽或绕过。
 
+### 坑 9：RL 启动器写死单节点，分配了多台机器也只会用一台
+
+**现象**：原启动脚本固定 `trainer.nnodes=1`。即使作业分配了四台训练机器，
+直接运行仍只配置一个训练节点；多分配 GPU 不会自动改变 verl 的资源池。
+
+**处理**：
+
+- 补齐 Ray head / worker 启动，只将四个训练节点加入训练集群。
+- 将训练节点数配置为 `trainer.nnodes=4`，每节点 8 张 GPU，共 32 个全局 rank。
+  若使用部署侧新增的 `NNODES=4`，须确认启动脚本确实读取并传递了该变量；
+  原版脚本仅设置环境变量不会生效。
+- 在 head 上提交一次训练，不是在四台机器上各启动一份独立训练。
+  开训前检查 Ray 的实际节点和 GPU 资源，不能只看作业申请了多少卡。
+
+**验证**：本次四节点的 32 个 rank 均初始化并完成了跨节点 all-reduce，
+不是只有 head 节点在工作。
+
+### 坑 10：节点工作目录不共享，同名路径不等于文件可见
+
+**现象**：其他节点看不到 node-0 工作目录里的代码和数据。
+FSDP checkpoint 分片也不能各存本地后，就把 node-0 的目录当作完整 checkpoint。
+
+**处理**：
+
+- 向三个 worker 同步已验证的代码和完整训练数据；本次每个 worker 的同步量约 29.35 GB，
+  这是该次部署的数据量，不是每次启动都必须重新下载的要求。
+- 同步范围包含 RL parquet、reward pools、SFT replay metadata、索引、评估数据和可读的 raw shards。
+  使用缓存软链接时，要在每个节点确认目标文件实际存在并能读取。
+- 将 checkpoint 改存到已确认跨训练节点共享、可写的 `/yufan` 挂载目录，
+  不再依赖训练结束后从各节点手工收集分片。仅有相同路径名或同名挂载点不足以证明共享。
+
+**验收要点**：rank 0 不一定在 node-0。推理使用 rank 0 导出的完整 HF 模型；
+完整续训还需要所有 rank 的模型、optimizer、额外状态分片，以及 dataloader 状态和最新步数记录。
+后续保存时应检查 32 个 rank 的文件是否齐全，并实际做一次恢复训练；不能只检查 HF 模型能加载。
+
+### 坑 11：四个训练节点都缺 OpenCC，语言规则依赖不能只在 head 检查
+
+**现象**：四个训练节点均缺少 OpenCC。现有语言工具允许缺失时继续运行，
+因此它不一定表现为启动报错，但中文简繁体判别能力会降级，规则口径不再完整。
+
+**处理**：在每个训练节点、实际 Ray worker 使用的 Python 环境中补齐依赖：
+
+```bash
+python3 -m pip install opencc-python-reimplemented
+python3 -c "from opencc import OpenCC; print(OpenCC('t2s').convert('繁體中文'))"
+```
+
+不能只检查包是否可导入：启动前还应实际初始化语言工具并调用 reward，
+尽早暴露 fastText 模型、依赖、数据和 embedding 服务访问问题。
+由于缺 OpenCC 的回退本身不会报错，还需要显式检查转换器可用，不能把 reward 调用成功当作依赖齐全。
+
+### 坑 12：完整 SFT 评估集有超长 prompt，不能统一预留 8192 输出 tokens
+
+**现象**：默认 prompt 上限为 17408 tokens，即总上下文 25600 减去固定输出预算 8192。
+每任务 500 条、共 4000 条 SFT 评估样本中，有 67 条 prompt 超过该上限，
+最长 24297 tokens，导致准备数据时直接报错。小规模 smoke test 没覆盖到这些长样本。
+
+**处理原则**：保留全部评估样本及完整的生成 prompt，按每条样本的剩余上下文分配输出预算，
+不扩大模型上下文，也不改 RL 训练参数：
+
+```text
+SFT 评估生成：每条 max_tokens = min(8192, 25600 - 该条实际 prompt token 数)
+```
+
+- prompt token 数按应用 chat template 后的实际输入计数。
+  最长的 24297-token prompt 留有 1303 个输出 tokens；短 prompt 仍可获得最多 8192 个。
+- 数据准备侧允许这些长 prompt，生成侧逐条限制输出；不能只放宽准备上限，
+  却仍给每条生成请求固定 8192 个输出 tokens。
+- 不通过丢弃 67 条样本、截断生成 prompt，或把所有样本输出统一缩到最短预算来绕过问题。
+  若某条 prompt 已占满或超过 25600-token 总上下文，明确报错，不能提交非正输出预算。
+- RL 仍保持 prompt / response 上限 17408 / 8192。
+  Replay 与参考 NLL/PPL 保留既有的 25600-token SFT 编码、左截断和归一化策略；
+  这次调整的是 SFT 护栏评估的生成预算。
+- 生成仍被截断时，如实保留 finish reason 和截断指标，不能算作完整输出。
+
+### 四节点验证结果与 NCCL 排查结论（2026-10-30）
+
+部署环境中的 `NCCL_IB_HCA` 原先为空，本次显式配置了 8 个 IB 网卡。
+具体设备名应以各节点实际硬件为准，不应照抄其他集群的网卡名。
+四节点、32 个 rank 的 all-reduce 已跑通，日志确认使用 InfiniBand，
+未遇到跨节点通信不通的问题；环境变量为空本身也不能直接证明 NCCL 未使用 IB。
+
+上述四处处理后，第一次正式启动完成了首个 **GRPO + SFT replay 联合更新**，首步未再报错。
+这验证了启动和联合更新链路，不等于完整训练已结束，也不代替后续 checkpoint 续训验证。
+本次主要阻断点是单节点启动配置、节点文件可见性、依赖和超长评估 prompt，
+不要在缺少通信失败证据时先归因于 NCCL。
+
 ### 重启前记得清理 Ray
+
+以下是早期单训练节点的清理示例。多训练节点场景需要统一管理本次 Ray 集群和 worker；
+不要直接套用本机 `ray stop --force`，破坏仍在使用的 head 或其他任务。
 
 崩溃后 Ray 的 actor 可能残留并占着显存：
 
