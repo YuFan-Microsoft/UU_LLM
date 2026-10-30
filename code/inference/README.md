@@ -56,6 +56,16 @@ Input rows, one per user (only `past_behaviors` is used; `future_behaviors` is h
 {"user_id": "...", "past_behaviors": [{"source": "Bing", "action": "...", "intent": "...", "date": "2026-02-06T00:00:00", "action_id": 0}], "future_behaviors": [...]}
 ```
 
+For local JSONL, each behavior only needs `source`, `action` and an ISO-format `date`; `intent` and `action_id`
+are optional. `future_behaviors` may be omitted and is exported as `[]`. Extra top-level fields, such as
+`anid` and `muid` lists, are carried unchanged to `final_profiles.jsonl`, without entering model prompts or
+changing the per-layer intermediate files. Generated profile fields take precedence over input fields with
+the same name. For example:
+
+```json
+{"user_id":"...","anid":["..."],"muid":["...","..."],"past_behaviors":[{"date":"2026-10-03T12:34:56Z","source":"Bing","action":"..."}],"future_behaviors":[]}
+```
+
 One checkpoint serves all seven tasks. The V3 SFT data were distilled from GPT-5.6 Final runs of the production
 pipeline (MAIProfile_Official, the successor of maiprofilev3dev, whose step logic this script ports). With the Layer-1
 prompt the model produces in one call what the pipeline builds with `layer1_delta` -> `layer1_actual` ->
@@ -267,8 +277,10 @@ For the windows where some user's final snapshot was built: `layer3_persona`, `l
 `past_behaviors` and `future_behaviors` from the input, and the user's `layer4_postprocessing` profile:
 `interests` (the Layer-2 interests with confidence ≥ 0.2, enriched with persona,
 category and commercial fields, followed by the `hyper_commercial` missions), `biography`, `life_stage`,
-`user_attributes`, `commercial_preferences` and `enriched_commercial_interests`. Everything is empty if the user never
-had a Layer-1 interest. The ungated Layer-2 snapshot stays in `layer2_postmerge.jsonl`.
+`user_attributes`, `commercial_preferences` and `enriched_commercial_interests`. The generated profile contents are
+empty if the user never had a Layer-1 interest; raw behaviors and input metadata (including any `anid` / `muid` lists)
+are still retained.
+The ungated Layer-2 snapshot stays in `layer2_postmerge.jsonl`.
 
 Plus `<out_dir>/predictions.jsonl` (one record per model call: `stage`, user, window, `attempts`, `valid`, raw
 `text`; L2 also has `mode`, `snapshot_dropped` and merge/add `actions`; L3/L4 have `dropped`, the

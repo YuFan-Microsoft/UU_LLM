@@ -387,17 +387,18 @@ def call_stats(calls: list[dict]) -> dict:
 
 
 def keep_raw(rows, raw):
-    """Pass rows through while saving each user's raw past / future behaviors for final_profiles.jsonl (on disk,
-    so the 12000-user split does not stay in memory)."""
+    """Pass rows through while saving each user's raw behaviors and top-level metadata for final_profiles.jsonl
+    (on disk, so the 12000-user split does not stay in memory)."""
     for row in rows:
-        raw.write(json.dumps({key: row.get(key, []) for key in ("past_behaviors", "future_behaviors")}
-                             | {"user_id": row["user_id"]}, ensure_ascii=False, default=lambda value: value.isoformat()) + "\n")  # HF dates are datetimes
+        raw.write(json.dumps({**row, "past_behaviors": row.get("past_behaviors", []),
+                              "future_behaviors": row.get("future_behaviors", [])},
+                             ensure_ascii=False, default=lambda value: value.isoformat()) + "\n")  # HF dates are datetimes
         yield row
 
 
 def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], profile_date: str,
                          final: dict[str, dict]) -> None:
-    """final_profiles.jsonl: per user, the raw past / future behaviors and the final profile, the user's
+    """final_profiles.jsonl: per user, the raw behaviors, top-level metadata and the final profile, the user's
     layer4_postprocessing record (Layer-3-enriched interests with confidence >= 0.2 plus the hyper-commercial
     missions, biography, life stage, user attributes and commercial preferences); empty if the user never had a
     Layer-1 interest."""
@@ -410,6 +411,7 @@ def write_final_profiles(output_dir: Path, raw_path: Path, user_ids: list[str], 
             wanted.discard(raw["user_id"])
             profile = final.get(raw["user_id"], {})
             out.write(dumps({
+                **raw,
                 "user_id": raw["user_id"],
                 "profile_date": profile_date,
                 "last_update": profile.get("date"),
