@@ -20,8 +20,8 @@ from verl.workers.utils.losses import sft_loss
 SFT_MICRO_BATCH_SIZE_PER_GPU = 2
 
 
-def replay_loss(config, model_output, data: TensorDict, *, coefficient: float):
-    nll, _ = sft_loss(config, model_output, data)
+def replay_loss(config, model_output, data: TensorDict, dp_group=None, *, coefficient: float):
+    nll, _ = sft_loss(config, model_output, data, dp_group=dp_group)
     return coefficient * nll, {
         "sft_replay/nll": Metric(value=nll.detach(), aggregation=AggregationType.SUM),
         "sft_replay/loss": Metric(value=coefficient * nll.detach(), aggregation=AggregationType.SUM),

@@ -15,6 +15,7 @@
 > | 坑 6：缺 fasttext 要等 ~12 分钟才暴露 | 启动前预检：检查 fasttext、预先下载一次 `lid.176.bin`、用一条验证数据实际调用 reward |
 > | 看门狗 `pgrep` 匹配到自己 | 仓库里的 `watchdog.sh` 用 `flock` 锁保证单实例 |
 > | 坑 7：`use_fused_kernels=True` 在第一次 actor 更新时报 liger `ImportError` | `torch_functional.py` 改为 `except ImportError`（非 liger 的缺失模块仍重新抛出），回退到 torch 实现 |
+> | 坑 8：SFT replay 的 loss 回调不接受 `dp_group` | `replay_loss` 接收并透传 `dp_group`，保持原有 NLL、系数和联合更新方式 |
 >
 > 用法以 `README.md` 为准。
 
@@ -369,6 +370,34 @@ except ImportError as exc:
 （例如在 `run_l1_grpo.sh` 的预检里加 `import verl.utils.experimental.torch_functional`），
 1 分钟内就能暴露，不用等 vLLM 启动和 step-0 validation 跑完（约 15 分钟）。
 
+### 坑 8：RL + SFT replay 在第一次联合更新前报 `dp_group` 接口错误
+
+**现象**：L1 和 SFT 的 step-0 验证正常，但第一次 actor 更新在 replay loss 调用时失败：
+
+```text
+TypeError: replay_loss() got an unexpected keyword argument 'dp_group'
+```
+
+**根因**：FSDP 的 `forward_step` 调用 loss 回调时传入
+`model_output`、`data` 和 `dp_group=self.get_data_parallel_group()`。
+`l1/sft_runtime.py` 的 `replay_loss` 没有接收最后一个参数，虽然底层 `sft_loss` 本身支持它。
+报错发生在 RL 梯度计算之后、辅助 SFT loss 调用之中；联合 optimizer step 尚未执行。
+因此 step-0 验证通过不能证明 replay 训练正常。
+
+**修复**：对齐底层 loss 回调接口，接收可选的 `dp_group` 并向下透传：
+
+```python
+def replay_loss(config, model_output, data: TensorDict, dp_group=None, *, coefficient: float):
+    nll, _ = sft_loss(config, model_output, data, dp_group=dp_group)
+```
+
+不改变 replay 系数、全局回答 token 归一化、指标聚合或一次联合 optimizer 更新的设计，也不吞掉回调异常。
+
+**集群验证依据**：用户提供的 `RL_DEBUG_REPORT.md` 记录了相同修复在 8×A100 上完成
+5/5 次联合更新、最终 RL/SFT 验证、checkpoint 保存和 CPU 重新加载。
+该记录是报告中的集群结果，不是本地重新跑过的 GPU 验证。
+报告另有训练结束后的非致命 DataLoader worker 退出异常，其根因未确定，未在此修复中屏蔽或绕过。
+
 ### 重启前记得清理 Ray
 
 崩溃后 Ray 的 actor 可能残留并占着显存：
@@ -433,4 +462,3 @@ tail -f outputs/watchdog.log
 
 > 坑：用 `pgrep -f "watchdog.sh"` 判断是否已在运行会**匹配到执行这条命令的 shell
 > 自己**，导致误判成"已在运行"。要用 `pgrep -af "bash watchdog.sh"` 再排除自身。
-

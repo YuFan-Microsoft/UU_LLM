@@ -146,6 +146,9 @@ and no change to L1 reward or advantages. The on-policy old-log-prob shortcut re
 does not change weights before the GRPO loss is computed. Replay currently requires the launcher's synchronous
 V1/FSDP2/vLLM packed-sequence setup, with one PPO epoch and one mini-batch per rollout batch.
 
+The replay loss callback accepts and forwards the engine's optional `dp_group` argument to `sft_loss`.
+Without it, the first auxiliary replay loss call fails before the joint optimizer step.
+
 **Evaluation** includes normal L1 and all seven other tasks. Preparation pins the Hugging Face revision,
 streams the first **up to 500 test rows per task**, and persists those exact rows in `eval.parquet`.
 It does not filter out long test examples silently: an oversized prompt fails preparation and must be
