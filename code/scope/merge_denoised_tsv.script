@@ -1,0 +1,164 @@
+// cosmos09 / MSN.DnI. Merge the 22 generated TSVs without removing duplicate rows.
+#DECLARE Root string = "/shares/UDC/RnR/MaiProfileV3/AllUsers_V4_Backfill/Denoising";
+#DECLARE OutputStream string = @Root + "/From-20260503-To-20261003/ForGptLabeling.tsv";
+
+#DECLARE Input20260509 string = @Root + "/2026-05-09/ForGptLabeling.tsv";
+rows20260509 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260509
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260516 string = @Root + "/2026-05-16/ForGptLabeling.tsv";
+rows20260516 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260516
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260523 string = @Root + "/2026-05-23/ForGptLabeling.tsv";
+rows20260523 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260523
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260530 string = @Root + "/2026-05-30/ForGptLabeling.tsv";
+rows20260530 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260530
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260606 string = @Root + "/2026-06-06/ForGptLabeling.tsv";
+rows20260606 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260606
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260613 string = @Root + "/2026-06-13/ForGptLabeling.tsv";
+rows20260613 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260613
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260620 string = @Root + "/2026-06-20/ForGptLabeling.tsv";
+rows20260620 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260620
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260627 string = @Root + "/2026-06-27/ForGptLabeling.tsv";
+rows20260627 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260627
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260704 string = @Root + "/2026-07-04/ForGptLabeling.tsv";
+rows20260704 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260704
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260711 string = @Root + "/2026-07-11/ForGptLabeling.tsv";
+rows20260711 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260711
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260718 string = @Root + "/2026-07-18/ForGptLabeling.tsv";
+rows20260718 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260718
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260725 string = @Root + "/2026-07-25/ForGptLabeling.tsv";
+rows20260725 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260725
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260801 string = @Root + "/2026-08-01/ForGptLabeling.tsv";
+rows20260801 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260801
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260808 string = @Root + "/2026-08-08/ForGptLabeling.tsv";
+rows20260808 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260808
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260815 string = @Root + "/2026-08-15/ForGptLabeling.tsv";
+rows20260815 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260815
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260822 string = @Root + "/2026-08-22/ForGptLabeling.tsv";
+rows20260822 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260822
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260829 string = @Root + "/2026-08-29/ForGptLabeling.tsv";
+rows20260829 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260829
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260905 string = @Root + "/2026-09-05/ForGptLabeling.tsv";
+rows20260905 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260905
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260912 string = @Root + "/2026-09-12/ForGptLabeling.tsv";
+rows20260912 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260912
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260919 string = @Root + "/2026-09-19/ForGptLabeling.tsv";
+rows20260919 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260919
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20260926 string = @Root + "/2026-09-26/ForGptLabeling.tsv";
+rows20260926 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20260926
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+#DECLARE Input20261003 string = @Root + "/2026-10-03/ForGptLabeling.tsv";
+rows20261003 =
+    EXTRACT UserId : string, Date : DateTime, Source : string, Action : string
+    FROM @Input20261003
+    USING DefaultTextExtractor(delimiter: '\t', skipFirstNRows: 1);
+
+merged =
+    SELECT * FROM rows20260509
+    UNION ALL SELECT * FROM rows20260516
+    UNION ALL SELECT * FROM rows20260523
+    UNION ALL SELECT * FROM rows20260530
+    UNION ALL SELECT * FROM rows20260606
+    UNION ALL SELECT * FROM rows20260613
+    UNION ALL SELECT * FROM rows20260620
+    UNION ALL SELECT * FROM rows20260627
+    UNION ALL SELECT * FROM rows20260704
+    UNION ALL SELECT * FROM rows20260711
+    UNION ALL SELECT * FROM rows20260718
+    UNION ALL SELECT * FROM rows20260725
+    UNION ALL SELECT * FROM rows20260801
+    UNION ALL SELECT * FROM rows20260808
+    UNION ALL SELECT * FROM rows20260815
+    UNION ALL SELECT * FROM rows20260822
+    UNION ALL SELECT * FROM rows20260829
+    UNION ALL SELECT * FROM rows20260905
+    UNION ALL SELECT * FROM rows20260912
+    UNION ALL SELECT * FROM rows20260919
+    UNION ALL SELECT * FROM rows20260926
+    UNION ALL SELECT * FROM rows20261003;
+
+OUTPUT merged
+TO @OutputStream
+ORDER BY UserId ASC
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
