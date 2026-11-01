@@ -25,24 +25,33 @@ GRPO/
 ## Reward
 
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, cut at the response
-length), else the mean of three signals, each in [0, 1]. **Only the first N interests earn credit, but every
+length), else the mean of four signals, each in [0, 1]. **Only the first N interests earn credit, but every
 interest written counts in precision's denominator:**
 
-- `coverage`: share of the input signals cited as evidence by the first N interests, scored as min(coverage / 0.7, 1)
-  (no gain past 0.7: noisy signals may be skipped; the logged `coverage` is the raw share);
+- `past_recall@10`: share of the user's visible input actions in the top 10 of one of the first N interests;
+- `past_precision@10`: number of the first N interests matched one-to-one to a distinct input action in their
+  top 10, divided by the number of interests written;
 - `future_recall@10`: share of the user's next-week actions in the top 10 of one of the first N interests;
 - `future_precision@10`: number of the first N interests matched one-to-one to a distinct next-week action in their
   top 10 (maximum matching: interests that only hit the same action count once), divided by the number of interests
   written.
 
-N = round(0.9 + 18.2 n / (33 + n)) for n input signals (`interest_cap` in `l1/l1_reward.py`) is the P90 of the SFT
+`coverage` remains the share of input indices cited by the first N interests, but is diagnostic only:
+it is logged to W&B and does not enter the reward. There is no coverage threshold or extra penalty.
+Both precisions are interest-level one-to-one matching rates, not retrieved-document precision;
+past retrieval does not prove that every evidence citation is correct.
+
+N = round(0.9 + 18.2 n / (33 + n)) for n input signals (`interest_cap` in `l1/l1_reward.py`) is the approximate P90 of the SFT
 Layer-1 interest count, a saturation curve fitted to the V3 train split's P90 per signal-count bucket: 1 at n = 1, 5
 at 10, 9 at 25, 13 at 60, 17 at 200 (the prompt holds at most 200 signals). Recall grows with every interest (10 more
 retrieved actions), which made the first run inflate the interest count from 8.7 to 15.4 in 200 steps; an interest
-past N adds no coverage, recall or matched interest and only lowers precision, so the best answer stops at N.
+past N adds no recall or matched interest and increases both precision denominators.
 
-Each interest is one query, `<interest name>: <top topic>`, ranking with Qwen3-Embedding-4B the next-week actions
-of every user of the answer's batch (64 users). See `case_study/README.md` for the details and the rule list.
+Each interest is one query, `<interest name>: <top topic>`, independently ranking two Qwen3-Embedding-4B pools:
+every batch user's visible prompt actions, and every batch user's next-week actions (64 users by default).
+Past targets and candidates exclude signals removed by the 200-signal cap or token-budget trimming.
+The future pool and future metric definitions are unchanged. Query embeddings and shared action embeddings
+are reused, but candidate membership and rankings remain separate. See `case_study/README.md` for details.
 
 ## Where it comes from
 
@@ -90,9 +99,12 @@ nohup bash run_l1_grpo.sh > l1_grpo_launch.out 2>&1 &
 NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_grpo_smoke bash run_l1_grpo.sh trainer.total_training_steps=5
 ```
 
-The launcher builds the data once per `DATA_DIR` (default `outputs/data/seed<SEED>_batch<TRAIN_BATCH_SIZE>_prompt<MAX_PROMPT_LENGTH>`;
+The launcher builds the data once per `DATA_DIR` (default `outputs/data/seed<SEED>_batch<TRAIN_BATCH_SIZE>_prompt<MAX_PROMPT_LENGTH>_pools_v2`;
 all 139,629 training rows take minutes with one process per CPU core, up to 32, and print their progress;
-`NUM_TRAIN_BATCHES=2` takes seconds) and refuses a `DATA_DIR` cut for another batch size.
+`NUM_TRAIN_BATCHES=2` takes seconds) and refuses a `DATA_DIR` cut for another batch size or using the old
+future-only pool format. Explicit old cache paths must be replaced with a new directory and regenerated.
+Use a new `EXPERIMENT_NAME` when starting this objective from SFT; the same output directory would resume
+its previous checkpoint automatically.
 With replay enabled, its separate preparation downloads the seven V3 SFT training sets once and tokenizes
 the fixed test subsets (see below). Before Ray starts, a
 preflight scores a validation row through `l1/verl_reward.py` (fastText and `UU_LLM/models/lid.176.bin`, downloaded
@@ -198,10 +210,11 @@ NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_r
 
 ## Following the reward
 
-Every validation logs only the mean over all validation answers of seven signals (W&B / console, set by
+Every validation logs only the mean over all validation answers of nine signals (W&B / console, set by
 `trainer.val_core_metrics` in the launcher): `val-core/user_profile_l1/<signal>` for `reward`, `n_interests`,
-`coverage` (the raw share), `future_recall`, `future_precision`, `json_valid` and `rule_pass`. Step 0 is the starting
-checkpoint, scored like `case_study/` scores it. Each training step logs the same seven means over its rollouts
+`coverage` (diagnostic only), `past_recall`, `past_precision`, `future_recall`, `future_precision`, `json_valid`
+and `rule_pass`. Step 0 is the starting checkpoint, scored like `case_study/` scores it.
+Each training step logs the same nine means over its rollouts
 (`trainer.train_core_metrics`): `train-core/user_profile_l1/<signal>`,
 `reward` being `critic/score/mean`;
 the `training/`, `num_turns/`, `timing_s/`, `timing_per_token_ms/` and `prompt_length/` metrics are not logged
@@ -217,7 +230,9 @@ python case_study.py score --output_dir outputs/<run>_val_300   # report.html of
 ```
 
 `trend.md` has one row per validation step (reward, best of 16, each signal, answer length); watch `n_interests`
-next to the reward. Runs from before the interest cap recorded `coverage` and `future_recall` over every interest
+next to the reward. Older runs lack past retrieval metrics and included coverage in the reward, so compare
+objectives by rescoring the same answers rather than directly comparing their rewards.
+Runs from before the interest cap recorded `coverage` and `future_recall` over every interest
 and `future_interest_hit` instead of `future_precision`; `from_val` + `score` rescore a step's answers with the
 current reward (`score` needs Qwen3-Embedding-4B: `--embedding_url` of a running server, or a GPU).
 
@@ -259,15 +274,23 @@ training rows from `train`, cut into batches of 64, and the 64 validation prompt
 Each row carries its user's cleaned next-week actions (`reward_model.ground_truth`, with date and source in
 `extra_info.future`), the Layer-1 user message and its `batch_id` (`extra_info`).
 
-verl computes rewards one answer at a time in its reward workers, so the pool of every batch is written ahead
-(`pools.parquet`, one row group per batch) and looked up by `batch_id`. That pool is the current batch only because
+verl computes rewards one answer at a time in its reward workers, so both candidate pools of every batch are written
+ahead (`pools.parquet`, one row group per batch, columns `batch_id`, `past_actions`, `future_actions`) and looked up by
+`batch_id`. Pool format version 2 is recorded in `meta.json`. Past actions are parsed from the actual prepared
+prompts, not from the untrimmed source history. The pools represent the current batch only because
 verl reads the rows in order: the launcher sets `data.shuffle=False` and `data.filter_overlong_prompts=False`, and
 the data step already dropped every row verl could reject.
 
 The embeddings come from the vLLM server of the Run section (on this node it logs to
 `outputs/<run>/embedding_server.log`; verl splits each step's 64 x 16 answers evenly over the training GPUs). The
-reward workers are CPU-only Ray actors: each asks the server for its batch's pool once per batch and for the queries
+reward workers are CPU-only Ray actors: each asks the server for its batch's two pools once per batch and for the queries
 of every answer (retrying for about 3 minutes, long enough for the watchdog to restart a server), then ranks them
 (`L1_REWARD_NUM_THREADS`, default 8 torch threads) and runs the rules with the fastText language model. verl does not
 pass the finish reason, so an answer cut at the response length is judged on its text (it is not valid JSON, so it
 gets 0).
+
+Focused CPU logic tests, with deterministic mock embeddings (no model downloads or GPUs):
+
+```bash
+PYTHONPATH="$PWD" python3 -m unittest l1.test_l1_reward -v
+```

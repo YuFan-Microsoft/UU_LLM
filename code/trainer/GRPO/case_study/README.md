@@ -9,11 +9,12 @@ data, or takes the answers a GRPO run generated at one validation step, and scor
 ## Reward (`../l1/l1_reward.py`)
 
 The reward of one answer is 0 when it breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation,
-or cut at max_tokens), else the mean of three signals, each in [0, 1], with K = 10. Only the first N interests earn
+or cut at max_tokens), else the mean of four signals, each in [0, 1], with K = 10. Only the first N interests earn
 credit, but every interest written counts in precision's denominator:
 
-- `coverage`: share of the input signals cited as evidence by the first N interests, scored as min(coverage / 0.7, 1)
-  (no gain past 0.7: noisy signals may be skipped; the reported `coverage` is the raw share).
+- `past_recall@K`: share of the user's visible input actions in the top K of one of the first N interests.
+- `past_precision@K`: first-N interests matched one-to-one to a distinct input action in their top K, divided
+  by the number of interests written.
 - `future_recall@K`: each interest is one query, `<interest name>: <top topic>` (the topic citing the most distinct
   signals), ranking a pool of actions with Qwen3-Embedding (the distractor pool plus this user's next-week actions);
   share of the user's next-week actions in the top K of one of the first N interests.
@@ -21,11 +22,14 @@ credit, but every interest written counts in precision's denominator:
   top K (maximum matching: interests that only hit the same action count once), divided by the number of interests
   written.
 
-N = round(0.9 + 18.2 n / (33 + n)) for n input signals, the P90 of the SFT interest count (see `../README.md`).
+`coverage` is still reported as the share of input indices cited by the first N interests, but is not in the reward.
+Past and future pools are separate: the former contains all prompts' actual visible actions and the latter all
+prompts' next-week actions. Every interest query ranks each pool independently.
+N = round(0.9 + 18.2 n / (33 + n)) for n input signals, the approximate SFT P90 interest count (see `../README.md`).
 
 ```python
 reward_fn = L1Reward()                     # Qwen3-Embedding + fastText language model
-reward_fn.set_pool(distractor_actions)     # case study: every prompt's next-week actions
+reward_fn.set_pools(past_actions, future_actions)  # all prompts' visible past / next-week actions, kept separate
 reward_fn(content, text, finish_reason, next_week_actions)["reward"]
 ```
 
@@ -60,7 +64,7 @@ its default output directory is `outputs/<run>_global_step_<N>`.
 ## GRPO runs
 
 `../run_l1_grpo.sh` validates before training and every 100 steps: the 64 validation users get 16 answers each,
-sampled as here (temperature 1.0), scored with the same reward against every validation user's next-week actions,
+sampled as here (temperature 1.0), scored independently against the validation batch's visible-past and next-week pools,
 and dumped to `<run>/validation/<step>.jsonl`. No GPU is needed to read them:
 
 ```bash
@@ -70,11 +74,13 @@ python case_study.py score --output_dir outputs/<run>_val_300                   
 ```
 
 `trend` has one row per validation step: the mean reward, the mean best reward of each user's 16 answers, the mean
-of `json_valid`, `rule_pass`, `n_interests`, `coverage`, `future_recall` and `future_precision` (`future_interest_hit`
-for runs from before the interest cap) (as the run's reward
+of `json_valid`, `rule_pass`, `n_interests`, `coverage`, the four retrieval signals (`past_recall`, `past_precision`,
+`future_recall`, `future_precision`) when available, and `future_interest_hit` for older runs (as the run's reward
 recorded them) and the mean answer length in characters. `from_val` turns one step's answers into `rollouts.jsonl`
 (signals parsed back from each Layer-1 message, next-week actions from the run's `val.parquet`) so that `score`
-writes the same report as for a checkpoint rollout, ranked against the same pool as the run's validation reward. With
+writes the same report as for a checkpoint rollout, ranked against the same two pools as the current validation reward.
+Old dumps can be rescored: past candidates are reconstructed from their actual prompts, even when the old run only
+stored a future pool. Reward values from different objectives are not directly comparable. With
 the same seed, `prepare` picks (up to the rows each tool skips) the run's validation users, so a checkpoint report
 and a validation-step report show the same people.
 
@@ -111,8 +117,10 @@ summary and, for the first `--report_prompts` prompts, the input signals and eve
 | `reward` | The GRPO reward of `../l1/l1_reward.py` (above) |
 | `json_valid` | Exactly the V3 Layer-1 schema `{"interests":[{"topics":[{"evidence","topic"}],"interest_name","actual_activity"}]}` with the right value types (no topic source, intent or content locale) |
 | `rule_pass` | The in-training rollout judgement (`user_profile_rules.score_example`) and not cut at max_tokens: JSON-valid and no violation (empty text, duplicate interest / topic name, evidence not a non-empty list of existing idx, duplicate evidence idx, 40+ interests, `wrong_language`: most interests' `actual_activity` not in the language of the actions they cite, `truncated`) |
-| `n_interests` | Number of interests written (only the first N earn credit; all count in `future_precision@K`'s denominator) |
-| `coverage` | Share of the input signals cited by the first N interests (raw; the reward scores min(coverage / 0.7, 1)) |
+| `n_interests` | Number of interests written (only the first N earn credit; all count in both precision denominators) |
+| `coverage` | Share of the input indices cited by the first N interests (diagnostic only, not in the reward) |
+| `past_recall@K` | Share of this user's visible input actions in the top K of one of the first N interests |
+| `past_precision@K` | First-N interests matched one-to-one to a distinct input action in their top K, over all interests written |
 | `future_recall@K` | Share of this user's next-week actions in the top K of one of the first N interests (reward signal) |
 | `future_precision@K` | First-N interests matched one-to-one to a distinct next-week action in their top K, over all interests written (reward signal) |
 

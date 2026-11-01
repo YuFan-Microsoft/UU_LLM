@@ -10,8 +10,8 @@ validation answers apart by prompt).
 
     <output_dir>/train.parquet   verl RL rows, batch after batch (train with data.shuffle=False)
     <output_dir>/val.parquet     one batch, "val" (data.val_batch_size unset: the whole set)
-    <output_dir>/pools.parquet   batch_id -> the distinct next-week actions of every user of the batch, the pool
-                                 verl_reward.py ranks each answer of the batch against (one row group per batch)
+    <output_dir>/pools.parquet   batch_id -> separate past_actions / future_actions pools (one row group per batch);
+                                 past actions come only from the visible, already capped/trimmed prompts
     <output_dir>/meta.json       the settings, the reward and data.* values the launcher must match
 
 Rows without an allowed past signal, without a next-week action, or whose prompt has more than --max_prompt_length
@@ -34,10 +34,12 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from rl_data import DEFAULT_CHECKPOINT, clean_behaviors, rl_data_files, row_key  # noqa: E402  (also puts code/inference first)
 import layer1  # noqa: E402
+from l1_reward import input_signals  # noqa: E402
 from utils import build_prompt_ids  # noqa: E402
 
 DATA_SOURCE = "user_profile_l1"
 VAL_BATCH_ID = "val"
+POOL_FORMAT_VERSION = 2
 
 
 def row_index(paths: list[Path], seed: int) -> list[tuple[str, int, int]]:
@@ -157,14 +159,17 @@ def select(args: argparse.Namespace, encode=None) -> tuple[list[dict], list[dict
     return val, train
 
 
-def assign_batches(rows: list[dict], split: str, batch_size: int | None) -> dict[str, list[str]]:
-    """Set index / split / batch_id of every row; returns batch_id -> the batch's distinct next-week actions."""
-    pools: dict[str, list[str]] = {}
+def assign_batches(rows: list[dict], split: str, batch_size: int | None) -> dict[str, dict[str, list[str]]]:
+    """Set index / split / batch_id; build separate visible-past and next-week candidate pools for each batch."""
+    pools: dict[str, dict[str, list[str]]] = {}
     for index, row in enumerate(rows):
         batch_id = VAL_BATCH_ID if batch_size is None else f"train-{index // batch_size:06d}"
         row["extra_info"].update(index=index, split=split, batch_id=batch_id)
-        pools.setdefault(batch_id, []).extend(row["reward_model"]["ground_truth"])
-    return {batch_id: list(dict.fromkeys(actions)) for batch_id, actions in pools.items()}
+        pool = pools.setdefault(batch_id, {"past_actions": [], "future_actions": []})
+        pool["past_actions"].extend(signal["action"] for signal in input_signals(row["extra_info"]["content"]))
+        pool["future_actions"].extend(row["reward_model"]["ground_truth"])
+    return {batch_id: {name: list(dict.fromkeys(actions)) for name, actions in pool.items()}
+            for batch_id, pool in pools.items()}
 
 
 def write(args: argparse.Namespace, val: list[dict], train: list[dict]) -> None:
@@ -175,16 +180,21 @@ def write(args: argparse.Namespace, val: list[dict], train: list[dict]) -> None:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(train), args.output_dir / "train.parquet")
     pq.write_table(pa.Table.from_pylist(val), args.output_dir / "val.parquet")
-    pq.write_table(pa.Table.from_pydict({"batch_id": list(pools), "actions": list(pools.values())}),
+    pq.write_table(pa.Table.from_pydict({"batch_id": list(pools),
+                                       "past_actions": [pool["past_actions"] for pool in pools.values()],
+                                       "future_actions": [pool["future_actions"] for pool in pools.values()]}),
                    args.output_dir / "pools.parquet", row_group_size=1)
     tokens = [row["extra_info"]["prompt_tokens"] for row in val + train]
-    pool_sizes = [len(actions) for actions in pools.values()]
+    pool_sizes = [len(pool["future_actions"]) for pool in pools.values()]
+    past_pool_sizes = [len(pool["past_actions"]) for pool in pools.values()]
     meta = {
         "seed": args.seed, "splits": {"train": "train", "val": "test"}, "batch_size": args.batch_size,
+        "pool_format_version": POOL_FORMAT_VERSION,
         "train_rows": len(train),
         "train_batches": len(train) // args.batch_size, "val_rows": len(val),
         "max_prompt_length": args.max_prompt_length, "max_prompt_tokens": max(tokens),
         "pool_size_min_max": [min(pool_sizes), max(pool_sizes)], "tokenizer": args.tokenizer,
+        "past_pool_size_min_max": [min(past_pool_sizes), max(past_pool_sizes)],
     }
     (args.output_dir / "meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(json.dumps(meta, indent=2))

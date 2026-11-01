@@ -6,7 +6,8 @@ The reward itself is l1_reward.L1Reward; this file only feeds it what verl passe
     ground_truth                  the user's next-week actions
     extra_info["content"]         the Layer-1 user message (the rule checks need the input signals)
     extra_info["batch_id"]        the fixed training batch of the row (prepare_data.py)
-and ranks every answer against the next-week actions of every user of its batch, read from the pool file
+and ranks every answer independently against the visible past and next-week actions of every user of its batch,
+read from the dual-pool file
 (reward.custom_reward_function.reward_kwargs.pool_file) by batch_id. That pool is the current batch only because the
 data loader reads the rows in order (data.shuffle=False, no filtering) in batches of the size the data was cut into.
 
@@ -30,14 +31,15 @@ _lock = threading.Lock()
 _state: dict = {"reward_fn": None, "batch_id": None}
 
 
-def load_pool(pool_file: str, batch_id: str) -> list[str]:
-    """The next-week actions of every user of the batch `batch_id` (one row group per batch, so one is read)."""
+def load_pools(pool_file: str, batch_id: str) -> dict[str, list[str]]:
+    """Separate visible-past and next-week pools of this batch (one row group per batch)."""
     import pyarrow.parquet as pq
 
-    rows = pq.read_table(pool_file, columns=["actions"], filters=[("batch_id", "=", batch_id)]).column("actions")
+    rows = pq.read_table(pool_file, columns=["past_actions", "future_actions"],
+                         filters=[("batch_id", "=", batch_id)]).to_pylist()
     if len(rows) != 1:
         raise ValueError(f"{pool_file}: {len(rows)} rows for batch_id {batch_id!r}, expected 1")
-    return rows[0].as_py()
+    return rows[0]
 
 
 def reward_fn(embedding_model: str, embedding_url: str | None, embedding_batch_size: int) -> L1Reward:
@@ -57,7 +59,7 @@ def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict
         scorer = reward_fn(embedding_model, embedding_url, embedding_batch_size)
         batch_id = str(extra_info["batch_id"])
         if batch_id != _state["batch_id"]:
-            scorer.set_pool(load_pool(pool_file, batch_id))
+            scorer.set_pools(**load_pools(pool_file, batch_id))
             _state["batch_id"] = batch_id
         result = scorer(extra_info["content"], solution_str, None, [str(action) for action in ground_truth])
     return {"score": float(result["reward"]), "json_valid": float(result["json_valid"]),

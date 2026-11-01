@@ -1,27 +1,28 @@
 """Layer-1 GRPO reward: the single definition, used by the GRPO trainer (verl_reward.py) and the case study.
 
 The reward of one answer: 0 if it breaks the Layer-1 rules (not V3 JSON, a user_profile_rules violation such as a
-duplicate interest / topic, bad evidence or the wrong language, or cut at max_tokens), else the mean of three signals,
+duplicate interest / topic, bad evidence or the wrong language, or cut at max_tokens), else the mean of four signals,
 each in [0, 1]. Only the first N interests earn credit, but every interest written counts in precision's denominator:
-    coverage            share of the input signals cited as evidence by the first N interests, scored as
-                        min(coverage / COVERAGE_TARGET, 1): no gain past the target, since noisy signals may be skipped
-                        (the logged coverage is the raw share)
+    past_recall@K       share of the user's visible input actions in the top K of one of the first N interests
+    past_precision@K    first-N interests matched one-to-one to a distinct input action in their top K, divided by
+                        the number of interests written
     future_recall@K     share of the user's next-week actions in the top K of one of the first N interests
-    future_precision@K  number of the first N interests matched one-to-one to a distinct next-week action in their
-                        top K (a maximum matching: interests that only hit the same action count once), divided by the
-                        number of interests written
-N = interest_cap(n) = round(0.9 + 18.2 n / (33 + n)) for n input signals: the P90 of the SFT Layer-1 interest count,
+    future_precision@K  first-N interests matched one-to-one to a distinct next-week action in their top K, divided
+                        by the number of interests written
+Coverage, the share of input indices cited by the first N interests, is logged but does not affect the reward.
+N = interest_cap(n) = round(0.9 + 18.2 n / (33 + n)) for n input signals: the approximate SFT P90 interest count,
 a saturation curve fitted to the V3 train split's per-bucket P90 (1 at n = 1, 5 at 10, 9 at 25, 13 at 60, 17 at 200;
 the prompt holds at most 200 signals). Recall grows with every interest (K more retrieved actions), which made GRPO
-inflate the interest count; an interest past N adds no coverage, recall or matched interest and only lowers precision.
-Each interest is one embedding query (interest_query) ranking a pool of actions: the distractor pool (set_pool) plus
-this user's next-week actions. The embeddings are Qwen3-Embedding-4B's, computed in process (Embedder) or by a vLLM
+inflate the interest count; an interest past N adds no recall or matched interest and only lowers precision.
+Each interest is one embedding query (interest_query), independently ranking two pools: this batch's visible past
+actions and this batch's next-week actions. Query embeddings and repeated action embeddings are shared, not rankings.
+The embeddings are Qwen3-Embedding-4B's, computed in process (Embedder) or by a vLLM
 embedding server (EmbeddingClient, `vllm serve <model> --runner pooling`; GRPO runs it on a GPU of its own) on the
 same texts.
 
     reward_fn = L1Reward()                        # Qwen3-Embedding and the fastText language model, loaded once
     reward_fn = L1Reward(embedding_url="http://127.0.0.1:8100")   # or: a vLLM embedding server
-    reward_fn.set_pool(distractor_actions)        # fixed for a run
+    reward_fn.set_pools(past_actions, future_actions)  # batch pools, including every user's targets
     reward_fn(content, text, finish_reason, next_week_actions)["reward"]
 """
 
@@ -42,9 +43,9 @@ import user_profile_rules  # noqa: E402
 from utils import parse_json_object  # noqa: E402
 
 TOP_K = 10
-COVERAGE_TARGET = 0.7
 INVALID_REWARD = 0.0
-SIGNALS = ("coverage", "future_recall", "future_precision")
+REWARD_SIGNALS = ("past_recall", "past_precision", "future_recall", "future_precision")
+SIGNALS = ("coverage", *REWARD_SIGNALS)  # All logged content metrics; coverage is diagnostic only.
 # The interest cap (P90 of the SFT interest count) at n input signals: CAP_BASE + CAP_SCALE * n / (CAP_HALF + n),
 # rounded; fitted to the V3 train split's P90 per signal-count bucket (1: 1, 3-4: 3, 8-11: 5, 20-29: 9, 50-74: 12,
 # 100-149: 15, 200: 17).
@@ -71,12 +72,12 @@ def judge(content: str, text: str, finish_reason: str | None) -> tuple[dict, dic
     return rules, parse_json_object(text) if rules["json_valid"] else None
 
 
-def input_indices(content: str) -> set:
-    """The idx of every input signal of a Layer-1 user message (one activity line per signal)."""
+def input_signals(content: str) -> list[dict]:
+    """The actual signals in a Layer-1 prompt, after its signal cap and token-budget trimming."""
     stage, payload = user_profile_rules.read_input([{"role": "user", "content": content}])
     if stage != "layer1" or "activities" not in payload:
-        return set()
-    return {activity["idx"] for activity in payload["activities"]}
+        raise ValueError("Expected a Layer-1 prompt containing activities")
+    return payload["activities"]
 
 
 def interest_query(interest: dict) -> str:
@@ -212,60 +213,79 @@ class L1Reward:
                                                                                                    batch_size)
         self.embedder = embedder
         self.top_k = top_k
-        self.set_pool([])
+        self.set_pools([], [])
 
-    def set_pool(self, actions: list[str]) -> None:
-        """The distractor actions every answer is ranked against; each user's next-week actions are added to them.
-        Clears the embedding cache, so a long run that switches pools keeps only the current one's texts."""
+    def set_pools(self, past_actions: list[str], future_actions: list[str]) -> None:
+        """Separate batch candidate pools. Clear the cache once; action embeddings are reused across both pools."""
         self.embedder.clear()
-        self.pool = list(dict.fromkeys(actions))
-        self.pool_index = {action: column for column, action in enumerate(self.pool)}
-        self.pool_vectors = self.embedder.encode(self.pool, query=False) if self.pool else None
+        self.past_pool = list(dict.fromkeys(past_actions))
+        self.future_pool = list(dict.fromkeys(future_actions))
+        self.past_index = {action: column for column, action in enumerate(self.past_pool)}
+        self.future_index = {action: column for column, action in enumerate(self.future_pool)}
+        self.past_vectors = self.embedder.encode(self.past_pool, query=False) if self.past_pool else None
+        self.future_vectors = self.embedder.encode(self.future_pool, query=False) if self.future_pool else None
+
+    def _rank_hits(self, query_vectors, pool: list[str], pool_index: dict[str, int], pool_vectors,
+                   targets: list[str]) -> list[list[list[int]]]:
+        """Per query, [target position, rank] of its top-K hits, using only this candidate pool."""
+        if query_vectors is None:
+            return []
+        if not targets:
+            return [[] for _ in range(query_vectors.shape[0])]
+        extra = [action for action in targets if action not in pool_index]
+        columns = {**{action: len(pool) + i for i, action in enumerate(extra)}, **pool_index}
+        position = {columns[action]: pos for pos, action in enumerate(targets)}
+        parts = [query_vectors @ vectors.T for vectors in
+                 (pool_vectors, self.embedder.encode(extra, query=False) if extra else None)
+                 if vectors is not None]
+        scores = self.embedder.torch.cat(parts, dim=1)
+        top = scores.topk(min(self.top_k, scores.shape[1]), dim=1).indices.tolist()
+        return [[[position[column], rank] for rank, column in enumerate(row, 1) if column in position]
+                for row in top]
 
     def __call__(self, content: str, text: str, finish_reason: str | None, future: list[str]) -> dict:
         """The reward of one answer `text` to the Layer-1 user message `content`, whose user does the actions `future`
         next week, with what it is computed from:
             reward, json_valid, rule_pass, violations, output (the parsed answer, None unless JSON-valid), n_interests,
-            coverage, future_recall, future_precision (0 unless JSON-valid), queries (one per interest) and hits
-            (per interest, the [position in the distinct `future`, rank from 1] of its top K; None unless JSON-valid;
-            interests past interest_cap get theirs too, for diagnostics, but earn nothing).
+            coverage and the four REWARD_SIGNALS (0 unless JSON-valid), queries (one per interest), past_hits and
+            hits (future hits): per interest, [position in the distinct target actions, rank from 1] of its top K;
+            None unless JSON-valid. Interests past interest_cap get diagnostic hits too, but earn nothing.
         A JSON-valid answer that breaks a rule gets its signals too, for diagnostics, but INVALID_REWARD."""
         rules, output = judge(content, text, finish_reason)
         result = {"reward": INVALID_REWARD, "json_valid": rules["json_valid"], "rule_pass": rules["rule_pass"],
                   "violations": rules["violations"], "output": output, "n_interests": 0,
-                  **{name: 0.0 for name in SIGNALS}, "queries": None, "hits": None}
+                  **{name: 0.0 for name in SIGNALS}, "queries": None, "past_hits": None, "hits": None}
         if output is None:
             return result
-        indices = input_indices(content)
+        signals = input_signals(content)
+        indices = {signal["idx"] for signal in signals}
+        past = list(dict.fromkeys(signal["action"] for signal in signals))
+        if past and not self.past_pool:
+            raise ValueError("Past candidate pool is empty; call set_pools with the batch's visible past actions")
+        if any(action not in self.past_index for action in past):
+            raise ValueError("Past candidate pool does not contain all visible input actions; check batch/data alignment")
         queries = [interest_query(interest) for interest in output["interests"]]
-        hits = [[] for _ in queries]
         future = list(dict.fromkeys(future))
-        if queries and future:
-            extra = [action for action in future if action not in self.pool_index]
-            columns = {**{action: len(self.pool) + i for i, action in enumerate(extra)}, **self.pool_index}
-            position = {columns[action]: pos for pos, action in enumerate(future)}
-            query_vectors = self.embedder.encode(queries, query=True)
-            parts = [query_vectors @ vectors.T for vectors in
-                     (self.pool_vectors, self.embedder.encode(extra, query=False) if extra else None)
-                     if vectors is not None]
-            scores = self.embedder.torch.cat(parts, dim=1)
-            top = scores.topk(min(self.top_k, scores.shape[1]), dim=1).indices.tolist()
-            hits = [[[position[column], rank] for rank, column in enumerate(row, 1) if column in position]
-                    for row in top]
+        query_vectors = self.embedder.encode(queries, query=True) if queries else None
+        past_hits = self._rank_hits(query_vectors, self.past_pool, self.past_index, self.past_vectors, past)
+        hits = self._rank_hits(query_vectors, self.future_pool, self.future_index, self.future_vectors, future)
         # Only the first N interests earn credit; every interest written counts in precision's denominator.
         n_credited = interest_cap(len(indices))
         credited, credited_hits = output["interests"][:n_credited], hits[:n_credited]
+        credited_past_hits = past_hits[:n_credited]
         cited = {idx for interest in credited for topic in interest["topics"] for idx in topic["evidence"]} & indices
+        past_retrieved = {pos for interest_hits in credited_past_hits for pos, _ in interest_hits}
         retrieved = {pos for interest_hits in credited_hits for pos, _ in interest_hits}
         n_interests = len(output["interests"])
         result.update({
             "n_interests": n_interests,
             "coverage": len(cited) / len(indices) if indices else 0.0,
+            "past_recall": len(past_retrieved) / len(past) if past else 0.0,
+            "past_precision": matched_interests(credited_past_hits) / n_interests if n_interests else 0.0,
             "future_recall": len(retrieved) / len(future) if future else 0.0,
             "future_precision": matched_interests(credited_hits) / n_interests if n_interests else 0.0,
-            "queries": queries, "hits": hits,
+            "queries": queries, "past_hits": past_hits, "hits": hits,
         })
         if rules["rule_pass"]:
-            scored = {**result, "coverage": min(result["coverage"] / COVERAGE_TARGET, 1.0)}
-            result["reward"] = statistics.mean(scored[name] for name in SIGNALS)
+            result["reward"] = statistics.mean(result[name] for name in REWARD_SIGNALS)
         return result

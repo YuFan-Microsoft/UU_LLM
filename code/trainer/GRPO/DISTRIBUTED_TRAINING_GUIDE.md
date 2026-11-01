@@ -6,6 +6,12 @@
 >
 > 不要一边正式训练，一边覆盖代码、切换分支、升级依赖、重复启动 Ray，或对同一个 W&B run 再启动第二个 writer。
 
+**后续双池 reward 版本**：reward 改为过去/未来 recall、precision 四项平均，coverage 只监控。
+该版本要求 `meta.json` 的 `pool_format_version=2`，以及 `pools.parquet` 中独立的
+`past_actions` / `future_actions` 列。下面旧部署的缓存路径不能直接复用；应另选 `DATA_DIR`
+重新准备并同步到全部训练节点。过去池仅包含实际进入 prompt 的行为，未来池口径不变。
+默认数据目录现有 `_pools_v2` 后缀；切换目标时也应使用新的实验名，避免误接续旧 run。
+
 ## 1. 当前布局与正式任务
 
 | 节点 | GPU 分工 | 作用 |
