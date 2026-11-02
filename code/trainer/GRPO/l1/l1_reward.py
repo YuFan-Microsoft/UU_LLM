@@ -1,7 +1,8 @@
 """Layer-1 GRPO reward: the single definition, used by the GRPO trainer (verl_reward.py) and the case study.
 
 The reward of one answer: 0 if it breaks the Layer-1 rules (not V3 JSON, a user_profile_rules violation such as a
-duplicate interest / topic, bad evidence or the wrong language, or cut at max_tokens), else the mean of four signals,
+duplicate interest / topic, bad evidence or the wrong language, any interest_name or topic with 7 or more generation
+tokenizer tokens (no special tokens), or cut at max_tokens), else the mean of four signals,
 each in [0, 1]. Only the first N interests earn credit, but every interest written counts in precision's denominator:
     past_recall@K       share of the user's visible input actions in the top K of one of the first N interests
     past_precision@K    first-N interests matched one-to-one to a distinct input action in their top K, divided by
@@ -20,8 +21,8 @@ The embeddings are Qwen3-Embedding-4B's, computed in process (Embedder) or by a 
 embedding server (EmbeddingClient, `vllm serve <model> --runner pooling`; GRPO runs it on a GPU of its own) on the
 same texts.
 
-    reward_fn = L1Reward()                        # Qwen3-Embedding and the fastText language model, loaded once
-    reward_fn = L1Reward(embedding_url="http://127.0.0.1:8100")   # or: a vLLM embedding server
+    reward_fn = L1Reward(tokenizer=tokenizer)  # generation checkpoint's tokenizer, not the embedding tokenizer
+    reward_fn = L1Reward(tokenizer=tokenizer, embedding_url="http://127.0.0.1:8100")  # or: a vLLM embedding server
     reward_fn.set_pools(past_actions, future_actions)  # batch pools, including every user's targets
     reward_fn(content, text, finish_reason, next_week_actions)["reward"]
 """
@@ -34,6 +35,10 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from transformers import PreTrainedTokenizerBase
 
 INFERENCE_DIR = Path(__file__).resolve().parents[3] / "inference"
 if str(INFERENCE_DIR) not in sys.path:
@@ -43,6 +48,7 @@ import user_profile_rules  # noqa: E402
 from utils import parse_json_object  # noqa: E402
 
 TOP_K = 10
+MAX_LABEL_TOKENS = 6
 INVALID_REWARD = 0.0
 REWARD_SIGNALS = ("past_recall", "past_precision", "future_recall", "future_precision")
 SIGNALS = ("coverage", *REWARD_SIGNALS)  # All logged content metrics; coverage is diagnostic only.
@@ -62,14 +68,26 @@ def embedding_text(text: str, query: bool) -> str:
     return f"Instruct: {EMBEDDING_INSTRUCTION}\nQuery:{text}" if query else text
 
 
-def judge(content: str, text: str, finish_reason: str | None) -> tuple[dict, dict | None]:
+def judge(content: str, text: str, finish_reason: str | None,
+          tokenizer: "PreTrainedTokenizerBase") -> tuple[dict, dict | None]:
     """user_profile_rules.score_example of one Layer-1 answer to the user message `content` (json_valid, violations,
     rule_pass, ...) and the parsed answer when it is JSON-valid. A generation cut at max_tokens gets the violation
-    "truncated" and fails rule_pass."""
+    "truncated" and fails rule_pass. Every interest_name and topic must have at most MAX_LABEL_TOKENS generation
+    tokens, without special tokens, including interests and topics that earn no retrieval credit."""
     rules = user_profile_rules.score_example([{"role": "user", "content": content}], text)
     if finish_reason == "length":
         rules = {**rules, "violations": rules["violations"] + ["truncated"], "rule_pass": False}
-    return rules, parse_json_object(text) if rules["json_valid"] else None
+    output = parse_json_object(text) if rules["json_valid"] else None
+    if output is not None:
+        violations = set(rules["violations"])
+        for interest in output["interests"]:
+            if len(tokenizer.encode(interest["interest_name"], add_special_tokens=False)) > MAX_LABEL_TOKENS:
+                violations.add("interest_name_too_long")
+            if any(len(tokenizer.encode(topic["topic"], add_special_tokens=False)) > MAX_LABEL_TOKENS
+                   for topic in interest["topics"]):
+                violations.add("topic_too_long")
+        rules = {**rules, "violations": sorted(violations), "rule_pass": rules["rule_pass"] and not violations}
+    return rules, output
 
 
 def input_signals(content: str) -> list[dict]:
@@ -205,8 +223,10 @@ class L1Reward:
 
     def __init__(self, embedding_model: str = DEFAULT_EMBEDDING_MODEL, batch_size: int = 256,
                  embedder: Embedder | EmbeddingClient | None = None, top_k: int = TOP_K,
-                 embedding_url: str | None = None):
-        """Embeddings from `embedder`, else the vLLM server at `embedding_url`, else `embedding_model` in process."""
+                 embedding_url: str | None = None, *, tokenizer: "PreTrainedTokenizerBase"):
+        """Use the generation `tokenizer` for label limits. Embeddings come from `embedder`, the vLLM server at
+        `embedding_url`, or `embedding_model` in process."""
+        self.tokenizer = tokenizer
         user_profile_rules.language_tools()  # the language rule needs fastText lid.176.bin: fail before scoring
         if embedder is None:
             embedder = EmbeddingClient(embedding_url, batch_size) if embedding_url else Embedder(embedding_model,
@@ -251,7 +271,7 @@ class L1Reward:
             hits (future hits): per interest, [position in the distinct target actions, rank from 1] of its top K;
             None unless JSON-valid. Interests past interest_cap get diagnostic hits too, but earn nothing.
         A JSON-valid answer that breaks a rule gets its signals too, for diagnostics, but INVALID_REWARD."""
-        rules, output = judge(content, text, finish_reason)
+        rules, output = judge(content, text, finish_reason, self.tokenizer)
         result = {"reward": INVALID_REWARD, "json_valid": rules["json_valid"], "rule_pass": rules["rule_pass"],
                   "violations": rules["violations"], "output": output, "n_interests": 0,
                   **{name: 0.0 for name in SIGNALS}, "queries": None, "past_hits": None, "hits": None}

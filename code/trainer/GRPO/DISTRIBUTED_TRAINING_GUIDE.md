@@ -12,6 +12,18 @@
 重新准备并同步到全部训练节点。过去池仅包含实际进入 prompt 的行为，未来池口径不变。
 默认数据目录现有 `_pools_v2` 后缀；切换目标时也应使用新的实验名，避免误接续旧 run。
 
+**后续 token 长度规则版本**：任意 `interest_name` 或 `topic` 达到 7 tokens，整条 rollout 的
+`rule_pass=False`、reward 为 0。计数使用 reward worker 已加载并本地化的生成模型 tokenizer，
+不计特殊 token；每个进程保留独立副本，不重新加载 checkpoint/processor。
+必须把 `verl/trainer/ppo/reward.py` 与 `l1/` 的修改同步到所有 Ray 节点，不能只替换 reward 文件。
+reward worker 会分布到所有有 CPU 资源的存活 Ray 节点；各节点仍须能访问同版本代码、tokenizer、
+语言模型、相同 reward pool，以及可跨节点访问的 embedding URL（不要使用 `127.0.0.1`）。
+
+**当前仓库与下文历史部署的区别**：当前 `run_l1_grpo.sh` 仍默认 `trainer.nnodes=1`，
+仅设置 `NNODES=2` 不会生效；两节点启动需追加 `trainer.nnodes=2`。
+历史示例中的 `SFT_EVAL_MAX_PROMPT_LENGTH=24576` 与 response 8192 之和超过当前 25600 上限，
+当前版本应使用 prompt 17408 / response 8192，或不覆盖脚本默认值。
+
 ## 1. 当前布局与正式任务
 
 | 节点 | GPU 分工 | 作用 |

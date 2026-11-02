@@ -304,9 +304,12 @@ def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings:
 
 def score(args: argparse.Namespace) -> None:
     """Independent batch pools: visible prompt actions and next-week actions."""
+    from transformers import AutoProcessor
+
     rows = read_jsonl(args.output_dir / "rollouts.jsonl")
+    tokenizer = AutoProcessor.from_pretrained(args.checkpoint, trust_remote_code=True).tokenizer
     reward_fn = L1Reward(args.embedding_model, args.embedding_batch_size, top_k=args.top_k,
-                         embedding_url=args.embedding_url)
+                         embedding_url=args.embedding_url, tokenizer=tokenizer)
     reward_fn.set_pools(
         past_actions=[signal["action"] for row in rows for signal in input_signals(row["content"])],
         future_actions=[behavior["action"] for row in rows for behavior in row["future"]],
@@ -392,7 +395,8 @@ def from_val(args: argparse.Namespace) -> None:
                 "temperature": args.temperature, "top_p": args.top_p}
     (args.output_dir / "rollout_settings.json").write_text(json.dumps(settings, indent=2) + "\n", encoding="utf-8")
     print(f"Step {step}: {len(rows)} prompts, {sum(len(r['samples']) for r in rows)} answers "
-          f"-> {args.output_dir / 'rollouts.jsonl'}; next: score --output_dir {args.output_dir}")
+          f"-> {args.output_dir / 'rollouts.jsonl'}; next: score --output_dir {args.output_dir} "
+          "--checkpoint <generation_checkpoint>")
 
 
 def trend(args: argparse.Namespace) -> None:
@@ -473,6 +477,8 @@ def parse_args() -> argparse.Namespace:
                    help="trainer.validation_data_dir of the run (OUTPUT_DIR/validation)")
 
     s = sub.add_parser("score", parents=[common], help="Reward and signals of rollouts.jsonl")
+    s.add_argument("--checkpoint", required=True,
+                   help="Generation checkpoint whose tokenizer counts interest_name and topic tokens")
     s.add_argument("--embedding_model", default=DEFAULT_EMBEDDING_MODEL,
                    help="Qwen3-Embedding path of the reward, loaded in process (on a GPU when there is one)")
     s.add_argument("--embedding_url", help="A vLLM embedding server of the same model instead (as the GRPO run's: "

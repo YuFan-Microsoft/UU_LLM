@@ -9,7 +9,9 @@ data, or takes the answers a GRPO run generated at one validation step, and scor
 ## Reward (`../l1/l1_reward.py`)
 
 The reward of one answer is 0 when it breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation,
-or cut at max_tokens), else the mean of four signals, each in [0, 1], with K = 10. Only the first N interests earn
+any `interest_name` or `topic` with 7 or more generation-tokenizer tokens, or cut at max_tokens), else the mean of
+four signals, each in [0, 1], with K = 10. Token counts exclude special tokens and apply to every name and topic,
+including those not credited by retrieval; `actual_activity` has no such limit. Only the first N interests earn
 credit, but every interest written counts in precision's denominator:
 
 - `past_recall@K`: share of the user's visible input actions in the top K of one of the first N interests.
@@ -28,7 +30,7 @@ prompts' next-week actions. Every interest query ranks each pool independently.
 N = round(0.9 + 18.2 n / (33 + n)) for n input signals, the approximate SFT P90 interest count (see `../README.md`).
 
 ```python
-reward_fn = L1Reward()                     # Qwen3-Embedding + fastText language model
+reward_fn = L1Reward(tokenizer=tokenizer)   # tokenizer from the generation checkpoint, not the embedding model
 reward_fn.set_pools(past_actions, future_actions)  # all prompts' visible past / next-week actions, kept separate
 reward_fn(content, text, finish_reason, next_week_actions)["reward"]
 ```
@@ -54,7 +56,7 @@ sh run_case_study.sh <ckpt_dir>                                           # -> o
 # or step by step
 python case_study.py prepare --output_dir <out>                           # fixed subset, downloads the RL data
 python case_study.py rollout --output_dir <out> --checkpoint <ckpt_dir>   # one GPU or more
-python case_study.py score   --output_dir <out>
+python case_study.py score   --output_dir <out> --checkpoint <ckpt_dir>
 ```
 
 `prepare` is skipped by the script when `<out>/prompts.jsonl` exists, so every checkpoint run on the same output
@@ -70,7 +72,7 @@ and dumped to `<run>/validation/<step>.jsonl`. No GPU is needed to read them:
 ```bash
 python case_study.py trend --validation_dir <run>/validation --output_dir <run>/validation   # -> trend.md
 python case_study.py from_val --dump <run>/validation/300.jsonl --val_data <data>/val.parquet --output_dir outputs/<run>_val_300
-python case_study.py score --output_dir outputs/<run>_val_300                                # -> report.html
+python case_study.py score --output_dir outputs/<run>_val_300 --checkpoint <ckpt_dir>         # -> report.html
 ```
 
 `trend` has one row per validation step: the mean reward, the mean best reward of each user's 16 answers, the mean
@@ -104,7 +106,9 @@ with the `best` engine preset of `run_inference.py` by default (`--engine_preset
 Sampling defaults to temperature 1.0 / top-p 1.0, the usual GRPO rollout setting (inference uses 0.6 / 0.8). There
 are no retries: every sample is kept as generated.
 
-**score** writes per-sample signals (`scores.jsonl`), their summary (`summary.json`, also printed), `report.md` and
+**score** requires `--checkpoint` to load the same tokenizer as the generation model for the name/topic token
+limit; the wrapper passes its rollout checkpoint automatically. It writes per-sample signals (`scores.jsonl`),
+their summary (`summary.json`, also printed), `report.md` and
 `report.html`. Open `report.html` in a browser (self-contained, works offline, follows light / dark mode) to read
 every rollout's actual output (rendered, or the raw text) next to its reward signals and violations, one prompt at
 a time, with the prompt's input signals on the side (hover an interest to highlight the signals it cites and the
@@ -116,7 +120,7 @@ summary and, for the first `--report_prompts` prompts, the input signals and eve
 | --- | --- |
 | `reward` | The GRPO reward of `../l1/l1_reward.py` (above) |
 | `json_valid` | Exactly the V3 Layer-1 schema `{"interests":[{"topics":[{"evidence","topic"}],"interest_name","actual_activity"}]}` with the right value types (no topic source, intent or content locale) |
-| `rule_pass` | The in-training rollout judgement (`user_profile_rules.score_example`) and not cut at max_tokens: JSON-valid and no violation (empty text, duplicate interest / topic name, evidence not a non-empty list of existing idx, duplicate evidence idx, 40+ interests, `wrong_language`: most interests' `actual_activity` not in the language of the actions they cite, `truncated`) |
+| `rule_pass` | The shared GRPO judgement: JSON-valid and no violation (`user_profile_rules.score_example`, `truncated`, `interest_name_too_long` / `topic_too_long` for any name or topic with 7+ generation-tokenizer tokens) |
 | `n_interests` | Number of interests written (only the first N earn credit; all count in both precision denominators) |
 | `coverage` | Share of the input indices cited by the first N interests (diagnostic only, not in the reward) |
 | `past_recall@K` | Share of this user's visible input actions in the top K of one of the first N interests |

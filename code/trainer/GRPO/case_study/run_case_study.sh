@@ -23,6 +23,6 @@ if [ ! -f "$OUTPUT_DIR/prompts.jsonl" ]; then
 fi
 python case_study.py rollout --output_dir "$OUTPUT_DIR" --seed "$SEED" --checkpoint "$CHECKPOINT" \
   --n "${N:-16}" --temperature "${TEMPERATURE:-1.0}" --top_p "${TOP_P:-1.0}"
-python case_study.py score --output_dir "$OUTPUT_DIR" --seed "$SEED" \
+python case_study.py score --output_dir "$OUTPUT_DIR" --seed "$SEED" --checkpoint "$CHECKPOINT" \
   --embedding_model "${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B}"
 echo "Open $OUTPUT_DIR/report.html"

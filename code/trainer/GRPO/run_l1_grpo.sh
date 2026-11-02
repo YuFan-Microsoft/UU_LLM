@@ -146,7 +146,7 @@ N_TRAIN_GPUS=$(echo "$TRAIN_GPUS" | tr ',' '\n' | grep -c .)
 echo "Reward embeddings at $EMBEDDING_URL; training on GPUs $TRAIN_GPUS"
 
 # Check reward dependencies before starting Ray.
-python3 - "$DATA_DIR" "$EMBEDDING_URL" "$EMBEDDING_MODEL" <<'EOF'
+python3 - "$DATA_DIR" "$EMBEDDING_URL" "$EMBEDDING_MODEL" "$CHECKPOINT" <<'EOF'
 import json, sys
 sys.path.insert(0, "l1")
 try:
@@ -158,15 +158,19 @@ import pyarrow.parquet as pq
 # Import reward first to expose the inference rules.
 from verl_reward import compute_score
 import user_profile_rules
+from verl.utils import hf_tokenizer
+from verl.utils.fs import copy_to_local
 
 user_profile_rules.language_tools()  # downloads lid.176.bin once, before the reward workers need it
-data_dir, url, model = sys.argv[1:]
+data_dir, url, model, checkpoint = sys.argv[1:]
+tokenizer = hf_tokenizer(copy_to_local(checkpoint), trust_remote_code=True)
 row = pq.read_table(f"{data_dir}/val.parquet").to_pylist()[0]
 answer = json.dumps({"interests": [{"topics": [{"evidence": [0], "topic": "test"}], "interest_name": "Test",
                                     "actual_activity": "Test"}]})
 for text in ("not json", answer):
     result = compute_score(row["data_source"], text, row["reward_model"]["ground_truth"], row["extra_info"],
-                           f"{data_dir}/pools.parquet", embedding_url=url, embedding_model=model)
+                           f"{data_dir}/pools.parquet", tokenizer=tokenizer,
+                           embedding_url=url, embedding_model=model)
     print(f"Preflight reward of {text[:20]!r}: {result}", flush=True)
 EOF
 

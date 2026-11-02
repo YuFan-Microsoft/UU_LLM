@@ -47,7 +47,7 @@ async def _call_with_kwargs_async(raw_fn, extra_kwargs, *args, **kwargs):
     return await raw_fn(*args, **merged_kwargs)
 
 
-def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
+def get_custom_reward_fn(config: DictConfig, tokenizer: Any = None) -> Optional[RawRewardFn]:
     """Load and return a custom reward function from external file.
 
     Dynamically imports a reward function from a specified file path and wraps
@@ -56,6 +56,8 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
     Args:
         config (dict): Configuration dictionary containing custom_reward_function
                       settings with 'path', 'name', and 'reward_kwargs' fields.
+        tokenizer: Worker-local generation tokenizer, injected only into callbacks
+                   that explicitly declare a keyword-compatible ``tokenizer`` parameter.
 
     Returns:
         callable or None: Wrapped reward function with merged kwargs, or None
@@ -80,6 +82,12 @@ def get_custom_reward_fn(config: DictConfig) -> Optional[RawRewardFn]:
     raw_fn = load_extern_object(module_path=module_path, object_name=fn_name)
 
     reward_kwargs = dict(reward_fn_config.get("reward_kwargs", {}))
+    tokenizer_param = inspect.signature(raw_fn).parameters.get("tokenizer")
+    if tokenizer is not None and tokenizer_param is not None and tokenizer_param.kind in (
+        inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        inspect.Parameter.KEYWORD_ONLY,
+    ):
+        reward_kwargs["tokenizer"] = tokenizer
     if not inspect.iscoroutinefunction(raw_fn):
         return partial(_call_with_kwargs, raw_fn, reward_kwargs)
     else:
@@ -123,7 +131,7 @@ def load_reward_manager(config: DictConfig, tokenizer: Any, **reward_kwargs: Any
 
     # Try to get a custom reward function based on the configuration
     # user defined reward manager can be registered in custom_reward_fn
-    compute_score = get_custom_reward_fn(config)
+    compute_score = get_custom_reward_fn(config, tokenizer=tokenizer)
     final_compute_score = compute_score
 
     reward_manager_cfg: RewardManagerConfig = config.reward.reward_manager

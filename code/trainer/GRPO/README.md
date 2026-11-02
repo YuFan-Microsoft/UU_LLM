@@ -24,8 +24,17 @@ GRPO/
 
 ## Reward
 
-0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, cut at the response
-length), else the mean of four signals, each in [0, 1]. **Only the first N interests earn credit, but every
+0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, any `interest_name` or
+`topic` with **7 or more tokens**, cut at the response length), else the mean of four signals, each in [0, 1].
+The label-length rule uses the **generation checkpoint's tokenizer**, with `add_special_tokens=False`, not the
+embedding tokenizer. Every name and every topic is checked, including interests beyond the credit cap and topics
+not selected for retrieval. A violation sets `rule_pass=False` and the entire rollout's reward to 0
+(`interest_name_too_long` / `topic_too_long`); retrieval diagnostics remain available for JSON-valid answers.
+`actual_activity` is not subject to this token limit. The vendored reward loader passes each worker's already-loaded
+generation tokenizer (including `model.tokenizer_path` overrides and node-local path resolution). The scorer keeps
+one private copy per process, isolated from concurrent response decoding; it does not reload the checkpoint or
+multimodal processor. Sync `verl/trainer/ppo/reward.py` together with the L1 reward code on every Ray node.
+**Only the first N interests earn credit, but every
 interest written counts in precision's denominator:**
 
 - `past_recall@10`: share of the user's visible input actions in the top 10 of one of the first N interests;
@@ -226,7 +235,7 @@ cd case_study
 python case_study.py trend --validation_dir ../outputs/<run>/validation --output_dir ../outputs/<run>/validation
 python case_study.py from_val --dump ../outputs/<run>/validation/300.jsonl \
     --val_data ../outputs/data/<data>/val.parquet --output_dir outputs/<run>_val_300
-python case_study.py score --output_dir outputs/<run>_val_300   # report.html of step 300
+python case_study.py score --output_dir outputs/<run>_val_300 --checkpoint <ckpt_dir>   # report.html of step 300
 ```
 
 `trend.md` has one row per validation step (reward, best of 16, each signal, answer length); watch `n_interests`
