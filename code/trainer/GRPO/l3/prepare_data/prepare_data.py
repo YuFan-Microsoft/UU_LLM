@@ -24,7 +24,7 @@ from l1.rl_data import DEFAULT_CHECKPOINT, HF_REPO, hf_token  # noqa: E402
 from run_inference import ENGINE_PRESETS, engine_kwargs  # noqa: E402
 from utils import MAX_MODEL_LEN, build_prompt_ids, dumps, generate, visible_gpus  # noqa: E402
 
-FORMAT_VERSION = 2
+FORMAT_VERSION = 3
 HF_CONFIG = "User_Profile_Layer3_For_RL_V1"
 
 
@@ -192,17 +192,18 @@ def worker(rank: int, args: argparse.Namespace, locations: list[Location], desti
         for start in range(0, len(locations), args.prepare_batch_size):
             batch = locations[start:start + args.prepare_batch_size]
             records = [load_location(location) for location in batch]
-            snapshots, rejected, calls = build_profiles(records, encode, run_round)
+            snapshots, rejected, _ = build_profiles(records, encode, run_round)
             for location, record in zip(batch, records):
                 reason, row = rejected.get(record.user_id), None
                 if reason is None:
                     row, reason = make_example(record, snapshots.get(record.user_id, {}),
                                                encode, args.max_prompt_length)
+                event = {"index": location.index, "split": location.split,
+                         "user_id": location.user_id, "source_file": record.source_file,
+                         "source_line": location.line, "reason": reason, "row": row}
                 if row is not None:
-                    row["extra_info"]["upstream_calls_json"] = dumps(calls[record.user_id])
-                output.write(dumps({"index": location.index, "split": location.split,
-                                    "user_id": location.user_id, "source_file": record.source_file,
-                                    "source_line": location.line, "reason": reason, "row": row}) + "\n")
+                    event["past_actions"] = list(dict.fromkeys(item["action"] for item in record.past))
+                output.write(dumps(event) + "\n")
             output.flush()
             print(f"GPU worker {rank}: {min(start + len(batch), len(locations))}/{len(locations)} users", flush=True)
 
@@ -263,18 +264,17 @@ def write_outputs(args: argparse.Namespace, paths: list[Path], directory: Path, 
         rejected = stack.enter_context((directory / "discarded.jsonl").open("w", encoding="utf-8"))
 
         def flush(split: str) -> None:
-            rows = buffers[split]
-            if not rows:
+            batch = buffers[split]
+            if not batch:
                 return
-            writers[split].writelines(dumps(row) + "\n" for row in rows)
-            pool = {"batch_id": rows[0]["extra_info"]["batch_id"], "split": split,
-                    "past_actions": list(dict.fromkeys(action for row in rows
-                                                      for action in row["extra_info"]["past_actions"])),
-                    "future_actions": list(dict.fromkeys(action for row in rows
-                                                        for action in row["reward_model"]["ground_truth"]))}
+            writers[split].writelines(dumps(event["row"]) + "\n" for event in batch)
+            pool = {"batch_id": f"{split}-{counts[split]['batches']:06d}", "split": split,
+                    "past_actions": list(dict.fromkeys(action for event in batch for action in event["past_actions"])),
+                    "future_actions": list(dict.fromkeys(behavior["action"] for event in batch
+                                                        for behavior in event["row"]["future_behaviors"]))}
             pools.write(dumps(pool) + "\n")
             counts[split]["batches"] += 1
-            rows.clear()
+            batch.clear()
 
         def events(stream):
             return (json.loads(line) for line in stream if line.strip())
@@ -288,9 +288,7 @@ def write_outputs(args: argparse.Namespace, paths: list[Path], directory: Path, 
                 counts[split]["discarded"][event["reason"]] += 1
                 rejected.write(dumps({key: value for key, value in event.items() if key != "row"}) + "\n")
                 continue
-            index = counts[split]["rows"]
-            row["extra_info"].update(index=index, split=split, batch_id=f"{split}-{index // args.batch_size:06d}")
-            buffers[split].append(row)
+            buffers[split].append(event)
             counts[split]["rows"] += 1
             if len(buffers[split]) == args.batch_size:
                 flush(split)

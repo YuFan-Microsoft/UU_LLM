@@ -175,12 +175,45 @@ class PreparationTest(unittest.TestCase):
             row, reason = pipeline.make_example(record, snapshots[record.user_id], fake.encode, 100)
             self.assertIsNone(reason)
             self.assertIsNotNone(row)
-            self.assertEqual(row["reward_model"]["ground_truth"], ["FUTURE_ONLY"])
-            self.assertNotIn("FUTURE_ONLY", row["prompt"][0]["content"])
+            self.assertEqual(set(row), {"prompt", "future_behaviors"})
+            self.assertIsInstance(row["prompt"], str)
+            self.assertEqual(row["future_behaviors"], [{"date": record.cutoff.isoformat(),
+                                                      "source": "Bing", "action": "FUTURE_ONLY"}])
+            self.assertNotIn("FUTURE_ONLY", row["prompt"])
             payload = pipeline.layer3.COMMERCIAL.payload(pipeline.layer3.active_interests(snapshots[record.user_id]))
-            self.assertEqual(row["prompt"][0]["content"], pipeline.layer3.COMMERCIAL.message(payload))
-            self.assertEqual(len(row["extra_info"]["past_actions"]), 4)
+            self.assertEqual(row["prompt"], pipeline.COMMERCIAL_PROMPT + "\nInput:\n" + pipeline.dumps(payload))
             self.assertEqual(len(calls[record.user_id]), 7)
+
+    def test_prompt_uses_repository_root_template_not_inference_copy(self):
+        prompt_file = Path(pipeline.__file__).resolve().parents[5] / "prompts" / "prompt_l3_commercial.md"
+        with patch.object(pipeline.layer3.COMMERCIAL, "prompt", "DO NOT USE THIS INFERENCE COPY"):
+            row = prepared()
+        prefix = prompt_file.read_text(encoding="utf-8") + "\nInput:\n"
+        self.assertTrue(row["prompt"].startswith(prefix))
+        payload = json.loads(row["prompt"][len(prefix):])
+        self.assertEqual(set(payload), {"interests"})
+        self.assertEqual(set(payload["interests"][0]), {"interest_name", "actual_activity", "sources", "topics"})
+        self.assertEqual(set(payload["interests"][0]["topics"][0]), {"topic", "actions"})
+
+    def test_future_behaviors_retain_dates_and_sources_without_internal_fields(self):
+        raw = monthly_row()
+        raw["future_behaviors"] = [
+            {"date": "2026-11-01", "source": "Bing", "action": 'FUTURE_ONLY "quoted"\nnext',
+             "detailed_source": "not exported"},
+            {"date": "2026-11-02", "source": "Bing", "action": "OTHER_FUTURE_ONLY"},
+        ]
+        record = pipeline.parse_record(raw, "input", 1)
+        fake = FakeInference()
+        snapshots, _, _ = pipeline.build_profiles([record], fake.encode, fake.run)
+        row, reason = pipeline.make_example(record, snapshots["user"], fake.encode, 100)
+        self.assertIsNone(reason)
+        self.assertEqual(row["future_behaviors"], [
+            {key: behavior[key] for key in ("date", "source", "action")} for behavior in raw["future_behaviors"]
+        ])
+        self.assertNotIn("FUTURE_ONLY", row["prompt"])
+        line = pipeline.dumps(row)
+        self.assertNotIn("\n", line)
+        self.assertEqual(json.loads(line), row)
 
     def test_failed_or_truncated_upstream_is_not_backfilled(self):
         record = pipeline.parse_record(monthly_row(), "input", 1)
@@ -248,7 +281,10 @@ class PreparationTest(unittest.TestCase):
             events = [json.loads(line) for line in (root / "worker.jsonl").read_text().splitlines()]
             self.assertEqual(len(events), 2)
             self.assertTrue(all(event["reason"] is None for event in events))
-            self.assertTrue(all(event["row"]["data_source"] == pipeline.DATA_SOURCE for event in events))
+            self.assertTrue(all(set(event["row"]) == {"prompt", "future_behaviors"} for event in events))
+            self.assertTrue(all(isinstance(event["row"]["prompt"], str) for event in events))
+            self.assertTrue(all(event["past_actions"] == [f"past-{week}" for week in range(4)] for event in events))
+            self.assertTrue(all("past_actions" not in event["row"] for event in events))
             self.assertTrue(all("FUTURE_ONLY" not in text for text in fake.prompts.values()))
 
 
@@ -274,11 +310,11 @@ class ExportTest(unittest.TestCase):
                        "row": None if i == 2 else prepared(str(i))} for i in range(5)]
             for event in events:
                 if event["row"]:
-                    event["row"]["extra_info"]["past_actions"] = [f"past-{event['user_id']}"]
-                    event["row"]["reward_model"]["ground_truth"] = [f"future-{event['user_id']}"]
+                    event["past_actions"] = [f"past-{event['user_id']}"]
+                    event["row"]["future_behaviors"] = [{"date": "2026-11-01", "source": "Bing",
+                                                        "action": f"future-{event['user_id']}"}]
             content = "Example \u4e2d\u6587\nwith newline"
-            events[0]["row"]["prompt"][0]["content"] = content
-            events[0]["row"]["extra_info"]["content"] = content
+            events[0]["row"]["prompt"] = content
             paths = [root / "worker-0.jsonl", root / "worker-1.jsonl"]
             for rank, path in enumerate(paths):
                 path.write_text("".join(json.dumps(event) + "\n" for event in events[rank::2]), encoding="utf-8")
@@ -288,22 +324,24 @@ class ExportTest(unittest.TestCase):
             train = read_jsonl(root / "train.jsonl")
             test = read_jsonl(root / "test.jsonl")
             pools = read_jsonl(root / "pools.jsonl")
-            self.assertEqual([row["extra_info"]["user_id"] for row in train], ["0", "1", "3"])
-            self.assertEqual([row["extra_info"]["user_id"] for row in test], ["4"])
-            self.assertEqual([row["extra_info"]["batch_id"] for row in train],
-                             ["train-000000", "train-000000", "train-000001"])
+            self.assertEqual([row["future_behaviors"][0]["action"] for row in train],
+                             ["future-0", "future-1", "future-3"])
+            self.assertEqual([row["future_behaviors"][0]["action"] for row in test], ["future-4"])
             by_id = {pool["batch_id"]: pool for pool in pools}
+            self.assertEqual(by_id["train-000000"]["past_actions"], ["past-0", "past-1"])
+            self.assertEqual(by_id["train-000000"]["future_actions"], ["future-0", "future-1"])
             self.assertEqual(by_id["test-000000"]["past_actions"], ["past-4"])
             self.assertEqual(by_id["train-000001"]["future_actions"], ["future-3"])
             self.assertEqual(meta["splits"]["train"]["last_batch_size"], 1)
             self.assertEqual(meta["splits"]["train"]["discarded"], {"prompt_too_long": 1})
             self.assertEqual(len((root / "discarded.jsonl").read_text().splitlines()), 1)
             self.assertEqual(len(pools), 3)
-            self.assertEqual(train[0]["prompt"][0]["content"], content)
-            expected = events[0]["row"]
-            expected["extra_info"].update(index=0, split="train", batch_id="train-000000")
-            self.assertEqual(train[0], expected)
-            self.assertEqual(meta["format_version"], 2)
+            self.assertEqual(train[0]["prompt"], content)
+            self.assertEqual(train[0], events[0]["row"])
+            self.assertTrue(all(set(row) == {"prompt", "future_behaviors"} for row in train + test))
+            self.assertTrue(all(isinstance(row["prompt"], str) for row in train + test))
+            self.assertEqual(len((root / "train.jsonl").read_text().splitlines()), len(train))
+            self.assertEqual(meta["format_version"], 3)
             self.assertEqual(meta["output_format"], "jsonl")
             self.assertEqual(list(root.glob("*.parquet")), [])
 
@@ -332,6 +370,8 @@ class ExportTest(unittest.TestCase):
                     event = {"index": 0, "split": "train", "user_id": "user-0", "source_file": "synthetic",
                              "source_line": 1, "reason": "prompt_too_long" if discard else None,
                              "row": None if discard else prepared("user-0")}
+                    if not discard:
+                        event["past_actions"] = [f"past-{week}" for week in range(4)]
                     path.write_text(json.dumps(event) + "\n", encoding="utf-8")
                     return [path]
 
@@ -404,7 +444,9 @@ class HFInputTest(unittest.TestCase):
                                                            fake.encode, settings.max_prompt_length)
                         stream.write(json.dumps({"index": location.index, "split": location.split,
                                                  "user_id": record.user_id, "source_file": record.source_file,
-                                                 "source_line": record.line, "reason": reason, "row": row}) + "\n")
+                                                 "source_line": record.line, "reason": reason, "row": row,
+                                                 "past_actions": list(dict.fromkeys(item["action"]
+                                                                                   for item in record.past))}) + "\n")
                 return [path]
 
             with patch.dict(sys.modules, {"huggingface_hub": hub}), \
@@ -428,7 +470,9 @@ class HFInputTest(unittest.TestCase):
                                 for path in observed["source_paths"]))
             self.assertEqual([item["path"] for item in meta["inputs"]], observed["source_paths"])
             train = read_jsonl(output / "train.jsonl")[0]
-            self.assertEqual(train["extra_info"]["source_file"], observed["source_paths"][0])
+            self.assertEqual(set(train), {"prompt", "future_behaviors"})
+            self.assertEqual(train["future_behaviors"], [{"date": "2026-11-01", "source": "Bing",
+                                                        "action": "FUTURE_ONLY"}])
             self.assertNotIn("unit-test-token", (output / "meta.json").read_text())
             self.assertEqual({path.name for path in output.iterdir()},
                              {"train.jsonl", "test.jsonl", "pools.jsonl", "discarded.jsonl", "meta.json"})

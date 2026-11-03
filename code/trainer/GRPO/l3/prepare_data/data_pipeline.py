@@ -12,11 +12,11 @@ sys.path.insert(0, str(INFERENCE_DIR))
 import layer1  # noqa: E402
 import layer2  # noqa: E402
 import layer3  # noqa: E402
-from utils import SOURCE_RANK, dedupe, dumps, load_users, new_item  # noqa: E402
+from utils import INPUT_MARKER, SOURCE_RANK, dedupe, dumps, load_users, new_item  # noqa: E402
 
 Encoder = Callable[[str], list[int]]
 RoundRunner = Callable[[list[dict], Callable[[dict], bool], str], None]
-DATA_SOURCE = "user_profile_l3_commercial"
+COMMERCIAL_PROMPT = (INFERENCE_DIR.parents[1] / "prompts" / "prompt_l3_commercial.md").read_text(encoding="utf-8")
 MAX_PROMPT_LENGTH = 25600 - 8192
 
 
@@ -147,31 +147,18 @@ def build_profiles(records: list[MonthlyRecord], encode: Encoder, run_round: Rou
 
 def make_example(record: MonthlyRecord, snapshot: dict, encode: Encoder, max_prompt_length: int
                  ) -> tuple[dict | None, str | None]:
-    """One full Commercial prompt, never a shortened payload or a collection of chunks."""
+    """A plain Commercial prompt and next-week behavior labels, without chat wrappers or training metadata."""
     interests = layer3.active_interests(snapshot)
     if not interests:
         return None, "empty_profile"
     if len(interests) > layer3.MAX_COMMERCIAL_INTERESTS:
         return None, "too_many_interests"
     payload = layer3.COMMERCIAL.payload(interests)
-    content = layer3.COMMERCIAL.message(payload)
+    content = COMMERCIAL_PROMPT + INPUT_MARKER + dumps(payload)
     prompt_ids = encode(content)
     if len(prompt_ids) > max_prompt_length:
         return None, "prompt_too_long"
-    visible = list(dict.fromkeys(action for interest in payload["interests"]
-                                for topic in interest["topics"] for action in topic["actions"]))
     return {
-        "data_source": DATA_SOURCE,
-        "prompt": [{"role": "user", "content": content}],
-        "ability": "user_profile",
-        "reward_model": {"style": "rule", "ground_truth": [item["action"] for item in record.future]},
-        "extra_info": {
-            "user_id": record.user_id, "content": content, "prompt_tokens": len(prompt_ids),
-            "history_start": record.history_start.isoformat(), "cutoff": record.cutoff.isoformat(),
-            "future_end": (record.cutoff + timedelta(days=7)).isoformat(), "n_interests": len(interests),
-            "past_actions": list(dict.fromkeys(item["action"] for item in record.past)),
-            "visible_past_actions": visible, "past_behaviors_json": dumps(record.past),
-            "future_behaviors_json": dumps(record.future), "profile_json": dumps(snapshot),
-            "upstream_calls_json": "[]", "source_file": record.source_file, "source_line": record.line,
-        },
+        "prompt": content,
+        "future_behaviors": [{key: item[key] for key in ("date", "source", "action")} for item in record.future],
     }, None

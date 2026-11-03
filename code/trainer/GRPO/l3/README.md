@@ -20,7 +20,9 @@ For each user, a fixed checkpoint extracts L1 interests separately for the four
 historical weeks, then L2 merges them chronologically. The script reuses the actual
 [inference helpers](../../../inference), including cleaning, weekly signal
 deduplication/capping, L2 confidence and evidence processing, and the L3 Commercial
-prompt/payload.
+payload. The final prompt uses the repository-root
+[prompt_l3_commercial.md](../../../../prompts/prompt_l3_commercial.md), followed by
+`\nInput:\n` and the minified interest payload, matching the HF Commercial user-message layout.
 
 It **does not generate any L3 or L4 answers**. The future week is used only as stored
 retrieval targets; it never enters upstream inference or the L3 prompt.
@@ -169,15 +171,16 @@ download an embedding or language-ID model.
 
 ## Outputs
 
-- `train.jsonl`, `test.jsonl`: one JSON object per retained user, containing the L3 prompt, future
-  ground truth, and `extra_info` with dates, provenance, all monthly past actions,
-  visible evidence actions, the fixed upstream profile, and upstream call metrics.
-  Cleaned history/future records and the profile are stored as JSON strings in
-  `extra_info`; the existing prepared row fields are unchanged.
+- `train.jsonl`, `test.jsonl`: one JSON object per retained user, with exactly two fields:
+  - `prompt`: a string containing the complete L3 Commercial instructions and interest payload.
+  - `future_behaviors`: a list of next-week behavior objects, each with `date`, `source`, and `action`.
+    Existing cleaning and action deduplication apply; the latest occurrence of a repeated action is kept.
+  There are no `role`/`content` wrappers, assistant answers, `reward_model`, or `extra_info` fields.
   Debug mode writes only `train.jsonl`.
 - `pools.jsonl`: independent past/future action pools for each task-local split
-  batch, one JSON object per batch. Past pools use the full cleaned month. Visible
-  evidence actions are stored separately in each example for future reward choices.
+  batch, one JSON object per batch. Past pools still use the full cleaned month,
+  carried in temporary worker events rather than the final examples. Future pools
+  contain the distinct `action` values from the batch's `future_behaviors`.
 - `discarded.jsonl`: user, source location, and reason for each discarded example.
 - `meta.json`: input-record hashes, HF repository/configuration/pinned commit when
   applicable, checkpoint/settings, split counts, discard counts, and batch layout.
@@ -186,32 +189,33 @@ download an embedding or language-ID model.
   marked as hashes of the read prefix rather than of unread file contents.
 
 All example and pool outputs are UTF-8 JSONL, not Parquet. Metadata remains a single
-`meta.json` document with `format_version: 2` and `output_format: "jsonl"`.
+`meta.json` document with `format_version: 3` and `output_format: "jsonl"`.
 PyArrow is used only to read HF Parquet inputs; local JSONL preparation/export does
-not require it. Existing Parquet outputs are not converted or overwritten.
+not require it. Existing Parquet or version-2 outputs are not converted or overwritten;
+generate this compact schema into a new output directory.
 
 **These are L3 inputs, not generated L3 answers.** An abbreviated prepared row is:
 
 ```json
 {
-  "prompt": [{"role": "user", "content": "<L3 Commercial instructions plus the monthly interest profile>"}],
-  "reward_model": {"style": "rule", "ground_truth": ["<next-week action>"]},
-  "extra_info": {
-    "user_id": "example-user",
-    "past_actions": ["<historical action>"],
-    "visible_past_actions": ["<evidence action shown to L3>"],
-    "profile_json": "<saved L1/L2 profile as JSON>"
-  }
+  "prompt": "<complete L3 Commercial instructions>\nInput:\n<interest payload JSON>",
+  "future_behaviors": [
+    {"date": "2026-11-01", "source": "Bing", "action": "<actual next-week action>"}
+  ]
 }
 ```
 
-During later training, the policy receives `prompt`, generates the L3 Commercial
-answer, and the reward uses the stored actions/pools to score it. Future actions
-are stored alongside the prompt for scoring, never inside the prompt itself.
+The actual export contains complete text rather than placeholders and writes each object
+on one physical line; newlines inside strings are escaped.
+During later training, wrap only `prompt` as `{"role": "user", "content": row["prompt"]}`
+and apply the generation tokenizer's chat template. The policy generates the L3 Commercial
+answer; the reward takes distinct `action` strings from `future_behaviors` and uses
+the recorded pools to score it. Never include future behaviors in the model input.
 
 Final partial batches are **retained**, not silently dropped to round 20K down to a
 multiple of 64. The eventual trainer must preserve row order, use the recorded batch
-size, keep partial batches, and route reward lookup by `extra_info.batch_id`.
+size, and keep partial batches. For zero-based row index `i` within a split, the pool
+ID is `f"{split}-{i // batch_size:06d}"`; no per-example batch metadata is needed.
 Do not shuffle or filter these JSONL rows without rebuilding their pools.
 
 ## CPU tests
@@ -224,7 +228,8 @@ python3 -m unittest l3.prepare_data.test_prepare_data -v
 
 Tests use deterministic fake model outputs and real inference postprocessing.
 They cover date boundaries, no future leakage, per-user calendars, failed upstream
-answers, prompt/interest limits, train/test user isolation, JSONL output,
+answers, prompt/interest limits, train/test user isolation, the exact two-field JSONL schema,
+repository-root prompt selection, future date/source retention,
 and partial retrieval batches. HF integration tests mock network downloads while
 using real Parquet input conversion and JSONL export. They do not download checkpoints or
 require GPUs.

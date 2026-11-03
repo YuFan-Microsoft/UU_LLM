@@ -272,9 +272,16 @@ L3 preparation outputs `train.jsonl`, `test.jsonl`, and `pools.jsonl`, with one
 example or retrieval pool per line. Debug mode produces only the train split.
 Discard records use `discarded.jsonl`, while run metadata remains in `meta.json`.
 The HF input files are still Parquet; prepared outputs are not.
+The prepared L3 example schema (format version 3) is deliberately minimal:
+`{"prompt": "<complete Commercial prompt string>", "future_behaviors": [{"date": "...", "source": "...", "action": "..."}]}`.
+The prompt reads the repository-root `prompts/prompt_l3_commercial.md` and appends the interest payload.
+There are no chat-message wrappers, generated L3 answers, or per-row training metadata.
+Future behavior labels remain outside the prompt. Pool IDs are derived from split and retained-row batch index;
+past candidate actions remain in `pools.jsonl`, not in each compact example.
 
 Preserve the existing Layer 1 `user_id`, `past_behaviors`, and `future_behaviors`
-interface where practical. Both task datasets should retain:
+interface where practical. The selected input records and upstream materialization records
+(rather than the compact prepared L3 examples) should retain:
 
 - Task and split.
 - User ID and a stable user-window example ID.
