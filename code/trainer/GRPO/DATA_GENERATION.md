@@ -22,7 +22,12 @@ behavior history.
   quota. A separate validation set, if needed, requires its own size decision.
 - The training scope is Layer 1 and Layer 3 Commercial only. Other tasks may be used
   as fixed preprocessing components, but are not additional training objectives.
-- This is a generation plan, not an implemented pipeline.
+- Rule-based corpus selection remains a plan. Preparation of already selected L3
+  monthly records is implemented in [l3/prepare_data.py](l3/prepare_data.py).
+
+The table gives selection quotas. L3 preparation discards users whose final input
+does not fit, rather than splitting them or selecting replacement data; prepared
+counts can therefore be below 20K train / 2K test. Record all discards explicitly.
 
 The guiding principle is to require sufficient information, sustained activity, and
 usable future targets, then sample randomly among eligible users and windows.
@@ -162,9 +167,10 @@ Run the following separately for the training and test split of each task:
    **2,000 for test**, per task.
 3. For each selected user, choose one eligible window uniformly with a fixed seed.
 4. Materialize the task input and validate final eligibility.
-5. If materialization makes a window ineligible, try the user's remaining windows
-   in reproducible random order. If none qualify, continue to another eligible user
-   from the same split's reproducible reserve order.
+5. For Layer 1, if materialization makes a window ineligible, try the user's
+   remaining windows in reproducible random order, then the same split's reserve
+   users if needed. For Layer 3, discard an unusable selected sample and report the
+   reduced prepared count; do not split it or automatically replace it.
 
 Do not sample uniformly from all candidate windows first: that would give users
 with more qualifying windows a higher chance of selection.
@@ -194,6 +200,12 @@ not need to generate candidate answers to select these windows.
 
 ### Layer 3 Commercial
 
+The preparation command reads the selected train/test Parquet shards from
+`yufan/user_profile_dataset`, configuration `User_Profile_Layer3_For_RL_V1`, by
+default. It pins the HF revision, fetches only that configuration's data shards,
+and then runs frozen upstream inference. Local JSONL remains supported through
+`--data_dir`; see [the L3 instructions](l3/README.md).
+
 Preserve the current structured input in
 [`Commercial.payload`](../../inference/layer3.py), rather than replacing it with
 a raw month of actions:
@@ -213,8 +225,8 @@ Selected 28-day history
 - Never include the target week or later events in upstream generation.
 - Layer 2 is a preprocessing dependency, not an additional RL training task.
 - Do not generate several Layer 3 answers and select windows by their performance.
-- Report empty or unusable upstream profiles explicitly and use the reproducible
-  reserve process to maintain the final quota.
+- Report and discard empty or unusable upstream profiles explicitly; do not hide
+  their removal or refill from a different window.
 
 The intended Layer 3 retrieval representation is `predicted_queries`. Its history
 retrieval target covers the selected 28 days, and its future target covers the next
@@ -225,10 +237,10 @@ The exact Layer 3 reward and query-count controls remain a separate implementati
 decision. A retrieval reward alone does not establish correctness of commercial
 flags, funnel stages, or extracted entities.
 
-Preserve existing prompt budgets and commercial-interest chunking. If a monthly
-profile needs multiple model requests, keep them associated with one logical
-user-window example; do not silently count chunks as additional users/examples.
-Trainer support for this distinction must be settled before materialization.
+Preserve the existing single-request limit of 30 commercial interests and the
+target training prompt budget. If the full active-interest payload exceeds either
+limit, discard the sample. Do not chunk it, trim its final interest list, or count
+one user as multiple training examples. Each surviving user produces one prompt.
 
 ## 7. Retrieval pools and training integration
 
@@ -245,8 +257,8 @@ Trainer support for this distinction must be settled before materialization.
 The current SFT mixture and GRPO SFT replay include eight tasks; creating these two
 datasets does not change that configuration. If replay is retained, restrict its
 training objectives to the agreed task scope as a separate training change. The
-current RL preparation and reward entry point are Layer 1-specific; Layer 3
-preparation, task routing, and reward support must be implemented explicitly.
+current reward entry point is Layer 1-specific. Layer 3 preparation is available
+separately; training/task routing and reward support remain to be implemented.
 
 Task selection does not freeze other capabilities: the layer names refer to tasks
 served by a shared model, not independently trainable parameter blocks.
@@ -288,15 +300,17 @@ generation only for selected candidates and any required reserve replacements.
 
 Before accepting the datasets, verify:
 
-- Exactly **20,000 training examples and 20,000 distinct users per task**.
-- Exactly **2,000 test examples and 2,000 distinct test users per task**, generated
-  using the same rules and preparation procedure as training examples.
+- Selected inputs contain **20,000 training examples and 20,000 distinct users per
+  task**, plus **2,000 test examples and 2,000 distinct test users per task**.
+- For L3 prepared outputs, each selected input is accounted for as one retained
+  example or one explicit discard; no chunks, duplicate users, or silent refills.
+- Test inputs use the same rules and preparation procedure as training inputs.
 - No user overlap between train, validation, and test, across either task.
 - Every selected example passes its recorded eligibility rules.
 - Correct interval boundaries, complete observation coverage, and no future data
   in prompts or upstream profiles.
 - Correct window-local deduplication and source attribution.
-- Layer 1 prompt/target alignment and explicit Layer 3 chunk handling.
+- Layer 1 prompt/target alignment and one full L3 prompt per retained user.
 - Reproducible selection under the same input snapshot, settings, and seed.
 
 Report candidate/user pass rates by rule, selected cutoff dates, distinct-action
