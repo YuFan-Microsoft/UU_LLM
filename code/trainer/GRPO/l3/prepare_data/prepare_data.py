@@ -1,4 +1,4 @@
-"""HF monthly train/test data (or local JSONL) -> frozen L1/L2 inference -> L3 Commercial GRPO parquet."""
+"""HF monthly train/test data (or local JSONL) -> frozen L1/L2 inference -> L3 Commercial GRPO JSONL."""
 
 import argparse
 from collections import Counter
@@ -24,7 +24,7 @@ from l1.rl_data import DEFAULT_CHECKPOINT, HF_REPO, hf_token  # noqa: E402
 from run_inference import ENGINE_PRESETS, engine_kwargs  # noqa: E402
 from utils import MAX_MODEL_LEN, build_prompt_ids, dumps, generate, visible_gpus  # noqa: E402
 
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 HF_CONFIG = "User_Profile_Layer3_For_RL_V1"
 
 
@@ -249,52 +249,30 @@ def run_workers(args: argparse.Namespace, locations: list[Location], directory: 
     return paths
 
 
-def row_schema():
-    import pyarrow as pa
-
-    strings = ("user_id", "split", "batch_id", "content", "history_start", "cutoff", "future_end",
-               "past_behaviors_json", "future_behaviors_json", "profile_json", "upstream_calls_json", "source_file")
-    integers = ("index", "prompt_tokens", "n_interests", "source_line")
-    extra = [(name, pa.string()) for name in strings] + [(name, pa.int64()) for name in integers]
-    extra += [(name, pa.list_(pa.string())) for name in ("past_actions", "visible_past_actions")]
-    return pa.schema([
-        ("data_source", pa.string()), ("ability", pa.string()),
-        ("prompt", pa.list_(pa.struct([("role", pa.string()), ("content", pa.string())]))),
-        ("reward_model", pa.struct([("style", pa.string()), ("ground_truth", pa.list_(pa.string()))])),
-        ("extra_info", pa.struct(extra)),
-    ])
-
-
 def write_outputs(args: argparse.Namespace, paths: list[Path], directory: Path, inputs: list[dict],
                   source_metadata: dict | None = None) -> dict:
-    """Merge GPU outputs in input order and preserve partial final batches instead of dropping users."""
-    import pyarrow as pa
-    import pyarrow.parquet as pq
-
-    schema = row_schema()
-    pool_schema = pa.schema([("batch_id", pa.string()), ("split", pa.string()),
-                             ("past_actions", pa.list_(pa.string())), ("future_actions", pa.list_(pa.string()))])
+    """Write ordered JSONL examples and one JSONL pool per batch, retaining partial final batches."""
     counts = {split: {"input_rows": 0, "rows": 0, "batches": 0, "discarded": Counter()}
               for split in (("train",) if args.max_users else ("train", "test"))}
     buffers: dict[str, list[dict]] = {split: [] for split in counts}
     with ExitStack() as stack:
         streams = [stack.enter_context(path.open(encoding="utf-8")) for path in paths]
-        writers = {split: stack.enter_context(pq.ParquetWriter(directory / f"{split}.parquet", schema))
+        writers = {split: stack.enter_context((directory / f"{split}.jsonl").open("w", encoding="utf-8"))
                    for split in counts}
-        pools = stack.enter_context(pq.ParquetWriter(directory / "pools.parquet", pool_schema))
+        pools = stack.enter_context((directory / "pools.jsonl").open("w", encoding="utf-8"))
         rejected = stack.enter_context((directory / "discarded.jsonl").open("w", encoding="utf-8"))
 
         def flush(split: str) -> None:
             rows = buffers[split]
             if not rows:
                 return
-            writers[split].write_table(pa.Table.from_pylist(rows, schema=schema))
+            writers[split].writelines(dumps(row) + "\n" for row in rows)
             pool = {"batch_id": rows[0]["extra_info"]["batch_id"], "split": split,
                     "past_actions": list(dict.fromkeys(action for row in rows
                                                       for action in row["extra_info"]["past_actions"])),
                     "future_actions": list(dict.fromkeys(action for row in rows
                                                         for action in row["reward_model"]["ground_truth"]))}
-            pools.write_table(pa.Table.from_pylist([pool], schema=pool_schema), row_group_size=1)
+            pools.write(dumps(pool) + "\n")
             counts[split]["batches"] += 1
             rows.clear()
 
@@ -323,7 +301,8 @@ def write_outputs(args: argparse.Namespace, paths: list[Path], directory: Path, 
     if args.max_users and not counts["train"]["rows"]:
         print("Debug run retained no examples; inspect discarded.jsonl for the reasons.", flush=True)
     meta = {
-        "format_version": FORMAT_VERSION, "task": "l3_commercial", "checkpoint": args.checkpoint,
+        "format_version": FORMAT_VERSION, "output_format": "jsonl",
+        "task": "l3_commercial", "checkpoint": args.checkpoint,
         "tokenizer": args.checkpoint, "seed": args.seed, "max_prompt_length": args.max_prompt_length,
         "batch_size": args.batch_size, "prepare_batch_size": args.prepare_batch_size,
         "debug": bool(args.max_users), "max_users": args.max_users,
@@ -383,8 +362,6 @@ def main() -> None:
     args = parse_args()
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError(f"Output directory is not empty: {args.output_dir}")
-    import pyarrow.parquet  # noqa: F401  (fail before expensive inference if export dependencies are missing)
-
     args.output_dir.mkdir(parents=True, exist_ok=True)
     with TemporaryDirectory(prefix=".prepare-", dir=args.output_dir) as temporary:
         directory = Path(temporary)
@@ -396,8 +373,8 @@ def main() -> None:
         print(f"Selected input users: {dict(Counter(item.split for item in locations))}", flush=True)
         paths = run_workers(args, locations, directory)
         meta = write_outputs(args, paths, directory, inputs, source_metadata)
-        filenames = [f"{split}.parquet" for split in meta["splits"]]
-        for name in filenames + ["pools.parquet", "discarded.jsonl", "meta.json"]:
+        filenames = [f"{split}.jsonl" for split in meta["splits"]]
+        for name in filenames + ["pools.jsonl", "discarded.jsonl", "meta.json"]:
             (directory / name).replace(args.output_dir / name)
     print(json.dumps(meta, indent=2), flush=True)
 

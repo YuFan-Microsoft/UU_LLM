@@ -122,7 +122,7 @@ Debug output defaults to `code/trainer/GRPO/outputs/l3_debug`; it can also be
 overridden with `--output_dir`.
 
 `--max_users K` processes **at most K train users in total**, not K users per split
-or per GPU. Test data is not read, and no `test.parquet` is produced. `0` (the
+or per GPU. Test data is not read, and no `test.jsonl` is produced. `0` (the
 default) prepares the full train and test splits.
 
 Debugging selects the first K records across sorted train shards, then applies the
@@ -133,7 +133,7 @@ For local JSONL, it stops reading at the limit and does not inspect the test fil
 
 The limit applies **before inference**, not to the number of retained examples.
 Discarded users are not replaced, so fewer than K prompts may survive. If every
-debug sample is discarded, the output still contains an empty `train.parquet` and
+debug sample is discarded, the output still contains an empty `train.jsonl` and
 the discard report. The metadata marks the run as debug; do not treat it as a
 completed full dataset or as a full train/test overlap validation.
 
@@ -169,14 +169,14 @@ download an embedding or language-ID model.
 
 ## Outputs
 
-- `train.parquet`, `test.parquet`: verl-shaped rows containing the L3 prompt, future
+- `train.jsonl`, `test.jsonl`: one JSON object per retained user, containing the L3 prompt, future
   ground truth, and `extra_info` with dates, provenance, all monthly past actions,
   visible evidence actions, the fixed upstream profile, and upstream call metrics.
   Cleaned history/future records and the profile are stored as JSON strings in
-  `extra_info` so their full structure is preserved without unstable Arrow schemas.
-  Debug mode writes only `train.parquet`.
-- `pools.parquet`: independent past/future action pools for each task-local split
-  batch, one row group per batch. Past pools use the full cleaned month. Visible
+  `extra_info`; the existing prepared row fields are unchanged.
+  Debug mode writes only `train.jsonl`.
+- `pools.jsonl`: independent past/future action pools for each task-local split
+  batch, one JSON object per batch. Past pools use the full cleaned month. Visible
   evidence actions are stored separately in each example for future reward choices.
 - `discarded.jsonl`: user, source location, and reason for each discarded example.
 - `meta.json`: input-record hashes, HF repository/configuration/pinned commit when
@@ -184,6 +184,11 @@ download an embedding or language-ID model.
   `train` and `test` are never merged or relabeled as each other.
   Debug metadata records the requested limit and actual counts; input hashes are
   marked as hashes of the read prefix rather than of unread file contents.
+
+All example and pool outputs are UTF-8 JSONL, not Parquet. Metadata remains a single
+`meta.json` document with `format_version: 2` and `output_format: "jsonl"`.
+PyArrow is used only to read HF Parquet inputs; local JSONL preparation/export does
+not require it. Existing Parquet outputs are not converted or overwritten.
 
 **These are L3 inputs, not generated L3 answers.** An abbreviated prepared row is:
 
@@ -207,7 +212,7 @@ are stored alongside the prompt for scoring, never inside the prompt itself.
 Final partial batches are **retained**, not silently dropped to round 20K down to a
 multiple of 64. The eventual trainer must preserve row order, use the recorded batch
 size, keep partial batches, and route reward lookup by `extra_info.batch_id`.
-Do not shuffle or filter these parquet rows without rebuilding their pools.
+Do not shuffle or filter these JSONL rows without rebuilding their pools.
 
 ## CPU tests
 
@@ -219,7 +224,7 @@ python3 -m unittest l3.prepare_data.test_prepare_data -v
 
 Tests use deterministic fake model outputs and real inference postprocessing.
 They cover date boundaries, no future leakage, per-user calendars, failed upstream
-answers, prompt/interest limits, train/test user isolation, actual Parquet output,
+answers, prompt/interest limits, train/test user isolation, JSONL output,
 and partial retrieval batches. HF integration tests mock network downloads while
-using real Parquet conversion and export. They do not download checkpoints or
+using real Parquet input conversion and JSONL export. They do not download checkpoints or
 require GPUs.

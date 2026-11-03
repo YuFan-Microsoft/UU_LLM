@@ -268,6 +268,11 @@ served by a shared model, not independently trainable parameter blocks.
 Write training and test examples separately for each task. Keep test examples out
 of parameter updates and SFT replay.
 
+L3 preparation outputs `train.jsonl`, `test.jsonl`, and `pools.jsonl`, with one
+example or retrieval pool per line. Debug mode produces only the train split.
+Discard records use `discarded.jsonl`, while run metadata remains in `meta.json`.
+The HF input files are still Parquet; prepared outputs are not.
+
 Preserve the existing Layer 1 `user_id`, `past_behaviors`, and `future_behaviors`
 interface where practical. Both task datasets should retain:
 

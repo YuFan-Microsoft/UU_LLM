@@ -26,6 +26,10 @@ def monthly_row(user="user", cutoff="2026-11-01"):
     }
 
 
+def read_jsonl(path):
+    return [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+
+
 class FakeInference:
     def __init__(self, fail_stage=None, truncate_stage=None):
         self.prompts = {}
@@ -261,9 +265,7 @@ class ExportTest(unittest.TestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("--max_users", result.stdout)
 
-    def test_real_parquet_pools_split_isolation_and_partial_batches(self):
-        import pyarrow.parquet as pq
-
+    def test_jsonl_rows_pools_split_isolation_and_partial_batches(self):
         with TemporaryDirectory() as directory:
             root = Path(directory)
             events = [{"index": i, "split": "train" if i < 4 else "test", "user_id": str(i),
@@ -274,15 +276,18 @@ class ExportTest(unittest.TestCase):
                 if event["row"]:
                     event["row"]["extra_info"]["past_actions"] = [f"past-{event['user_id']}"]
                     event["row"]["reward_model"]["ground_truth"] = [f"future-{event['user_id']}"]
+            content = "Example \u4e2d\u6587\nwith newline"
+            events[0]["row"]["prompt"][0]["content"] = content
+            events[0]["row"]["extra_info"]["content"] = content
             paths = [root / "worker-0.jsonl", root / "worker-1.jsonl"]
             for rank, path in enumerate(paths):
                 path.write_text("".join(json.dumps(event) + "\n" for event in events[rank::2]), encoding="utf-8")
             args = prepare_data.parse_args(["--data_dir", str(root), "--output_dir", str(root),
                                            "--batch_size", "2", "--checkpoint", "synthetic"])
             meta = prepare_data.write_outputs(args, paths, root, [])
-            train = pq.read_table(root / "train.parquet").to_pylist()
-            test = pq.read_table(root / "test.parquet").to_pylist()
-            pools = pq.read_table(root / "pools.parquet").to_pylist()
+            train = read_jsonl(root / "train.jsonl")
+            test = read_jsonl(root / "test.jsonl")
+            pools = read_jsonl(root / "pools.jsonl")
             self.assertEqual([row["extra_info"]["user_id"] for row in train], ["0", "1", "3"])
             self.assertEqual([row["extra_info"]["user_id"] for row in test], ["4"])
             self.assertEqual([row["extra_info"]["batch_id"] for row in train],
@@ -293,7 +298,14 @@ class ExportTest(unittest.TestCase):
             self.assertEqual(meta["splits"]["train"]["last_batch_size"], 1)
             self.assertEqual(meta["splits"]["train"]["discarded"], {"prompt_too_long": 1})
             self.assertEqual(len((root / "discarded.jsonl").read_text().splitlines()), 1)
-            self.assertEqual(pq.ParquetFile(root / "pools.parquet").metadata.num_row_groups, 3)
+            self.assertEqual(len(pools), 3)
+            self.assertEqual(train[0]["prompt"][0]["content"], content)
+            expected = events[0]["row"]
+            expected["extra_info"].update(index=0, split="train", batch_id="train-000000")
+            self.assertEqual(train[0], expected)
+            self.assertEqual(meta["format_version"], 2)
+            self.assertEqual(meta["output_format"], "jsonl")
+            self.assertEqual(list(root.glob("*.parquet")), [])
 
     def test_invalid_cli_limits(self):
         for flag, value in (("--batch_size", "0"), ("--max_prompt_length", "17409"),
@@ -302,8 +314,6 @@ class ExportTest(unittest.TestCase):
                 prepare_data.parse_args(["--data_dir", "input", "--output_dir", "output", flag, value])
 
     def test_debug_main_publishes_only_train_even_when_sample_is_discarded(self):
-        import pyarrow.parquet as pq
-
         for discard in (False, True):
             with self.subTest(discard=discard), TemporaryDirectory() as directory:
                 root = Path(directory)
@@ -327,11 +337,12 @@ class ExportTest(unittest.TestCase):
 
                 with patch.object(prepare_data, "parse_args", return_value=args), \
                         patch.object(prepare_data, "download_hf_inputs") as download, \
-                        patch.object(prepare_data, "run_workers", side_effect=fake_workers), patch("builtins.print"):
+                        patch.object(prepare_data, "run_workers", side_effect=fake_workers), \
+                        patch.dict(sys.modules, {"pyarrow": None, "pyarrow.parquet": None}), patch("builtins.print"):
                     prepare_data.main()
                 download.assert_not_called()
                 self.assertEqual({path.name for path in output.iterdir()},
-                                 {"train.parquet", "pools.parquet", "discarded.jsonl", "meta.json"})
+                                 {"train.jsonl", "pools.jsonl", "discarded.jsonl", "meta.json"})
                 meta = json.loads((output / "meta.json").read_text())
                 self.assertTrue(meta["debug"])
                 self.assertEqual(meta["max_users"], 1)
@@ -339,7 +350,7 @@ class ExportTest(unittest.TestCase):
                 self.assertEqual(meta["splits"]["train"]["input_rows"], 1)
                 self.assertEqual(meta["splits"]["train"]["rows"], 0 if discard else 1)
                 self.assertEqual(meta["splits"]["train"]["last_batch_size"], 0 if discard else 1)
-                self.assertEqual(pq.read_table(output / "train.parquet").num_rows, 0 if discard else 1)
+                self.assertEqual(len(read_jsonl(output / "train.jsonl")), 0 if discard else 1)
 
 
 class HFInputTest(unittest.TestCase):
@@ -416,11 +427,11 @@ class HFInputTest(unittest.TestCase):
             self.assertTrue(all(path.startswith("hf://") and "@fixed-commit/" in path
                                 for path in observed["source_paths"]))
             self.assertEqual([item["path"] for item in meta["inputs"]], observed["source_paths"])
-            train = pq.read_table(output / "train.parquet").to_pylist()[0]
+            train = read_jsonl(output / "train.jsonl")[0]
             self.assertEqual(train["extra_info"]["source_file"], observed["source_paths"][0])
             self.assertNotIn("unit-test-token", (output / "meta.json").read_text())
             self.assertEqual({path.name for path in output.iterdir()},
-                             {"train.parquet", "test.parquet", "pools.parquet", "discarded.jsonl", "meta.json"})
+                             {"train.jsonl", "test.jsonl", "pools.jsonl", "discarded.jsonl", "meta.json"})
 
     def test_missing_hf_split_fails_before_download(self):
         api = Mock()
