@@ -14,10 +14,10 @@ from pathlib import Path
 import sys
 from tempfile import TemporaryDirectory
 
-GRPO_DIR = Path(__file__).resolve().parents[1]
+GRPO_DIR = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(GRPO_DIR))
 
-from l3.data_pipeline import (  # noqa: E402
+from l3.prepare_data.data_pipeline import (  # noqa: E402
     MAX_PROMPT_LENGTH, build_profiles, make_example, parse_record,
 )
 from l1.rl_data import DEFAULT_CHECKPOINT, HF_REPO, hf_token  # noqa: E402

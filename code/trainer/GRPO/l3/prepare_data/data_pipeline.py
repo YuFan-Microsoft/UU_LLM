@@ -6,7 +6,7 @@ from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 import sys
 
-INFERENCE_DIR = Path(__file__).resolve().parents[3] / "inference"
+INFERENCE_DIR = Path(__file__).resolve().parents[4] / "inference"
 sys.path.insert(0, str(INFERENCE_DIR))
 
 import layer1  # noqa: E402

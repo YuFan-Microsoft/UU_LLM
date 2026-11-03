@@ -1,8 +1,9 @@
 # Layer 3 Commercial GRPO
 
-- `prepare_data.py`: executable monthly-input preparation entry point.
-- `data_pipeline.py`: input validation and reusable L1/L2-to-L3 preparation helpers.
-- `test_prepare_data.py`: CPU tests.
+- `prepare_data/`: data preparation scripts and tests:
+  - `prepare_data.py`: executable monthly-input preparation entry point.
+  - `data_pipeline.py`: input validation and reusable L1/L2-to-L3 preparation helpers.
+  - `test_prepare_data.py`: CPU tests.
 - `training/`: reserved for the L3 reward and training launcher; neither is implemented yet.
 
 ## What preparation does
@@ -95,7 +96,7 @@ the activity/source-diversity filters on the already selected dataset.
 ## Run
 
 Use the existing project inference/Docker environment with vLLM, transformers,
-PyArrow, and `huggingface_hub`. From `code/trainer/GRPO/l3`, read the specified HF
+PyArrow, and `huggingface_hub`. From `code/trainer/GRPO/l3/prepare_data`, read the specified HF
 configuration and prepare the final L3 inputs:
 
 ```bash
@@ -213,7 +214,7 @@ Do not shuffle or filter these parquet rows without rebuilding their pools.
 From `code/trainer/GRPO`:
 
 ```bash
-python3 -m unittest l3.test_prepare_data -v
+python3 -m unittest l3.prepare_data.test_prepare_data -v
 ```
 
 Tests use deterministic fake model outputs and real inference postprocessing.

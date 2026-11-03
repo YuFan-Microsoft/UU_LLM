@@ -10,7 +10,7 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import Mock, patch
 
-from l3 import data_pipeline as pipeline, prepare_data
+from l3.prepare_data import data_pipeline as pipeline, prepare_data
 
 
 def monthly_row(user="user", cutoff="2026-11-01"):

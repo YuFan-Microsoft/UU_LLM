@@ -23,7 +23,7 @@ behavior history.
 - The training scope is Layer 1 and Layer 3 Commercial only. Other tasks may be used
   as fixed preprocessing components, but are not additional training objectives.
 - Rule-based corpus selection remains a plan. Preparation of already selected L3
-  monthly records is implemented in [l3/prepare_data.py](l3/prepare_data.py).
+  monthly records is implemented in [l3/prepare_data](l3/prepare_data/prepare_data.py).
 
 The table gives selection quotas. L3 preparation discards users whose final input
 does not fit, rather than splitting them or selecting replacement data; prepared
