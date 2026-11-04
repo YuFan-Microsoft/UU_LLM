@@ -30,7 +30,7 @@ reward worker 会分布到所有有 CPU 资源的存活 Ray 节点；各节点�
 |---|---|---|
 | node-0 | GPU 0–7，8 张 A100 80 GB | Ray head、训练启动入口、8 个训练 rank |
 | node-1 | GPU 0–7，8 张 A100 80 GB | Ray worker、8 个训练 rank |
-| node-2 | 仅 GPU 0 | Qwen3-Embedding-4B 服务，其余 7 卡未用于本次训练 |
+| node-2 | 仅 GPU 0 | Qwen3-Embedding-8B 服务，其余 7 卡未用于本次训练 |
 
 实际训练是 **2 个训练节点、16 张 GPU、16 个全局 rank**，不是 3 个训练节点或 24 个训练 rank。
 
@@ -89,7 +89,7 @@ export JOB_DIR=/scratch/azureml/cr/j/8f2d3895dfb6482cb5274346f94b816b/exe/wd
 export REPO_DIR="$JOB_DIR/UU_LLM"
 export GRPO_DIR="$REPO_DIR/code/trainer/GRPO"
 export CHECKPOINT=/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT
-export EMBEDDING_MODEL=/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B
+export EMBEDDING_MODEL=/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B
 export LID_MODEL_PATH="$JOB_DIR/lid.176.bin"
 export HF_DATA_REVISION=748e344f4a47656ba724420493dadbc6155c91e2
 export HF_HOME="$HOME/.cache/huggingface"

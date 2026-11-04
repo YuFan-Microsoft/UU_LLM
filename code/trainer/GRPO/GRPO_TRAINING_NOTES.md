@@ -33,7 +33,7 @@
 ## 1. 本次部署的目标与和默认脚本的差异
 
 默认 `run_l1_grpo.sh` 是**单节点**设计：8 卡里拿最后 1 卡跑 reward 的
-Qwen3-Embedding-4B（vLLM `--runner pooling`），剩下 7 卡训练。
+Qwen3-Embedding-8B（vLLM `--runner pooling`），剩下 7 卡训练。
 
 本次要求：
 
@@ -125,7 +125,7 @@ worker 连不上 node-1。
 
 ```bash
 ssh node-1 'setsid nohup env CUDA_VISIBLE_DEVICES=0 \
-  vllm serve /yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B \
+  vllm serve /yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B \
     --runner pooling --served-model-name l1-embedding \
     --host 0.0.0.0 --port 8100 --max-model-len 1024 --gpu-memory-utilization 0.9 \
   > /tmp/l1_emb/embedding_server.log 2>&1 < /dev/null &'
@@ -134,7 +134,7 @@ ssh node-1 'setsid nohup env CUDA_VISIBLE_DEVICES=0 \
 要点：
 - `setsid nohup ... < /dev/null &`，否则 ssh 会话断开时服务被 SIGHUP 杀掉。
 - 健康检查：`curl -sf http://node-1:8100/health`（node-1 主机名在 node-0 上可解析）。
-- 加载 4B embedding 模型 + CUDA graph 捕获大概需要 1–3 分钟，不要过早判定失败。
+- 加载 8B embedding 模型 + CUDA graph 捕获大概需要 1–3 分钟，不要过早判定失败。
 
 ---
 
@@ -301,7 +301,7 @@ row = pq.read_table(f"{D}/val.parquet").to_pylist()[0]
 print(compute_score("user_profile_l1", "not json", row["reward_model"]["ground_truth"],
                     row["extra_info"], f"{D}/pools.parquet",
                     embedding_url="http://node-1:8100",
-                    embedding_model="/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B"))
+                    embedding_model="/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B"))
 PY
 # 期望：{'score': 0.0, 'json_valid': 0.0, ...} 且不抛异常
 ```
