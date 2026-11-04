@@ -75,7 +75,9 @@ def prepare(args: argparse.Namespace, tokenizer) -> dict:
     args.output_dir.mkdir(parents=True, exist_ok=True)
     train = {}
     for config in REPLAY_CONFIGS:
-        patterns = [item["path"] for item in configs[config]["data_files"] if item["split"] == "train"]
+        # The configs point the viewer at Parquet copies; replay byte-indexes the JSONL shards stored beside them.
+        patterns = [item["path"].removesuffix(".parquet") + ".jsonl" if item["path"].endswith(".parquet")
+                    else item["path"] for item in configs[config]["data_files"] if item["split"] == "train"]
         names = [name for name in files if any(fnmatch.fnmatchcase(name, pattern) for pattern in patterns)]
         if not names:
             raise ValueError(f"No training shards for {config}")
