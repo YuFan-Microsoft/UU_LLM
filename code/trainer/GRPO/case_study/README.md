@@ -44,8 +44,8 @@ reward_fn(content, text, finish_reason, next_week_actions)["reward"]
   in the directory above it (first line; the files are git-ignored).
 - `fasttext` and `UU_LLM/models/lid.176.bin` (or `LID_MODEL_PATH`) for the language rule of `score`, as for
   `run_inference.py`; downloaded once when missing.
-- Qwen3-Embedding-4B for the reward (`EMBEDDING_MODEL`, default
-  `/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B`), loaded by `score` on a GPU when there is one, or
+- Qwen3-Embedding-8B for the reward (`EMBEDDING_MODEL`, default
+  `/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B`), loaded by `score` on a GPU when there is one, or
   `--embedding_url` of a vLLM server of it (`vllm serve <model> --runner pooling --served-model-name l1-embedding`, as
   a GRPO run starts one).
 

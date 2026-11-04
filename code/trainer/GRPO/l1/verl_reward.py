@@ -16,7 +16,7 @@ One L1Reward per worker process. The vendored reward loader injects the generati
 that worker (respecting model.tokenizer_path and copy_to_local). A private copy avoids sharing mutable tokenizer
 state with the reward manager's concurrent response decoding; no checkpoint/processor is loaded again.
 Its embeddings come from the vLLM embedding server at reward_kwargs.embedding_url
-(Qwen3-Embedding-4B on a GPU of its own, started by run_l1_grpo.sh), else from reward_kwargs.embedding_model in the
+(Qwen3-Embedding-8B on a GPU of its own, started by run_l1_grpo.sh), else from reward_kwargs.embedding_model in the
 worker on the CPU; L1_REWARD_NUM_THREADS (default 8) torch threads rank them (Ray starts actors with a single OpenMP
 thread). verl may score several answers of a worker at once in threads, so they take turns. A cut answer is judged on its text only (verl does not pass the finish reason): it is not valid JSON.
 """

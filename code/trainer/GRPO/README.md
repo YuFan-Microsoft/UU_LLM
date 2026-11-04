@@ -7,7 +7,7 @@ used for training and for the case study, so a case-study report shows what the 
 ```
 GRPO/
 ├── run_l1_grpo.sh            launcher: data (once), embedding server, preflight, then python -m verl.trainer.main_ppo
-├── serve_embedding.sh        the reward's Qwen3-Embedding-4B on vLLM, on this node or another one (ssh)
+├── serve_embedding.sh        the reward's Qwen3-Embedding-8B on vLLM, on this node or another one (ssh)
 ├── watchdog.sh               restarts a crashed run (and the embedding server) until training finishes
 ├── DISTRIBUTED_TRAINING_GUIDE.md  distributed RL/replay setup, data, checkpoints and monitoring
 ├── GRPO_TRAINING_NOTES.md    record of the first 2-node run: deployment, the problems hit and their fixes (Chinese)
@@ -56,7 +56,7 @@ at 10, 9 at 25, 13 at 60, 17 at 200 (the prompt holds at most 200 signals). Reca
 retrieved actions), which made the first run inflate the interest count from 8.7 to 15.4 in 200 steps; an interest
 past N adds no recall or matched interest and increases both precision denominators.
 
-Each interest is one query, `<interest name>: <top topic>`, independently ranking two Qwen3-Embedding-4B pools:
+Each interest is one query, `<interest name>: <top topic>`, independently ranking two Qwen3-Embedding-8B pools:
 every batch user's visible prompt actions, and every batch user's next-week actions (64 users by default).
 Past targets and candidates exclude signals removed by the 200-signal cap or token-budget trimming.
 The future pool and future metric definitions are unchanged. Query embeddings and shared action embeddings
@@ -79,7 +79,7 @@ sequences through the gated-delta-net layers). None of the SID changes apply to 
 
 Inside the UU_LLM Docker image (which installs `fasttext-wheel` for the reward's language rule). The run starts from
 `/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT` (`DEFAULT_CHECKPOINT` in `run_l1_grpo.sh` and
-`l1/rl_data.py`; `CHECKPOINT=...` for another). verl trains on one node; the reward's Qwen3-Embedding-4B gets a GPU
+`l1/rl_data.py`; `CHECKPOINT=...` for another). verl trains on one node; the reward's Qwen3-Embedding-8B gets a GPU
 of its own:
 
 | Layout | Command | Training GPUs |
@@ -133,7 +133,7 @@ script.
 | Update | one PPO epoch over one mini-batch; add 0.1 times SFT replay NLL before the same optimizer step |
 | Actor | FSDP2, packed sequences, dynamic batch (49152 tokens per GPU), fused log-prob kernels, gradient checkpointing |
 | Rollout | vLLM, TP 1, colocated (asleep while the actor trains; 0.75 of GPU memory), prefix caching with the 16 answers of a prompt on one replica, the inference chat template without thinking |
-| Reward embeddings | Qwen3-Embedding-4B, vLLM server on a GPU of its own (this node's last, or `EMBEDDING_NODE`'s GPU 0) |
+| Reward embeddings | Qwen3-Embedding-8B, vLLM server on a GPU of its own (this node's last, or `EMBEDDING_NODE`'s GPU 0) |
 | Validation | before training and every 100 steps: 64 held-out users x 16 answers at temperature 1.0 |
 | Checkpoints | every 100 steps, with a Hugging Face copy |
 
@@ -243,7 +243,7 @@ next to the reward. Older runs lack past retrieval metrics and included coverage
 objectives by rescoring the same answers rather than directly comparing their rewards.
 Runs from before the interest cap recorded `coverage` and `future_recall` over every interest
 and `future_interest_hit` instead of `future_precision`; `from_val` + `score` rescore a step's answers with the
-current reward (`score` needs Qwen3-Embedding-4B: `--embedding_url` of a running server, or a GPU).
+current reward (`score` needs Qwen3-Embedding-8B: `--embedding_url` of a running server, or a GPU).
 
 ## Crashes, restarts and the watchdog
 

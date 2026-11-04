@@ -17,7 +17,7 @@ the prompt holds at most 200 signals). Recall grows with every interest (K more 
 inflate the interest count; an interest past N adds no recall or matched interest and only lowers precision.
 Each interest is one embedding query (interest_query), independently ranking two pools: this batch's visible past
 actions and this batch's next-week actions. Query embeddings and repeated action embeddings are shared, not rankings.
-The embeddings are Qwen3-Embedding-4B's, computed in process (Embedder) or by a vLLM
+The embeddings are Qwen3-Embedding-8B's, computed in process (Embedder) or by a vLLM
 embedding server (EmbeddingClient, `vllm serve <model> --runner pooling`; GRPO runs it on a GPU of its own) on the
 same texts.
 
@@ -56,7 +56,7 @@ SIGNALS = ("coverage", *REWARD_SIGNALS)  # All logged content metrics; coverage 
 # rounded; fitted to the V3 train split's P90 per signal-count bucket (1: 1, 3-4: 3, 8-11: 5, 20-29: 9, 50-74: 12,
 # 100-149: 15, 200: 17).
 CAP_BASE, CAP_SCALE, CAP_HALF = 0.9, 18.2, 33.0
-DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B"
+DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B"
 SERVED_EMBEDDING_MODEL = "l1-embedding"  # --served-model-name of the vLLM embedding server
 # Same query instruction as code/evaluation/evaluate_behavior_retrieval.py; documents (actions) have none.
 EMBEDDING_INSTRUCTION = "Given a web search query, retrieve relevant documents that answer the query"

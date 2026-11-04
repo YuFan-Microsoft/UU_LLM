@@ -1,6 +1,6 @@
 #!/bin/bash
 # ============================================================================
-# The Layer-1 reward's embedding server: vLLM serving Qwen3-Embedding-4B on one GPU (OpenAI /v1/embeddings, served
+# The Layer-1 reward's embedding server: vLLM serving Qwen3-Embedding-8B on one GPU (OpenAI /v1/embeddings, served
 # name l1-embedding), on this machine or on another node over ssh. Detached (setsid nohup, so it outlives the shell
 # or ssh session that started it); returns once /health answers and prints the server URL as its last line. An
 # embedding server already answering at that URL is reused.
@@ -8,7 +8,7 @@
 # Usage:
 #   bash serve_embedding.sh [node]          start (or reuse) on this machine, or on <node> (e.g. node-1)
 #   bash serve_embedding.sh stop [node]     stop the server this script started there
-# Env: EMBEDDING_MODEL (Qwen3-Embedding-4B), EMBEDDING_GPU (default 0 on another node; on this machine the last
+# Env: EMBEDDING_MODEL (Qwen3-Embedding-8B), EMBEDDING_GPU (default 0 on another node; on this machine the last
 #   visible GPU), EMBEDDING_PORT (8100), EMBEDDING_HOST (bind address: 0.0.0.0 on another node, 127.0.0.1 here),
 #   EMBEDDING_LOG (/tmp/l1_embedding/embedding_server.log on the serving node; <log>.pid holds the server's PID),
 #   EMBEDDING_WAIT (seconds to wait for /health, 900).
@@ -19,7 +19,7 @@ set -euo pipefail
 STOP=0
 if [ "${1:-}" = stop ]; then STOP=1; shift; fi
 NODE=${1:-}
-MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B}
+MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
 PORT=${EMBEDDING_PORT:-8100}
 LOG=${EMBEDDING_LOG:-/tmp/l1_embedding/embedding_server.log}
 if [ -n "$NODE" ]; then

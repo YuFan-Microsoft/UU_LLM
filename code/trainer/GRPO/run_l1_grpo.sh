@@ -48,7 +48,7 @@ if [ "$PPO_MAX_TOKEN_LEN_PER_GPU" -lt $((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH
   exit 1
 fi
 DATA_DIR=${DATA_DIR:-$HERE/outputs/data/seed${SEED}_batch${TRAIN_BATCH_SIZE}_prompt${MAX_PROMPT_LENGTH}_pools_v2}
-EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-4B}
+EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
 mkdir -p "$OUTPUT_DIR"
