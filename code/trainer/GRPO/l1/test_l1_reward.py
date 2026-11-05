@@ -512,18 +512,18 @@ class PoolPreparationTest(unittest.TestCase):
 
 class CaseStudyTest(unittest.TestCase):
     def test_score_requires_generation_checkpoint(self):
-        from case_study import case_study
+        from case_study import layer1_sampling
 
-        argv = ["case_study.py", "score", "--output_dir", "synthetic"]
+        argv = ["layer1_sampling.py", "score", "--output_dir", "synthetic"]
         with patch.object(sys, "argv", argv), patch.object(sys, "stderr"):
             with self.assertRaises(SystemExit) as error:
-                case_study.parse_args()
+                layer1_sampling.parse_args()
         self.assertEqual(error.exception.code, 2)
         with patch.object(sys, "argv", [*argv, "--checkpoint", "generation-checkpoint"]):
-            self.assertEqual(case_study.parse_args().checkpoint, "generation-checkpoint")
+            self.assertEqual(layer1_sampling.parse_args().checkpoint, "generation-checkpoint")
 
     def test_score_reports_both_sides(self):
-        from case_study import case_study
+        from case_study import layer1_sampling
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
@@ -544,8 +544,8 @@ class CaseStudyTest(unittest.TestCase):
                     patch.object(reward, "judge", side_effect=judge), \
                     patch.dict(sys.modules, {"transformers": SimpleNamespace(AutoProcessor=processor)}):
                 scorer = reward.L1Reward(embedder=FakeEmbedder(), top_k=1, tokenizer=tokenizer)
-                with patch.object(case_study, "L1Reward", return_value=scorer) as constructor, patch("builtins.print"):
-                    case_study.score(args)
+                with patch.object(layer1_sampling, "L1Reward", return_value=scorer) as constructor, patch("builtins.print"):
+                    layer1_sampling.score(args)
             processor.from_pretrained.assert_called_once_with("generation-checkpoint", trust_remote_code=True)
             constructor.assert_called_once_with("synthetic", 256, top_k=1, embedding_url=None, tokenizer=tokenizer)
             summary = json.loads((root / "summary.json").read_text())
@@ -556,7 +556,7 @@ class CaseStudyTest(unittest.TestCase):
             self.assertIn("past_hits", (root / "report.html").read_text())
 
     def test_trend_reads_old_and_new_dumps(self):
-        from case_study import case_study
+        from case_study import layer1_sampling
 
         base = {"input": "synthetic prompt", "output": "synthetic answer", "score": 0.5,
                 "json_valid": 1, "rule_pass": 1, "n_interests": 1,
@@ -569,10 +569,84 @@ class CaseStudyTest(unittest.TestCase):
                 (validation / "0.jsonl").write_text(json.dumps({**base, **extra, "step": 0}) + "\n")
                 output = root / f"{name}-output"
                 with patch("builtins.print"):
-                    case_study.trend(argparse.Namespace(validation_dir=validation, output_dir=output))
+                    layer1_sampling.trend(argparse.Namespace(validation_dir=validation, output_dir=output))
                 step = json.loads((output / "trend.json").read_text())[0]
                 self.assertEqual("past_recall" in step, name == "new")
                 self.assertEqual(step["future_recall"], 0.5)
+
+
+class Layer1InferenceTest(unittest.TestCase):
+    def test_pools_are_near_equal_training_batches(self):
+        from case_study import layer1_inference
+
+        batches = layer1_inference.pools(2000, 64)
+        self.assertEqual(len(batches), 31)
+        self.assertEqual({len(batch) for batch in batches}, {64, 65})
+        self.assertEqual([index for batch in batches for index in batch], list(range(2000)))
+        self.assertEqual(layer1_inference.pools(10, 64), [range(0, 10)])
+
+    def test_prepare_reads_test_rows(self):
+        import gzip
+
+        from case_study import layer1_inference
+
+        def behaviors(actions, date):
+            return [{"date": date, "source": "Bing", "action": action, "detailed_source": ""} for action in actions]
+
+        rows = [{"user_id": f"user{index}", "raw_history_targets": behaviors([f"P{index}"], "2026-07-10"),
+                 "future_targets": behaviors([f"F{index}"] if index else [], "2026-07-17")} for index in range(3)]
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            with gzip.open(root / "test-00000-of-00001.jsonl.gz", "wt", encoding="utf-8") as sink:
+                sink.writelines(json.dumps(row) + "\n" for row in rows)
+            args = argparse.Namespace(data_dir=root, output_dir=root / "out", seed=0, num_prompts=0)
+            with patch("builtins.print"):
+                layer1_inference.prepare(args)
+            prompts = [json.loads(line) for line in (root / "out" / "prompts.jsonl").read_text().splitlines()]
+        self.assertEqual(sorted(prompt["user_id"] for prompt in prompts), ["user1", "user2"])  # user0: no future
+        self.assertEqual([prompt["prompt_id"] for prompt in prompts], [0, 1])
+        for prompt in prompts:
+            index = prompt["user_id"][-1]
+            self.assertEqual([signal["action"] for signal in prompt["signals"]], [f"P{index}"])
+            self.assertEqual([behavior["action"] for behavior in prompt["future"]], [f"F{index}"])
+
+    def test_score_ranks_each_answer_in_its_own_pool(self):
+        from case_study import layer1_inference
+
+        def rollouts(root):
+            rows = [{"prompt_id": index, "user_id": f"user{index}", "content": content([f"P{index}"]),
+                     "signals": [{"date": "2026-10-03", "source": "Bing", "action": f"P{index}"}],
+                     "future": [{"date": "2026-10-10", "source": "Bing", "action": f"F{index}"}],
+                     "prompt_tokens": 2, "signals_dropped": 0,
+                     "samples": [{"text": answer(1), "finish_reason": "stop"}]} for index in range(2)]
+            (root / "rollouts.jsonl").write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+        recalls = {}
+        for pool_size in (1, 2):
+            with TemporaryDirectory() as directory:
+                root = Path(directory)
+                rollouts(root)
+                args = argparse.Namespace(output_dir=root, checkpoint="generation-checkpoint",
+                                          embedding_model="synthetic", embedding_batch_size=256, top_k=1,
+                                          embedding_url=None, pool_size=pool_size)
+                tokenizer = fake_tokenizer()
+                processor = Mock()
+                processor.from_pretrained.return_value.tokenizer = tokenizer
+                with patch.object(reward.user_profile_rules, "language_tools"), \
+                        patch.object(reward, "judge", side_effect=judge), \
+                        patch.dict(sys.modules, {"transformers": SimpleNamespace(AutoProcessor=processor)}):
+                    scorer = reward.L1Reward(embedder=FakeEmbedder(), top_k=1, tokenizer=tokenizer)
+                    with patch.object(layer1_inference, "L1Reward", return_value=scorer), patch("builtins.print"):
+                        layer1_inference.score(args)
+                scores = [json.loads(line) for line in (root / "scores.jsonl").read_text().splitlines()]
+                summary = json.loads((root / "summary.json").read_text())
+                self.assertIn("future_hits", (root / "report.html").read_text())
+            self.assertEqual([entry["pool"] for entry in scores], [0, 1] if pool_size == 1 else [0, 0])
+            self.assertEqual(summary["pool_sizes"], [pool_size])
+            self.assertEqual(summary["n_interests_valid"]["max"], 1)
+            recalls[pool_size] = [entry["past_recall@1"] for entry in scores]
+        # Alone in its pool, user1's own action is the only candidate; sharing user0's pool, I0 ranks P0 first.
+        self.assertEqual(recalls, {1: [1.0, 1.0], 2: [1.0, 0.0]})
 
 
 if __name__ == "__main__":

@@ -1,6 +1,6 @@
 #!/bin/bash
-# Layer-1 case study: fixed RL subset (downloaded from Hugging Face) -> N answers per prompt -> reward and report.
-# Usage: sh run_case_study.sh [checkpoint_dir]   (default: DEFAULT_CHECKPOINT below; a GRPO checkpoint is its
+# Layer-1 sampling: fixed RL subset (downloaded from Hugging Face) -> N answers per prompt -> reward and report.
+# Usage: sh run_layer1_sampling.sh [checkpoint_dir]   (default: DEFAULT_CHECKPOINT below; a GRPO checkpoint is its
 #        .../global_step_<N>/actor/huggingface directory)
 # Optional: OUTPUT_DIR, NUM_PROMPTS (64), N (16), TEMPERATURE (1.0), TOP_P (1.0), SEED (0), HF_TOKEN,
 #           EMBEDDING_MODEL (Qwen3-Embedding-8B path of the reward), CUDA_VISIBLE_DEVICES (one engine per visible GPU).
@@ -19,10 +19,10 @@ OUTPUT_DIR=${OUTPUT_DIR:-./outputs/$NAME}
 SEED=${SEED:-0}
 
 if [ ! -f "$OUTPUT_DIR/prompts.jsonl" ]; then
-  python case_study.py prepare --output_dir "$OUTPUT_DIR" --seed "$SEED" --num_prompts "${NUM_PROMPTS:-64}"
+  python layer1_sampling.py prepare --output_dir "$OUTPUT_DIR" --seed "$SEED" --num_prompts "${NUM_PROMPTS:-64}"
 fi
-python case_study.py rollout --output_dir "$OUTPUT_DIR" --seed "$SEED" --checkpoint "$CHECKPOINT" \
+python layer1_sampling.py rollout --output_dir "$OUTPUT_DIR" --seed "$SEED" --checkpoint "$CHECKPOINT" \
   --n "${N:-16}" --temperature "${TEMPERATURE:-1.0}" --top_p "${TOP_P:-1.0}"
-python case_study.py score --output_dir "$OUTPUT_DIR" --seed "$SEED" --checkpoint "$CHECKPOINT" \
+python layer1_sampling.py score --output_dir "$OUTPUT_DIR" --seed "$SEED" --checkpoint "$CHECKPOINT" \
   --embedding_model "${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}"
 echo "Open $OUTPUT_DIR/report.html"

@@ -1,6 +1,14 @@
 # Layer-1 case study
 
-Read what a checkpoint writes and what the GRPO reward makes of it. `case_study.py` rolls out a GRPO-sized group of
+Read what a checkpoint writes and what the GRPO reward makes of it, in two ways:
+
+- `layer1_sampling.py` (`run_layer1_sampling.sh`): a GRPO-sized group of sampled answers per prompt, to see how
+  they vary and what the reward makes of the variation (what GRPO learns from).
+- `layer1_inference.py` (`run_layer1_inference.sh`): one answer per held-out user with the inference sampling, to
+  see what the model's direct inference output looks like (see
+  [One answer per held-out user](#one-answer-per-held-out-user-layer1_inferencepy)).
+
+`layer1_sampling.py` rolls out a GRPO-sized group of
 answers per prompt with a checkpoint (the SFT one, or a GRPO step's Hugging Face copy) on a fixed subset of the RL
 data, or takes the answers a GRPO run generated at one validation step, and scores every answer with the reward of
 `../l1/l1_reward.py`, the single Layer-1 reward definition shared with the GRPO trainer. Rollouts are generated once;
@@ -51,17 +59,34 @@ reward_fn(content, text, finish_reason, next_week_actions)["reward"]
 
 ```bash
 cd UU_LLM/code/trainer/GRPO/case_study
-sh run_case_study.sh                                                      # default checkpoint (in the script)
-sh run_case_study.sh <ckpt_dir>                                           # -> outputs/<checkpoint name>/report.html
+sh run_layer1_sampling.sh                                                      # default checkpoint (in the script)
+sh run_layer1_sampling.sh <ckpt_dir>                                           # -> outputs/<checkpoint name>/report.html
 # or step by step
-python case_study.py prepare --output_dir <out>                           # fixed subset, downloads the RL data
-python case_study.py rollout --output_dir <out> --checkpoint <ckpt_dir>   # one GPU or more
-python case_study.py score   --output_dir <out> --checkpoint <ckpt_dir>
+python layer1_sampling.py prepare --output_dir <out>                           # fixed subset, downloads the RL data
+python layer1_sampling.py rollout --output_dir <out> --checkpoint <ckpt_dir>   # one GPU or more
+python layer1_sampling.py score   --output_dir <out> --checkpoint <ckpt_dir>
 ```
 
 `prepare` is skipped by the script when `<out>/prompts.jsonl` exists, so every checkpoint run on the same output
 directory sees the same prompts. For a GRPO checkpoint pass `<run>/checkpoints/global_step_<N>/actor/huggingface`;
 its default output directory is `outputs/<run>_global_step_<N>`.
+
+## One answer per held-out user (`layer1_inference.py`)
+
+`layer1_inference.py` reads the `test` split of `User_Profile_Layer1_For_RL_V1` (2,000 rows, one per held-out user:
+`{"user_id", "raw_history_targets", "future_targets"}`, behaviors `{"date", "source", "action", "detailed_source"}`;
+only the test shard is downloaded, to a temporary directory) and generates **one** answer per user, sampled with the
+inference setting (temperature 0.6, top-p 0.8). `prepare` takes every row (`--num_prompts` to limit) in the seeded
+order of `row_key` and cleans both weeks as above; `rollout` is `layer1_sampling.py`'s with `n = 1`; `score` splits the
+prompts, in that order, into near-equal pools of about `--pool_size` (64, the GRPO batch size) users, so each
+answer is ranked against the visible past and next-week actions of its own pool only, as in training. It writes
+`scores.jsonl` (with each answer's pool), `summary.json` (mean signals, interest counts, violations) and the same
+`report.html` (one rollout per prompt).
+
+```bash
+sh run_layer1_inference.sh [<ckpt_dir>]   # -> outputs/layer1_inference_<checkpoint name>/report.html
+# NUM_PROMPTS (0 = all), TEMPERATURE (0.6), TOP_P (0.8), POOL_SIZE (64), SEED (0), EMBEDDING_MODEL
+```
 
 ## GRPO runs
 
@@ -70,9 +95,9 @@ sampled as here (temperature 1.0), scored independently against the validation b
 and dumped to `<run>/validation/<step>.jsonl`. No GPU is needed to read them:
 
 ```bash
-python case_study.py trend --validation_dir <run>/validation --output_dir <run>/validation   # -> trend.md
-python case_study.py from_val --dump <run>/validation/300.jsonl --val_data <data>/val.parquet --output_dir outputs/<run>_val_300
-python case_study.py score --output_dir outputs/<run>_val_300 --checkpoint <ckpt_dir>         # -> report.html
+python layer1_sampling.py trend --validation_dir <run>/validation --output_dir <run>/validation   # -> trend.md
+python layer1_sampling.py from_val --dump <run>/validation/300.jsonl --val_data <data>/val.parquet --output_dir outputs/<run>_val_300
+python layer1_sampling.py score --output_dir outputs/<run>_val_300 --checkpoint <ckpt_dir>         # -> report.html
 ```
 
 `trend` has one row per validation step: the mean reward, the mean best reward of each user's 16 answers, the mean

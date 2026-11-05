@@ -232,10 +232,10 @@ The dumped answers are read without a GPU:
 
 ```bash
 cd case_study
-python case_study.py trend --validation_dir ../outputs/<run>/validation --output_dir ../outputs/<run>/validation
-python case_study.py from_val --dump ../outputs/<run>/validation/300.jsonl \
+python layer1_sampling.py trend --validation_dir ../outputs/<run>/validation --output_dir ../outputs/<run>/validation
+python layer1_sampling.py from_val --dump ../outputs/<run>/validation/300.jsonl \
     --val_data ../outputs/data/<data>/val.parquet --output_dir outputs/<run>_val_300
-python case_study.py score --output_dir outputs/<run>_val_300 --checkpoint <ckpt_dir>   # report.html of step 300
+python layer1_sampling.py score --output_dir outputs/<run>_val_300 --checkpoint <ckpt_dir>   # report.html of step 300
 ```
 
 `trend.md` has one row per validation step (reward, best of 16, each signal, answer length); watch `n_interests`

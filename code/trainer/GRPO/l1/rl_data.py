@@ -1,4 +1,4 @@
-"""The Layer-1 RL data shared by prepare_data.py (GRPO training data) and case_study/case_study.py.
+"""The Layer-1 RL data shared by prepare_data.py (GRPO training data) and case_study/layer1_sampling.py.
 
 User_Profile_Weekly_For_RL of the gated yufan/user_profile_dataset: one JSONL row per user-week,
 {"user_id", "past_behaviors": [{"source", "action", "date"}], "future_behaviors": [...]}, in two splits with

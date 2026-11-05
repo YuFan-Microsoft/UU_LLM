@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""Layer-1 case study: roll out a group of answers per prompt with a checkpoint on a fixed subset of
-User_Profile_Weekly_For_RL, score every answer with the GRPO reward (../l1/l1_reward.py) and read them in a report.
+"""Layer-1 sampling: roll out a group of answers per prompt with a checkpoint on a fixed subset of
+User_Profile_Weekly_For_RL, to see how they vary; score every answer with the GRPO reward (../l1/l1_reward.py) and
+read them in a report.
 
 Steps (see README.md); the rollouts are generated once and can be re-scored as the reward changes:
     prepare   fixed seeded sample of RL rows -> prompts.jsonl (cleaned past signals, cleaned next-week behaviors)
