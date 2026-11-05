@@ -40,7 +40,6 @@ accelerate launch --multi_gpu --num_processes "$NUM_GPUS" --num_machines 1 --mix
     --attn_implementation flash_attention_2 \
     --epochs 1 \
     --eval_steps 1000 \
-    --save_steps 5000 \
     --eval_samples 5000 \
     "$@"
 

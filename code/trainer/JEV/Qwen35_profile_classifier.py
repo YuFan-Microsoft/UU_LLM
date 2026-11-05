@@ -305,9 +305,9 @@ def parse_args():
                         help="Attention of the full-attention layers (flash_attention_2 or sdpa)")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers per GPU (tokenization)")
 
-    parser.add_argument("--eval_steps", type=int, default=1000, help="Evaluate every N optimizer steps")
-    parser.add_argument("--save_steps", type=int, default=5000,
-                        help="Save a full checkpoint (~8 GB for 4B) every N steps; the final model is always saved")
+    parser.add_argument("--eval_steps", type=int, default=1000,
+                        help="Evaluate and save a full checkpoint (~8 GB for 4B) every N optimizer steps; the final "
+                             "model is always evaluated on the whole test split and saved")
     parser.add_argument("--output_dir", default="../output/qwen35_4B_profile_classifier")
     parser.add_argument("--wandb_project", default="qwen35_4B_profile_classifier",
                         help="W&B project ('' disables W&B); key from WANDB_API_KEY or UU_LLM/wandb_key.txt")
@@ -393,8 +393,7 @@ def main():
             wandb.log({f"{prefix}/{k}": v for k, v in metrics.items()}, step=global_step)
 
     global_step = 0
-    metrics = evaluate(model, eval_loader, accelerator, desc="Eval @ step 0")
-    log(metrics, "eval")
+    log(evaluate(model, eval_loader, accelerator, desc="Eval @ step 0"), "eval")
     model.train()
     for epoch in range(args.epochs):
         progress = tqdm(total=len(train_loader), desc=f"Epoch {epoch + 1}", disable=not accelerator.is_main_process,
@@ -412,7 +411,6 @@ def main():
             if global_step % args.eval_steps == 0:
                 metrics = evaluate(model, eval_loader, accelerator, desc=f"Eval @ step {global_step}")
                 log(metrics, "eval")
-            if global_step % args.save_steps == 0:
                 save_checkpoint(model, tokenizer, accelerator, args, global_step, metrics)
         progress.close()
 
