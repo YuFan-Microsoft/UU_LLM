@@ -67,9 +67,9 @@ def prepare(args: argparse.Namespace, tokenizer) -> dict:
     token = hf_token()
     info = HfApi().dataset_info(HF_REPO, revision=args.revision, token=token)
     configs = {item["config_name"]: item for item in info.card_data["configs"]
-               if item["config_name"].startswith("V3_")}
+               if item["config_name"].startswith("SFT_") and item["config_name"].endswith("_V3")}
     if set(configs) != set(V3_MIXTURE):
-        raise ValueError(f"Expected the eight SFT V3_ configs, got {sorted(configs)}")
+        raise ValueError(f"Expected the eight SFT_*_V3 configs, got {sorted(configs)}")
     revision = info.sha
     files = sorted(sibling.rfilename for sibling in info.siblings)
     args.output_dir.mkdir(parents=True, exist_ok=True)

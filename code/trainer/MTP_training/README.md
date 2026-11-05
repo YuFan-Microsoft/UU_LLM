@@ -69,7 +69,7 @@ Main settings (environment variables):
 | Variable | Default | Notes |
 |---|---|---|
 | `TEMPERATURE` / `TOP_P` | 0.6 / 0.8 | Sampling for data generation, same as `run_inference.py`; **use the production values** (the MAIProfile client currently sends temperature 0.2) |
-| `CONFIGS` | the 8 V3 SFT tasks | `V3_User_Profile_{L1, L1_Negative, L2, L3_Persona, L3_Commercial, L4_Biography, L4_CommercialPreference, L4_Hyper}_gpt56` |
+| `CONFIGS` | the 8 V3 SFT tasks | `SFT_User_Profile_{L1, L1_Negative, L2, L3_Persona, L3_Commercial, L4_Biography, L4_CommercialPreference, L4_Hyper}_gpt56_V3` |
 | `SAMPLES_PER_CONFIG` | 2000 | About 16,000 prompts over the 8 configs; community examples gain clearly with 5,000-8,000 |
 | `NUM_STEPS` / `STEP_WEIGHT_BETA` | 5 / 0.6 | Recursive draft steps and step weights ([0.43, 0.26, 0.16, 0.09, 0.06]); the head can then be served with any `num_speculative_tokens` from 1 to 5. A lower beta (e.g. 0.5) shifts weight back to the early steps |
 | `LR` / `EPOCHS` | 1e-4 / 3 | Values of the official Speculators Qwen3.5 example |

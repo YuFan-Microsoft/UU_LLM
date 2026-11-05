@@ -13,7 +13,7 @@ GRPO/
 ├── GRPO_TRAINING_NOTES.md    record of the first 2-node run: deployment, the problems hit and their fixes (Chinese)
 ├── l1/                       Layer-1 RL code
 │   ├── l1_reward.py          the reward (L1Reward)
-│   ├── rl_data.py            User_Profile_Weekly_For_RL: download, cleaning, seeded row order (shared)
+│   ├── rl_data.py            RL_User_Profile_Layer1_V0: download, cleaning, seeded row order (shared)
 │   ├── prepare_data.py       -> verl train / val parquet with fixed batches + the reward pool of every batch
 │   ├── sft_replay.py         V3 replay preparation, fixed test subsets and deterministic weighted sampling
 │   ├── sft_runtime.py        joint actor updates, held-out PPL and SFT guardrail evaluation
@@ -143,7 +143,7 @@ Replay is enabled by default (`SFT_REPLAY=1`); `SFT_REPLAY=0` disables replay an
 The default experiment name ends in `_replay`, so it does not accidentally resume a previous L1-only run.
 The watchdog uses the same naming rule. An explicit `EXPERIMENT_NAME` still takes precedence.
 
-The source is `yufan/user_profile_dataset`, **exactly the eight `V3_` configs**, not `V35_` or other versions.
+The source is `yufan/user_profile_dataset`, **exactly the eight `SFT_*_V3` configs**, not `SFT_User_Profile_TestSet` or other versions.
 Replay uses the **train** splits of all eight tasks, including normal L1 and L1 Negative.
 The weights are the original SFT `V3_MIXTURE` weights; normal L1 has a 21% row-sampling probability.
 The shared definition and
@@ -275,7 +275,7 @@ shows progress.
 
 ## Data and reward pools
 
-`User_Profile_Weekly_For_RL` of `yufan/user_profile_dataset` has two splits with disjoint users: `train` (139,629
+`RL_User_Profile_Layer1_V0` (folder `User_Profile_Weekly_For_RL`) of `yufan/user_profile_dataset` has two splits with disjoint users: `train` (139,629
 user-weeks, 31,543 users) and `test` (2,000 user-weeks of 456 held-out users: whole users in a seeded random order).
 `l1/prepare_data.py` builds one prompt per user-week exactly as the inference and the case study do
 (`load_users` + `dedupe`, `layer1.fit_prompt` / `build_message`) and takes the rows in a seeded random order: the

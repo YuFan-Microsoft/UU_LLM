@@ -43,9 +43,9 @@ SPECULATORS_REPO=${SPECULATORS_REPO:-$WORK_DIR/speculators}  # for scripts/launc
 
 # Data generation (defaults follow run_inference.py; the MAIProfile client currently uses temperature 0.2). CONFIGS are
 # the eight V3 SFT tasks.
-CONFIGS=${CONFIGS:-"V3_User_Profile_L1_gpt56 V3_User_Profile_L1_Negative_gpt56 V3_User_Profile_L2_gpt56 \
-V3_User_Profile_L3_Persona_gpt56 V3_User_Profile_L3_Commercial_gpt56 V3_User_Profile_L4_Biography_gpt56 \
-V3_User_Profile_L4_CommercialPreference_gpt56 V3_User_Profile_L4_Hyper_gpt56"}
+CONFIGS=${CONFIGS:-"SFT_User_Profile_L1_gpt56_V3 SFT_User_Profile_L1_Negative_gpt56_V3 SFT_User_Profile_L2_gpt56_V3 \
+SFT_User_Profile_L3_Persona_gpt56_V3 SFT_User_Profile_L3_Commercial_gpt56_V3 SFT_User_Profile_L4_Biography_gpt56_V3 \
+SFT_User_Profile_L4_CommercialPreference_gpt56_V3 SFT_User_Profile_L4_Hyper_gpt56_V3"}
 SAMPLES_PER_CONFIG=${SAMPLES_PER_CONFIG:-2000}
 TEMPERATURE=${TEMPERATURE:-0.6}
 TOP_P=${TOP_P:-0.8}

@@ -73,8 +73,8 @@ its default output directory is `outputs/<run>_global_step_<N>`.
 
 ## One answer per held-out user (`layer1_inference.py`)
 
-`layer1_inference.py` reads the `test` split of `User_Profile_Layer1_For_RL_V1` (2,000 rows, one per held-out user:
-`{"user_id", "raw_history_targets", "future_targets"}`, behaviors `{"date", "source", "action", "detailed_source"}`;
+`layer1_inference.py` reads the `test` split of `RL_User_Profile_Layer1_V1` (folder `User_Profile_Layer1_For_RL_V1`; 2,000 rows, one per held-out user:
+`{"user_id", "past_behaviors", "future_behaviors"}`, behaviors `{"date", "source", "action", "detailed_source"}`;
 only the test shard is downloaded, to a temporary directory) and generates **one** answer per user, sampled with the
 inference setting (temperature 0.6, top-p 0.8). `prepare` takes every row (`--num_prompts` to limit) in the seeded
 order of `row_key` over each row's `user_id` (so the users and their order do not depend on the file format) and
@@ -114,7 +114,7 @@ stored a future pool. Reward values from different objectives are not directly c
 the same seed, `prepare` picks (up to the rows each tool skips) the run's validation users, so a checkpoint report
 and a validation-step report show the same people.
 
-**Data**: `User_Profile_Weekly_For_RL` of `yufan/user_profile_dataset`, two splits with disjoint users: `train`
+**Data**: `RL_User_Profile_Layer1_V0` (folder `User_Profile_Weekly_For_RL`) of `yufan/user_profile_dataset`, two splits with disjoint users: `train`
 (139,629 rows, 31,543 users; the GRPO training data) and `test` (2,000 rows of 456 held-out users). `prepare` reads
 `--split test` by default, downloaded to a temporary directory and deleted once the subset is written (`--data_dir`
 reads local `<split>-*.jsonl` copies instead). One row is one user-week:

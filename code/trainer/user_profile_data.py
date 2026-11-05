@@ -4,16 +4,16 @@ import numpy as np
 
 
 V3_MIXTURE = {
-    "V3_User_Profile_L1_gpt56": 21.0,
-    "V3_User_Profile_L1_Negative_gpt56": 4.0,
-    "V3_User_Profile_L2_gpt56": 20.0,
-    "V3_User_Profile_L3_Persona_gpt56": 8.0,
-    "V3_User_Profile_L3_Commercial_gpt56": 14.0,
-    "V3_User_Profile_L4_Biography_gpt56": 10.0,
-    "V3_User_Profile_L4_CommercialPreference_gpt56": 9.0,
-    "V3_User_Profile_L4_Hyper_gpt56": 14.0,
+    "SFT_User_Profile_L1_gpt56_V3": 21.0,
+    "SFT_User_Profile_L1_Negative_gpt56_V3": 4.0,
+    "SFT_User_Profile_L2_gpt56_V3": 20.0,
+    "SFT_User_Profile_L3_Persona_gpt56_V3": 8.0,
+    "SFT_User_Profile_L3_Commercial_gpt56_V3": 14.0,
+    "SFT_User_Profile_L4_Biography_gpt56_V3": 10.0,
+    "SFT_User_Profile_L4_CommercialPreference_gpt56_V3": 9.0,
+    "SFT_User_Profile_L4_Hyper_gpt56_V3": 14.0,
 }
-L1_CONFIG = "V3_User_Profile_L1_gpt56"
+L1_CONFIG = "SFT_User_Profile_L1_gpt56_V3"
 
 
 def chat_template_ids(messages: list[dict], tokenizer, *, generation: bool) -> np.ndarray:

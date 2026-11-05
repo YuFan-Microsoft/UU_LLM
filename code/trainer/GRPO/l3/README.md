@@ -13,7 +13,7 @@ six-month corpus. The selection rules and intended 20K train / 2K test quotas ar
 in [the data generation plan](../DATA_GENERATION.md).
 
 By default, preparation reads the Parquet train/test shards in
-[`yufan/user_profile_dataset / User_Profile_Layer3_For_RL_V1`](https://huggingface.co/datasets/yufan/user_profile_dataset/tree/main/User_Profile_Layer3_For_RL_V1)
+[`yufan/user_profile_dataset / RL_User_Profile_Layer3_V1`](https://huggingface.co/datasets/yufan/user_profile_dataset/tree/main/User_Profile_Layer3_For_RL_V1)
 directly from Hugging Face. Local JSONL remains an optional override.
 
 For each user, a fixed checkpoint extracts L1 interests separately for the four
@@ -44,7 +44,7 @@ Consequently, final counts can be below the selected 20K / 2K input counts.
 ### Hugging Face (default)
 
 The loader resolves `--hf_revision` (default `main`) to one immutable commit, lists
-only `User_Profile_Layer3_For_RL_V1`, and downloads only its train/test Parquet
+only the `User_Profile_Layer3_For_RL_V1` folder (config `RL_User_Profile_Layer3_V1`), and downloads only its train/test Parquet
 shards. It does not download other configurations or `generation_info.json`.
 Required columns are `user_id`, `cutoff`, `past_behaviors`, and `future_behaviors`;
 the dataset's `history_start`, `future_end`, and `split` columns are also validated.

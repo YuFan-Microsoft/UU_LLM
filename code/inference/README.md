@@ -15,7 +15,7 @@
 
 The prompt files are read as-is (line endings normalized to `\n`); the script builds each user message as
 `prompt + "\nInput:\n" + input`, exactly like the V3 SFT data: rebuilt from their own inputs, every
-`V3_User_Profile_*_gpt56` L1, L2, L3 Persona and L3 Commercial test row gives the identical user message, the L4
+`SFT_User_Profile_*_gpt56_V3` L1, L2, L3 Persona and L3 Commercial test row gives the identical user message, the L4
 inputs have the same fields (without user context: no declared attributes, facts or personal / professional context,
 which this script never has), and every V3 test answer passes the answer checks. The model was trained on these exact strings, so edit them only together with the SFT data (and retrain).
 
@@ -30,7 +30,7 @@ must stay identical to the originals. It uses one vLLM engine per visible GPU (l
 ```bash
 cd UU_LLM/code/inference
 export HF_TOKEN=...   # gated dataset
-# Default input: config User_Profile_TestSet, split user_1200 (1191 users) of yufan/user_profile_dataset;
+# Default input: config SFT_User_Profile_TestSet, split user_1200 (1191 users) of yufan/user_profile_dataset;
 # --hf_split user_12000 for the larger set. Only the chosen split is streamed.
 python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir>
 # Quick check on the first 20 user ids

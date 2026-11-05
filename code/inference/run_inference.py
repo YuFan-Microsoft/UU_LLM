@@ -54,7 +54,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--output_dir", type=Path, required=True)
     parser.add_argument("--input", type=Path, nargs="+", help="Local JSONL files instead of the Hugging Face test set")
-    parser.add_argument("--hf_split", default="user_1200", help="User_Profile_TestSet split: user_1200 or user_12000")
+    parser.add_argument("--hf_split", default="user_1200", help="SFT_User_Profile_TestSet split: user_1200 or user_12000")
     parser.add_argument("--max_users", type=int, default=0, help="Only the first N user ids (0 = all)")
     parser.add_argument("--grid_start_date", type=date.fromisoformat, help="Default: the earliest behavior date")
     parser.add_argument("--window_days", type=int, default=7)

@@ -585,8 +585,8 @@ class Layer1InferenceTest(unittest.TestCase):
         def behaviors(actions, date):
             return [{"date": date, "source": "Bing", "action": action, "detailed_source": ""} for action in actions]
 
-        rows = [{"user_id": f"user{index}", "raw_history_targets": behaviors([f"P{index}"], "2026-07-10"),
-                 "future_targets": behaviors([f"F{index}"] if index else [], "2026-07-17")} for index in range(3)]
+        rows = [{"user_id": f"user{index}", "past_behaviors": behaviors([f"P{index}"], "2026-07-10"),
+                 "future_behaviors": behaviors([f"F{index}"] if index else [], "2026-07-17")} for index in range(3)]
         with TemporaryDirectory() as directory:
             root = Path(directory)
             pq.write_table(pa.Table.from_pylist(rows), root / "test-00000-of-00001.parquet")

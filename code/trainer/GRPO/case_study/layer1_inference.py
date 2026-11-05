@@ -68,7 +68,7 @@ def read_rows(paths: list[Path]) -> list[tuple[str, int, dict]]:
     """(file name, row number, row) of every row."""
     import pyarrow.parquet as pq
 
-    columns = ["user_id", "raw_history_targets", "future_targets"]
+    columns = ["user_id", "past_behaviors", "future_behaviors"]
     return [(path.name, number, row) for path in paths
             for number, row in enumerate(pq.read_table(path, columns=columns).to_pylist())]
 
@@ -76,7 +76,7 @@ def read_rows(paths: list[Path]) -> list[tuple[str, int, dict]]:
 def prepare(args: argparse.Namespace) -> None:
     """Every test row (or the first --num_prompts) in the seeded order of rl_data.row_key of its user_id (one row per
     user, so the order does not depend on the file format), both weeks cleaned as run_inference.py cleans one window.
-    One row is one user: {"user_id", "raw_history_targets", "future_targets"}, behaviors {"date", "source", "action",
+    One row is one user: {"user_id", "past_behaviors", "future_behaviors"}, behaviors {"date", "source", "action",
     "detailed_source"}. Rows left without a signal or a next-week action are skipped."""
     with data_files(args.data_dir) as paths:
         rows = read_rows(paths)
@@ -85,14 +85,14 @@ def prepare(args: argparse.Namespace) -> None:
     rows.sort(key=lambda entry: row_key(args.seed, entry[2]["user_id"].encode()))
     prompts, skipped = [], 0
     for file_name, row_number, row in rows:
-        signals = clean_behaviors(row["user_id"], row["raw_history_targets"])
-        future = clean_behaviors(row["user_id"], row["future_targets"])
+        signals = clean_behaviors(row["user_id"], row["past_behaviors"])
+        future = clean_behaviors(row["user_id"], row["future_behaviors"])
         if not signals or not future:
             skipped += 1
             continue
         prompts.append({
             "prompt_id": len(prompts), "user_id": row["user_id"], "file": file_name, "line": row_number,
-            "raw_past": len(row["raw_history_targets"]), "raw_future": len(row["future_targets"]),
+            "raw_past": len(row["past_behaviors"]), "raw_future": len(row["future_behaviors"]),
             "signals": signals, "future": future,
         })
         if len(prompts) == args.num_prompts:

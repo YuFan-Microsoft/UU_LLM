@@ -201,8 +201,8 @@ not need to generate candidate answers to select these windows.
 ### Layer 3 Commercial
 
 The preparation command reads the selected train/test Parquet shards from
-`yufan/user_profile_dataset`, configuration `User_Profile_Layer3_For_RL_V1`, by
-default. It pins the HF revision, fetches only that configuration's data shards,
+`yufan/user_profile_dataset`, configuration `RL_User_Profile_Layer3_V1` (folder
+`User_Profile_Layer3_For_RL_V1`), by default. It pins the HF revision, fetches only that configuration's data shards,
 and then runs frozen upstream inference. Local JSONL remains supported through
 `--data_dir`; see [the L3 instructions](l3/README.md).
 

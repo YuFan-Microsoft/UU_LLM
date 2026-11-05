@@ -51,7 +51,7 @@ reward worker 会分布到所有有 CPU 资源的存活 Ray 节点；各节点�
 | 起始权重 | 原始 SFT `Final_CKPT`，不是调试五步后的权重 |
 | RL 数据 | 139584 条，64 条 held-out 验证 prompt |
 | 全局训练 batch | 64 个 prompt，每个生成 16 个回答，共 1024 个回答 |
-| Replay | 八个 `V3_` train 集，按原 SFT mixture 权重采样 |
+| Replay | 八个 `SFT_*_V3` train 集，按原 SFT mixture 权重采样 |
 | Replay batch / 权重 | 每张 DP GPU 2 行，全局 32 行；系数 0.1 |
 | 更新方式 | RL 与 replay 梯度合并后执行一次 optimizer 和 scheduler 更新 |
 | Actor | FSDP2、梯度检查点、动态 token batch |
@@ -91,7 +91,7 @@ export GRPO_DIR="$REPO_DIR/code/trainer/GRPO"
 export CHECKPOINT=/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT
 export EMBEDDING_MODEL=/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B
 export LID_MODEL_PATH="$JOB_DIR/lid.176.bin"
-export HF_DATA_REVISION=748e344f4a47656ba724420493dadbc6155c91e2
+export HF_DATA_REVISION=84fd43abef6ee0f15968523d660f0133c38c4de7
 export HF_HOME="$HOME/.cache/huggingface"
 export HF_HUB_CACHE="$HF_HOME/hub"
 export HF_DATASETS_CACHE="$HF_HOME/datasets"
@@ -209,9 +209,9 @@ https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
 
 范围必须是：
 
-- 八个 **`V3_`** 配置的 train/test。
-- `User_Profile_Weekly_For_RL` 的 train/test。
-- **不包含 `V35_`**；`startswith("V3")` 会错误地把 V35 也包含进来。
+- 八个 **`SFT_*_V3`** 配置的 train/test。
+- `RL_User_Profile_Layer1_V0`（目录 `User_Profile_Weekly_For_RL`）的 train/test。
+- **不包含 `SFT_User_Profile_TestSet`**；只用 `startswith("SFT_")` 会错误地把它也包含进来。
 
 HF token 放在权限为 `0600` 的文件中。不要打印 token、放进命令行实参、代码、日志或 Ray/Hydra 配置。
 
@@ -231,10 +231,10 @@ token = (Path(os.environ["JOB_DIR"]) / "hf_token.txt").read_text().split()[0]
 info = HfApi().dataset_info(repo, revision=revision, token=token)
 names = [
     c["config_name"] for c in info.card_data["configs"]
-    if c["config_name"].startswith("V3_")
-    or c["config_name"] == "User_Profile_Weekly_For_RL"
+    if (c["config_name"].startswith("SFT_") and c["config_name"].endswith("_V3"))
+    or c["config_name"] == "RL_User_Profile_Layer1_V0"
 ]
-assert set(names) == set(REPLAY_CONFIGS) | {"User_Profile_Weekly_For_RL"}
+assert set(names) == set(REPLAY_CONFIGS) | {"RL_User_Profile_Layer1_V0"}
 for name in names:
     data = load_dataset(repo, name, revision=info.sha, token=token)
     print(name, {split: len(rows) for split, rows in data.items()}, flush=True)
@@ -270,7 +270,7 @@ HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 PYTHONPATH="$GRPO_DIR" python3 - <<'PY'
 import os
 from datasets import load_dataset
 from l1.sft_replay import REPLAY_CONFIGS
-for name in (*REPLAY_CONFIGS, "User_Profile_Weekly_For_RL"):
+for name in (*REPLAY_CONFIGS, "RL_User_Profile_Layer1_V0"):
     data = load_dataset(
         "yufan/user_profile_dataset", name,
         revision=os.environ["HF_DATA_REVISION"], token=False,
@@ -292,7 +292,7 @@ HF cache 不等于已经有了 verl 的 parquet、reward pool 或 replay 索引�
 ### 6.1 RL 数据
 
 ```bash
-export DATA_DIR="$GRPO_DIR/outputs/data/prod_2nodes_seed0_batch64_prompt17408_sha748e344f4a47"
+export DATA_DIR="$GRPO_DIR/outputs/data/prod_2nodes_seed0_batch64_prompt17408_sha84fd43abef6e"
 cd "$GRPO_DIR"
 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1 python3 l1/prepare_data.py \
   --data_dir "$HF_HUB_CACHE/datasets--yufan--user_profile_dataset/snapshots/$HF_DATA_REVISION/User_Profile_Weekly_For_RL" \
@@ -310,7 +310,7 @@ TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1 python3 l1/prepare_data.py \
 ### 6.2 SFT replay 与评估
 
 ```bash
-export SFT_REPLAY_DIR="$GRPO_DIR/outputs/data/sft_v2_Final_CKPT_seq25600_prompt24576_test500_sha748e344f4a47"
+export SFT_REPLAY_DIR="$GRPO_DIR/outputs/data/sft_v2_Final_CKPT_seq25600_prompt24576_test500_sha84fd43abef6e"
 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1 python3 l1/sft_replay.py \
   --output_dir "$SFT_REPLAY_DIR" --tokenizer "$CHECKPOINT" \
   --revision "$HF_DATA_REVISION" --max_seq_length 25600 \
@@ -783,7 +783,7 @@ UU_LLM/code/trainer/GRPO/outputs/debug5_2nodes_replay_attempt1/checkpoints/globa
 - [ ] node-0/node-1 各 8 张目标 GPU 无冲突，node-2 仅 GPU 0 跑 embedding。
 - [ ] 使用完整 SFT 权重和已修复代码，三节点代码版本已对齐。
 - [ ] 两训练节点语言模型、parquet、reward pool、replay 原始文件和索引都可读。
-- [ ] 九个指定数据配置缓存范围正确，没有误下 V35。
+- [ ] 九个指定数据配置缓存范围正确，没有误下 `SFT_User_Profile_TestSet`。
 - [ ] Embedding health 和实际向量接口均成功，两个训练节点都能访问。
 - [ ] Ray 只有两个训练节点、总 GPU=16；没有继承作业的 `WORLD_SIZE=3`。
 - [ ] 两训练节点 W&B 认证有效，ID/Entity/Project 一致，只有一个 writer，凭据不进入日志/config。

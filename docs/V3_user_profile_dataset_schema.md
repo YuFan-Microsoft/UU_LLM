@@ -1,9 +1,9 @@
 # V3 User Profile Dataset: Input and Output Schemas
 
-This guide covers the 8 `V3_*` configs in
+This guide covers the 8 `SFT_*_V3` configs in
 [`yufan/user_profile_dataset`](https://huggingface.co/datasets/yufan/user_profile_dataset).
 The 7 profile tasks L1–L4 use the GPT-5.6 Final teacher data (`Training_Data_InferredByGPT56_Final/process_dataset`).
-`V3_User_Profile_L1_Negative_gpt56` copies `V2_User_Profile_L1_Negative_gpt56` (train unchanged, test capped at
+`SFT_User_Profile_L1_Negative_gpt56_V3` copies `V2_User_Profile_L1_Negative_gpt56` (train unchanged, test capped at
 5,000 rows), because the Final data has no negative-feedback calls. There is no V3 Ranker config;
 `V2_User_Profile_Ranker` stays as it was.
 
@@ -14,14 +14,14 @@ missing data is represented, and what changed from V2. Section 5 lists the V2 �
 
 | Config | Folder | Task | Train | Test |
 |---|---|---|---:|---:|
-| `V3_User_Profile_L1_gpt56` | `User_Profile_L1_gpt56_V3` | Raw activities → interests | 287,557 | 4,985 |
-| `V3_User_Profile_L1_Negative_gpt56` | `User_Profile_L1_Negative_gpt56_V3` | Negative feedback → rejected topics (V2 copy) | 557,734 | 5,000 |
-| `V3_User_Profile_L2_gpt56` | `User_Profile_L2_gpt56_V3` | Existing profile + new interests → merge / add decisions | 259,606 | 4,977 |
-| `V3_User_Profile_L3_Commercial_gpt56` | `User_Profile_L3_Commercial_gpt56_V3` | Interests → commercial label, brands, search queries | 201,304 | 4,998 |
-| `V3_User_Profile_L3_Persona_gpt56` | `User_Profile_L3_Persona_gpt56_V3` | Interests → persona + category | 162,863 | 4,997 |
-| `V3_User_Profile_L4_Biography_gpt56` | `User_Profile_L4_Biography_gpt56_V3` | Interests + facts → life stage, attributes, biography | 161,345 | 5,000 |
-| `V3_User_Profile_L4_CommercialPreference_gpt56` | `User_Profile_L4_CommercialPreference_gpt56_V3` | Commercial interests → shopping preferences | 155,190 | 4,991 |
-| `V3_User_Profile_L4_Hyper_gpt56` | `User_Profile_L4_Hyper_gpt56_V3` | Commercial interests + context → ad missions + new queries | 136,511 | 4,998 |
+| `SFT_User_Profile_L1_gpt56_V3` | `User_Profile_L1_gpt56_V3` | Raw activities → interests | 287,557 | 4,985 |
+| `SFT_User_Profile_L1_Negative_gpt56_V3` | `User_Profile_L1_Negative_gpt56_V3` | Negative feedback → rejected topics (V2 copy) | 557,734 | 5,000 |
+| `SFT_User_Profile_L2_gpt56_V3` | `User_Profile_L2_gpt56_V3` | Existing profile + new interests → merge / add decisions | 259,606 | 4,977 |
+| `SFT_User_Profile_L3_Commercial_gpt56_V3` | `User_Profile_L3_Commercial_gpt56_V3` | Interests → commercial label, brands, search queries | 201,304 | 4,998 |
+| `SFT_User_Profile_L3_Persona_gpt56_V3` | `User_Profile_L3_Persona_gpt56_V3` | Interests → persona + category | 162,863 | 4,997 |
+| `SFT_User_Profile_L4_Biography_gpt56_V3` | `User_Profile_L4_Biography_gpt56_V3` | Interests + facts → life stage, attributes, biography | 161,345 | 5,000 |
+| `SFT_User_Profile_L4_CommercialPreference_gpt56_V3` | `User_Profile_L4_CommercialPreference_gpt56_V3` | Commercial interests → shopping preferences | 155,190 | 4,991 |
+| `SFT_User_Profile_L4_Hyper_gpt56_V3` | `User_Profile_L4_Hyper_gpt56_V3` | Commercial interests + context → ad missions + new queries | 136,511 | 4,998 |
 
 Train and test are split by user, so a user never appears in both splits of a config. L1 and L2 hold out 2% of
 users (hash buckets 0–199 of 10,000); L3 and L4 hold out 4.85% (buckets 0–484), so no L1/L2 test user is in any
@@ -151,7 +151,7 @@ All counts and percentages cover the full config, including train and test.
 
 ## L1: Interest extraction
 
-Config: `V3_User_Profile_L1_gpt56`
+Config: `SFT_User_Profile_L1_gpt56_V3`
 
 The model reads a window of activities and extracts the user's interests. Each row merges the GPT-5.6 Final
 `l1_delta` and `l1_actual` calls of one user-day window (there is no intent call).
@@ -205,7 +205,7 @@ The `language` column covers 49 values. The most common are:
 
 ## L1 Negative: Rejected topics
 
-Config: `V3_User_Profile_L1_Negative_gpt56`
+Config: `SFT_User_Profile_L1_Negative_gpt56_V3`
 
 The train split is a byte-for-byte copy of `V2_User_Profile_L1_Negative_gpt56`; the test split keeps 5,000 of its
 11,184 rows (section 1). The model reads a batch of negative feedback and identifies the topics the user wants to
@@ -245,7 +245,7 @@ Every input signal is cited by at least one negative interest. The input and out
 
 ## L2: Profile merge
 
-Config: `V3_User_Profile_L2_gpt56`
+Config: `SFT_User_Profile_L2_gpt56_V3`
 
 For each new interest, the model decides whether to merge it into an existing interest or add it to the profile.
 Names and activities follow the language of their topics, so a German delta can merge into an English snapshot
@@ -282,7 +282,7 @@ Rows were dropped when a merged or added activity is not written in the language
 
 ## L3 Commercial: Commercial classification
 
-Config: `V3_User_Profile_L3_Commercial_gpt56`
+Config: `SFT_User_Profile_L3_Commercial_gpt56_V3`
 
 For each interest, the model decides whether it is relevant to advertisers. For every interest, commercial or not,
 it also lists the brands, retailers, and products the evidence names and predicts search queries.
@@ -339,7 +339,7 @@ brand spellings can be uppercase).
 
 ## L3 Persona: Interest personas
 
-Config: `V3_User_Profile_L3_Persona_gpt56`
+Config: `SFT_User_Profile_L3_Persona_gpt56_V3`
 
 For each interest, the model describes the user's motivations and behavior and assigns a category path, both in
 the language of the interest name.
@@ -375,7 +375,7 @@ Rows were dropped when a persona is not written in the language of its interest 
 
 ## L4 Biography: User attributes and biography
 
-Config: `V3_User_Profile_L4_Biography_gpt56`
+Config: `SFT_User_Profile_L4_Biography_gpt56_V3`
 
 The model uses interests, facts, and declared attributes to infer the user's life stage and other attributes,
 then writes a short biography.
@@ -509,7 +509,7 @@ still mention "later-life" or "later life".
 
 ## L4 Commercial Preference: Shopping preferences
 
-Config: `V3_User_Profile_L4_CommercialPreference_gpt56`
+Config: `SFT_User_Profile_L4_CommercialPreference_gpt56_V3`
 
 The model summarizes how the user shops, including sensitivity to price and discounts, subscription preferences,
 shopping categories, and dietary restrictions. The input and output schemas are unchanged from V2.
@@ -567,7 +567,7 @@ When a `value` is `"Unknown"`, the corresponding `details` list is empty (`[]`).
 
 ## L4 Hyper: Ad missions and queries
 
-Config: `V3_User_Profile_L4_Hyper_gpt56`
+Config: `SFT_User_Profile_L4_Hyper_gpt56_V3`
 
 The model groups commercial interests into goals, called missions, and writes new search queries for ad
 retrieval. Each mission names the interests it came from.

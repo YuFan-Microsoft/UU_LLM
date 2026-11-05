@@ -364,7 +364,7 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 
 - Hugging Face dataset with `train` / `test` splits and a `messages` column
   (`[{"role": "user", ...}, {"role": "assistant", ...}]`).
-- User-profile SFT loads `yufan/user_profile_dataset` with the eight `V3_` configs (L1, L1 Negative, L2, L3 Persona,
+- User-profile SFT loads `yufan/user_profile_dataset` with the eight `SFT_*_V3` configs (L1, L1 Negative, L2, L3 Persona,
   L3 Commercial, L4 Biography, L4 Commercial Preference, L4 Hyper; GPT-5.6, multilingual, each with its V3 task prompt,
   rows ≤ 25,600 Qwen3.5-4B tokens; schema in `docs/V3_user_profile_dataset_schema.md`). Rollout scoring rules exist for all eight configs (see the rollout metrics below).
 - The train split is mixed with `--dataset_mixing_weights` (`V3_MIXTURE` in `deepspeed_user_profile_trainer.py`):
@@ -469,14 +469,14 @@ One section per V3 task: every section has the 4 shared charts plus 1-4 task cha
 
 | Section (config) | Charts |
 | --- | --- |
-| `L1_Interest` (`V3_User_Profile_L1_gpt56`) | shared + `topic_evidence_valid_ratio`, `avg_interest_num`, `language_match_ratio_en`, `language_match_ratio_glb` |
-| `L1_Negative` (`V3_User_Profile_L1_Negative_gpt56`) | shared + `signal_coverage_ratio`, `field_consistent_ratio` |
-| `L2_Merge` (`V3_User_Profile_L2_gpt56`) | shared + `input_match_ratio`, `merge_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
-| `L3_Persona` (`V3_User_Profile_L3_Persona_gpt56`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
-| `L3_Commercial` (`V3_User_Profile_L3_Commercial_gpt56`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb`, `avg_query_num` |
-| `L4_Biography` (`V3_User_Profile_L4_Biography_gpt56`) | shared + `declared_match_ratio`, `source_grounded_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
-| `L4_CommercialPreference` (`V3_User_Profile_L4_CommercialPreference_gpt56`) | shared + `value_detail_consistent_ratio` |
-| `L4_Hyper` (`V3_User_Profile_L4_Hyper_gpt56`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L1_Interest` (`SFT_User_Profile_L1_gpt56_V3`) | shared + `topic_evidence_valid_ratio`, `avg_interest_num`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L1_Negative` (`SFT_User_Profile_L1_Negative_gpt56_V3`) | shared + `signal_coverage_ratio`, `field_consistent_ratio` |
+| `L2_Merge` (`SFT_User_Profile_L2_gpt56_V3`) | shared + `input_match_ratio`, `merge_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L3_Persona` (`SFT_User_Profile_L3_Persona_gpt56_V3`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L3_Commercial` (`SFT_User_Profile_L3_Commercial_gpt56_V3`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb`, `avg_query_num` |
+| `L4_Biography` (`SFT_User_Profile_L4_Biography_gpt56_V3`) | shared + `declared_match_ratio`, `source_grounded_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
+| `L4_CommercialPreference` (`SFT_User_Profile_L4_CommercialPreference_gpt56_V3`) | shared + `value_detail_consistent_ratio` |
+| `L4_Hyper` (`SFT_User_Profile_L4_Hyper_gpt56_V3`) | shared + `input_match_ratio`, `language_match_ratio_en`, `language_match_ratio_glb` |
 
 | Task | Metric | Meaning |
 | --- | --- | --- |

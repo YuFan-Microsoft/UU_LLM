@@ -200,7 +200,7 @@ def visible_gpus() -> list[str]:
 # ---------------------------------------------------------------------------
 
 def read_rows(input_paths: list[Path] | None, hf_split: str):
-    """User rows from local JSONL files, or the User_Profile_TestSet split on Hugging Face."""
+    """User rows from local JSONL files, or the SFT_User_Profile_TestSet split on Hugging Face."""
     if input_paths:
         for path in input_paths:
             with path.open(encoding="utf-8") as source:
@@ -209,7 +209,7 @@ def read_rows(input_paths: list[Path] | None, hf_split: str):
         from datasets import load_dataset
 
         # Streaming downloads only this split (user_12000 is ~6 GB).
-        yield from load_dataset("yufan/user_profile_dataset", "User_Profile_TestSet", split=hf_split,
+        yield from load_dataset("yufan/user_profile_dataset", "SFT_User_Profile_TestSet", split=hf_split,
                                 streaming=True, token=os.getenv("HF_TOKEN"))
 
 

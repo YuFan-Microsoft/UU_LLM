@@ -788,9 +788,9 @@ TASK_DISPLAY_NAMES = {"L1": "L1_Interest", "L2": "L2_Merge"}
 
 
 def task_name(config):
-    """Short task name of a dataset config: "V3_User_Profile_L1_gpt56" -> "L1_Interest",
-    "V3_User_Profile_L1_Negative_gpt56" -> "L1_Negative", "V3_User_Profile_L2_gpt56" -> "L2_Merge",
-    "V3_User_Profile_L3_Persona_gpt56" -> "L3_Persona" (V1 "_gpt54" and V2 configs map the same way)."""
+    """Short task name of a dataset config: "SFT_User_Profile_L1_gpt56_V3" -> "L1_Interest",
+    "SFT_User_Profile_L1_Negative_gpt56_V3" -> "L1_Negative", "SFT_User_Profile_L2_gpt56_V3" -> "L2_Merge",
+    "SFT_User_Profile_L3_Persona_gpt56_V3" -> "L3_Persona" (V1 "_gpt54" and V2 configs map the same way)."""
     match = re.search(r"(?:^|_)(L\d+(?:_[A-Za-z]+)?)_gpt5\d(?:_|$)", config or "") \
         or re.search(r"(?:^|_)(L\d+)(?:_|$)", config or "")
     if not match:
