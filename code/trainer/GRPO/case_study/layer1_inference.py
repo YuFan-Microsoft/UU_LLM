@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
 """Layer-1 inference: what a checkpoint writes for the test split of User_Profile_Layer1_For_RL_V1, one answer per
-user, scored with the GRPO reward (../l1/l1_reward.py) against training-sized batch pools, read in report.html.
+user, read in report.html. No retrieval reward (no embeddings): each answer only gets the rule check.
 
     prepare   the test rows in a seeded order -> prompts.jsonl (cleaned history week, cleaned next-week actions)
-    rollout   vLLM, one answer per prompt (inference sampling by default) -> rollouts.jsonl
-    score     reward and signals per answer, pools of about --pool_size users -> scores.jsonl, summary.json, report.html
+    rollout   vLLM, one answer per prompt (inference sampling by default) -> rollouts.jsonl, then report
+    report    rule check per answer (l1_reward.judge) -> summary.json, report.html
 
-The rollout (Layer-1 input built as inference builds it) and the HTML page are layer1_sampling.py's; only the data, the
-single answer per prompt and the batch pools differ.
+The rollout (Layer-1 input built as inference builds it) and the HTML page are layer1_sampling.py's; only the data and
+the single answer per prompt differ.
 """
 
 import argparse
@@ -25,13 +25,12 @@ HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import layer1_sampling as base  # noqa: E402
 
-from l1_reward import DEFAULT_EMBEDDING_MODEL, TOP_K, L1Reward, input_signals  # noqa: E402
+from l1_reward import judge  # noqa: E402
 from rl_data import DEFAULT_CHECKPOINT, HF_REPO, clean_behaviors, hf_token, row_key  # noqa: E402
 from utils import dumps  # noqa: E402
 
 HF_CONFIG = "User_Profile_Layer1_For_RL_V1"
 SPLIT = "test"
-POOL_SIZE = 64  # data.train_batch_size of run_l1_grpo.sh: the users whose actions share one reward pool
 
 
 # ---------------------------------------------------------------------------
@@ -114,78 +113,61 @@ def prepare(args: argparse.Namespace) -> None:
 # ---------------------------------------------------------------------------
 
 def rollout(args: argparse.Namespace) -> None:
-    """layer1_sampling.py's rollout with one answer per prompt."""
+    """layer1_sampling.py's rollout with one answer per prompt, then the report."""
     args.n = 1
     base.rollout(args)
+    report(args)
 
 
 # ---------------------------------------------------------------------------
-# score
+# report
 # ---------------------------------------------------------------------------
 
-def pools(count: int, pool_size: int) -> list[range]:
-    """Consecutive prompts in round(count / pool_size) near-equal pools (at least one), so no pool is much smaller
-    than a training batch."""
-    number = max(1, round(count / pool_size))
-    return [range(index * count // number, (index + 1) * count // number) for index in range(number)]
-
-
-def summarize(metrics: list[dict], outputs: list[dict | None]) -> dict:
-    """Mean of every metric over all answers, and the interest count of the JSON-valid ones."""
-    summary = {"metrics": {name: statistics.mean(m[name] for m in metrics) for name in metrics[0]}}
-    counts = sorted(len(output["interests"]) for output in outputs if output is not None)
+def summarize(results: list[dict]) -> dict:
+    """Shares of JSON-valid and rule-passing answers, the interest count of the JSON-valid ones, the violations."""
+    summary = {"prompts": len(results),
+               "json_valid": statistics.mean(result["metrics"]["json_valid"] for result in results),
+               "rule_pass": statistics.mean(result["metrics"]["rule_pass"] for result in results)}
+    counts = sorted(len(result["output"]["interests"]) for result in results if result["output"] is not None)
     if counts:
         summary["n_interests_valid"] = {"min": counts[0], "median": statistics.median(counts),
                                         "p90": counts[min(len(counts) - 1, int(0.9 * len(counts)))],
                                         "max": counts[-1]}
+    summary["violations"] = dict(Counter(v for result in results for v in result["violations"]).most_common())
     return summary
 
 
-def score(args: argparse.Namespace) -> None:
-    """Each pool holds the visible past actions and the next-week actions of its own prompts only, as one GRPO batch
-    does; every answer is ranked against its prompt's pool."""
+def report(args: argparse.Namespace) -> None:
+    """report.html of rollouts.jsonl: every answer with its rule check (l1_reward.judge, the GRPO judgement: V3 JSON,
+    user_profile_rules, label token limits with the generation tokenizer, truncation) and no retrieval reward."""
     from transformers import AutoProcessor
 
     rows = base.read_jsonl(args.output_dir / "rollouts.jsonl")
-    tokenizer = AutoProcessor.from_pretrained(args.checkpoint, trust_remote_code=True).tokenizer
-    reward_fn = L1Reward(args.embedding_model, args.embedding_batch_size, top_k=args.top_k,
-                         embedding_url=args.embedding_url, tokenizer=tokenizer)
-    batches = pools(len(rows), args.pool_size)
-    results = []
-    with (args.output_dir / "scores.jsonl").open("w", encoding="utf-8") as sink:
-        for pool_id, members in enumerate(batches):
-            batch = [rows[index] for index in members]
-            reward_fn.set_pools(
-                past_actions=[signal["action"] for row in batch for signal in input_signals(row["content"])],
-                future_actions=[behavior["action"] for row in batch for behavior in row["future"]],
-            )
-            for row in batch:
-                raw = row["samples"][0]
-                sample = reward_fn(row["content"], raw["text"], raw["finish_reason"],
-                                   [behavior["action"] for behavior in row["future"]])
-                result = {"metrics": base.sample_metrics(sample, args.top_k), "violations": sample["violations"],
-                          "output": sample["output"], "queries": sample["queries"],
-                          "past_hits": sample["past_hits"], "future_hits": sample["hits"]}
-                results.append(result)
-                sink.write(dumps({"prompt_id": row["prompt_id"], "user_id": row["user_id"], "pool": pool_id,
-                                  **result["metrics"], "violations": result["violations"]}) + "\n")
-            print(f"Scored pool {pool_id + 1}/{len(batches)} ({len(batch)} prompts)", flush=True)
-
-    summary = summarize([result["metrics"] for result in results], [result["output"] for result in results])
-    summary["violations"] = dict(Counter(v for result in results for v in result["violations"]).most_common())
-    summary["prompts"], summary["pool_sizes"] = len(rows), sorted({len(members) for members in batches})
-    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
     settings_path = args.output_dir / "rollout_settings.json"
     settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
-    base.write_html(args.output_dir / "report.html", rows, [[result] for result in results],
-                    {**settings, "pool_size": args.pool_size}, args.top_k)
+    checkpoint = args.checkpoint or settings.get("checkpoint")
+    if not checkpoint:
+        raise SystemExit("--checkpoint is required: no rollout_settings.json names the generation checkpoint")
+    tokenizer = AutoProcessor.from_pretrained(checkpoint, trust_remote_code=True).tokenizer
+    results = []
+    for row in rows:
+        raw = row["samples"][0]
+        rules, output = judge(row["content"], raw["text"], raw["finish_reason"], tokenizer)
+        results.append({
+            "metrics": {"json_valid": int(rules["json_valid"]), "rule_pass": int(rules["rule_pass"]),
+                        "n_interests": len(output["interests"]) if output else 0,
+                        "output_tokens": raw.get("output_tokens")},
+            "violations": rules["violations"], "output": output,
+            "queries": None, "past_hits": None, "future_hits": None,
+        })
 
-    print(f"{summary['prompts']} prompts, one answer each, pools of {summary['pool_sizes']} prompts")
-    for name, value in summary["metrics"].items():
-        print(f"{name:<28}{value:>10.3f}")
+    summary = summarize(results)
+    (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+    base.write_html(args.output_dir / "report.html", rows, [[result] for result in results], settings, None)
+    print(f"{summary['prompts']} prompts: JSON-valid {summary['json_valid']:.3f}, rule pass {summary['rule_pass']:.3f}")
     print("interests (JSON-valid answers):", summary.get("n_interests_valid"))
     print("violations:", summary["violations"])
-    print(f"-> {args.output_dir / 'scores.jsonl'}, summary.json, report.html")
+    print(f"-> {args.output_dir / 'summary.json'}, report.html")
 
 
 # ---------------------------------------------------------------------------
@@ -205,7 +187,7 @@ def parse_args() -> argparse.Namespace:
                         "directory above it)")
     p.add_argument("--num_prompts", type=int, default=0, help="Prompts to keep (0 = every usable row)")
 
-    r = sub.add_parser("rollout", parents=[common], help="vLLM, one answer per prompt of prompts.jsonl")
+    r = sub.add_parser("rollout", parents=[common], help="vLLM, one answer per prompt of prompts.jsonl, then report")
     r.add_argument("--checkpoint", default=DEFAULT_CHECKPOINT)
     r.add_argument("--temperature", type=float, default=0.6, help="Inference default (GRPO rollouts use 1.0)")
     r.add_argument("--top_p", type=float, default=0.8, help="Inference default (GRPO rollouts use 1.0)")
@@ -217,23 +199,16 @@ def parse_args() -> argparse.Namespace:
     r.add_argument("--gpu_memory_utilization", type=float)
     r.add_argument("--max_num_seqs", type=int)
 
-    s = sub.add_parser("score", parents=[common], help="Reward and signals of rollouts.jsonl, batch pools")
-    s.add_argument("--checkpoint", required=True,
-                   help="Generation checkpoint whose tokenizer counts interest_name and topic tokens")
-    s.add_argument("--embedding_model", default=DEFAULT_EMBEDDING_MODEL,
-                   help="Qwen3-Embedding path of the reward, loaded in process (on a GPU when there is one)")
-    s.add_argument("--embedding_url", help="A vLLM embedding server of the same model instead (vllm serve <model> "
-                                            "--runner pooling --served-model-name l1-embedding)")
-    s.add_argument("--embedding_batch_size", type=int, default=256)
-    s.add_argument("--top_k", type=int, default=TOP_K, help="Actions each interest retrieves (the K of the reward)")
-    s.add_argument("--pool_size", type=int, default=POOL_SIZE,
-                   help="Users per reward pool (the GRPO batch size); prompts are split into near-equal pools")
+    s = sub.add_parser("report", parents=[common], help="Rule check and report.html of rollouts.jsonl")
+    s.add_argument("--checkpoint",
+                   help="Generation checkpoint whose tokenizer counts interest_name and topic tokens "
+                        "(default: the one in rollout_settings.json)")
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    {"prepare": prepare, "rollout": rollout, "score": score}[args.command](args)
+    {"prepare": prepare, "rollout": rollout, "report": report}[args.command](args)
 
 
 if __name__ == "__main__":

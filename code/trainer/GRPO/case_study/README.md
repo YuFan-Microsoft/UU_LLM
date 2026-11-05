@@ -5,7 +5,7 @@ Read what a checkpoint writes and what the GRPO reward makes of it, in two ways:
 - `layer1_sampling.py` (`run_layer1_sampling.sh`): a GRPO-sized group of sampled answers per prompt, to see how
   they vary and what the reward makes of the variation (what GRPO learns from).
 - `layer1_inference.py` (`run_layer1_inference.sh`): one answer per held-out user with the inference sampling, to
-  see what the model's direct inference output looks like (see
+  see what the model's direct inference output looks like; rule check only, no retrieval reward (see
   [One answer per held-out user](#one-answer-per-held-out-user-layer1_inferencepy)).
 
 `layer1_sampling.py` rolls out a GRPO-sized group of
@@ -77,15 +77,17 @@ its default output directory is `outputs/<run>_global_step_<N>`.
 `{"user_id", "raw_history_targets", "future_targets"}`, behaviors `{"date", "source", "action", "detailed_source"}`;
 only the test shard is downloaded, to a temporary directory) and generates **one** answer per user, sampled with the
 inference setting (temperature 0.6, top-p 0.8). `prepare` takes every row (`--num_prompts` to limit) in the seeded
-order of `row_key` and cleans both weeks as above; `rollout` is `layer1_sampling.py`'s with `n = 1`; `score` splits the
-prompts, in that order, into near-equal pools of about `--pool_size` (64, the GRPO batch size) users, so each
-answer is ranked against the visible past and next-week actions of its own pool only, as in training. It writes
-`scores.jsonl` (with each answer's pool), `summary.json` (mean signals, interest counts, violations) and the same
-`report.html` (one rollout per prompt).
+order of `row_key` and cleans both weeks as above; `rollout` is `layer1_sampling.py`'s with `n = 1`, followed by
+`report`. There is no retrieval reward (no embedding model): `report` only applies the GRPO rule check
+(`l1_reward.judge`: V3 JSON, `user_profile_rules`, the label token limits with the generation tokenizer, truncation)
+and writes `summary.json` (JSON-valid and rule-pass shares, interest counts, violations) and the same `report.html`
+(one answer per prompt, with its next-week actions on the side). `report` alone rebuilds the page from an existing
+`rollouts.jsonl` (the checkpoint defaults to the one in `rollout_settings.json`).
 
 ```bash
 sh run_layer1_inference.sh [<ckpt_dir>]   # -> outputs/layer1_inference_<checkpoint name>/report.html
-# NUM_PROMPTS (0 = all), TEMPERATURE (0.6), TOP_P (0.8), POOL_SIZE (64), SEED (0), EMBEDDING_MODEL
+# NUM_PROMPTS (0 = all), TEMPERATURE (0.6), TOP_P (0.8), SEED (0)
+python layer1_inference.py report --output_dir outputs/layer1_inference_<checkpoint name>
 ```
 
 ## GRPO runs
