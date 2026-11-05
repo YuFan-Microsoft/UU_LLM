@@ -1,12 +1,18 @@
 """Qwen3.5 text-only 3-class classifier on EVAL_Dataset of yufan/user_profile_dataset.
 
 Input: a short instruction + mai_profile + future_behavior (both JSON strings without null keys, as stored on HF).
-Output: the next-token logits of "No" / "Partial" / "Perfect" after the non-thinking assistant prompt, i.e. the
+Output: the next-token scores of "No" / "Partial" / "Perfect" after the non-thinking assistant prompt, i.e. the
 labels "no match" / "partial match" / "perfect match" (the same scoring idea as Qwen3VL.py with Bad / Fair / Good).
+
+Full-parameter fine-tuning with DeepSpeed ZeRO. The language model keeps its standard Qwen3.5 structure; the
+classifier only reads its last hidden state with a frozen [3, hidden] head, the lm_head rows of the three answers.
+A checkpoint is a standard Qwen3.5 save_pretrained directory (loadable anywhere with from_pretrained) plus
+class_head.pt; load_classifier restores both.
 """
 import argparse
 import glob
 import json
+import math
 import os
 import random
 from pathlib import Path
@@ -17,8 +23,7 @@ import pyarrow.parquet as pq
 import torch
 import torch.nn.functional as F
 from accelerate import Accelerator
-from accelerate.utils import DataLoaderConfiguration
-from peft import LoraConfig, PeftModel, get_peft_model
+from accelerate.utils import DataLoaderConfiguration, DeepSpeedPlugin
 from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 from torch.utils.data import DataLoader, Dataset
 from tqdm import tqdm
@@ -27,6 +32,7 @@ from transformers import AutoTokenizer, Qwen3_5ForConditionalGeneration, get_cos
 os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
 
 LABELS = ["no match", "partial match", "perfect match"]
+CLASS_HEAD_FILE = "class_head.pt"
 ANSWERS = ["No", "Partial", "Perfect"]
 PROMPT = ("Does the user profile predict the future behavior? Answer No, Partial or Perfect.\n\n"
           "Profile: {profile}\n\nBehavior: {behavior}")
@@ -93,9 +99,10 @@ class ProfileBehaviorDataset(Dataset):
         if len(input_ids) > self.max_length:
             # Keep the instruction, the behavior and the answer position; cut the end of the profile.
             profile_ids = self.tokenizer.encode(profile, add_special_tokens=False)
-            while len(input_ids) > self.max_length:
+            while len(input_ids) > self.max_length and profile_ids:
                 profile_ids = profile_ids[:max(0, len(profile_ids) - (len(input_ids) - self.max_length) - 8)]
                 input_ids = self.encode(self.tokenizer.decode(profile_ids), behavior)
+            input_ids = input_ids[-self.max_length:]  # only if the behavior alone is too long; keeps the answer slot
         return {"input_ids": input_ids, "class_label": int(self.labels[row])}
 
 
@@ -135,19 +142,17 @@ def answer_token_ids(tokenizer):
     return torch.tensor([i[0] for i in ids])
 
 
-def class_logits(model, batch, answer_ids):
-    """[B, 3] logits of No / Partial / Perfect at the last position (lm_head runs on that position only)."""
-    outputs = model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"], use_cache=False,
-                    logits_to_keep=1)
-    return outputs.logits[:, -1, :].index_select(-1, answer_ids).float()
+def class_logits(model, batch):
+    """[B, 3] logits of No / Partial / Perfect at the last position."""
+    return model(input_ids=batch["input_ids"], attention_mask=batch["attention_mask"]).float()
 
 
 @torch.no_grad()
-def evaluate(model, loader, answer_ids, accelerator, desc="Eval"):
+def evaluate(model, loader, accelerator, desc="Eval"):
     model.eval()
     all_logits, all_labels = [], []
     for batch in tqdm(loader, desc=desc, disable=not accelerator.is_main_process, dynamic_ncols=True):
-        logits, labels = accelerator.gather_for_metrics((class_logits(model, batch, answer_ids), batch["class_label"]))
+        logits, labels = accelerator.gather_for_metrics((class_logits(model, batch), batch["class_label"]))
         all_logits.append(logits.cpu())
         all_labels.append(labels.cpu())
     model.train()
@@ -185,34 +190,77 @@ def require_linear_attention_kernels():
         raise RuntimeError(f"Install {' and '.join(missing)} for the Qwen3.5 linear-attention kernels")
 
 
-def load_model(args):
-    model = Qwen3_5ForConditionalGeneration.from_pretrained(
-        args.model_name_or_path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True,
-        attn_implementation=args.attn_implementation)
-    model.config.use_cache = False
+class ProfileClassifier(torch.nn.Module):
+    """A standard Qwen3.5 model (self.lm, saved and loaded with save_pretrained / from_pretrained) whose last hidden
+    state is scored by a frozen [3, hidden] head: the lm_head rows of No / Partial / Perfect, i.e. the same scores as
+    those three columns of the full next-token logits. The 248320-row lm_head itself is never run."""
+
+    def __init__(self, lm, class_head):
+        super().__init__()
+        self.lm = lm
+        self.register_buffer("class_head", class_head.detach().clone())
+
+    def forward(self, input_ids, attention_mask):
+        hidden = self.lm.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)[0]
+        return F.linear(hidden[:, -1, :], self.class_head.to(hidden.dtype))
+
+
+def load_classifier(path, answer_ids, args):
+    """Base model or checkpoint dir -> ProfileClassifier. A checkpoint's class_head.pt is the head it was trained with;
+    for the base model the head is the lm_head rows of the answers (for Qwen3.5-4B, tied to the input embeddings, which
+    full fine-tuning changes, so a checkpoint must never rebuild the head from its own lm_head)."""
+    lm = Qwen3_5ForConditionalGeneration.from_pretrained(
+        path, torch_dtype=torch.bfloat16, low_cpu_mem_usage=True, attn_implementation=args.attn_implementation)
+    lm.config.use_cache = False
+    head_file = os.path.join(path, CLASS_HEAD_FILE)
+    if os.path.exists(head_file):
+        saved = torch.load(head_file, map_location="cpu")
+        if saved["answers"] != ANSWERS or saved["token_ids"] != answer_ids.tolist():
+            raise ValueError(f"{head_file} is for {saved['answers']} {saved['token_ids']}, "
+                             f"not {ANSWERS} {answer_ids.tolist()}")
+        class_head = saved["weight"].to(torch.bfloat16)
+    else:
+        class_head = lm.lm_head.weight.detach()[answer_ids].to(torch.bfloat16)
     if args.gradient_checkpointing:
-        model.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
-        model.enable_input_require_grads()
-    if args.lora_path:
-        model = PeftModel.from_pretrained(model, args.lora_path, is_trainable=not args.eval_only)
-    elif args.use_lora and not args.eval_only:
-        # Text-only forward never runs the vision tower or the MTP head, so they get no LoRA (unused DDP params).
-        model = get_peft_model(model, LoraConfig(
-            r=args.lora_rank, lora_alpha=args.lora_alpha, lora_dropout=0.05, bias="none", task_type="CAUSAL_LM",
-            target_modules="all-linear", exclude_modules=r".*(visual|mtp).*"))
-    return model
+        lm.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    # The text-only forward never runs the vision tower, the MTP head or the full lm_head: freeze them so the
+    # optimizer holds no state for them. A tied lm_head is the input embedding matrix, which stays trainable.
+    tied = lm.lm_head.weight is lm.get_input_embeddings().weight
+    for name, param in lm.named_parameters():
+        if "visual" in name or "mtp" in name or (name.startswith("lm_head") and not tied):
+            param.requires_grad_(False)
+    return ProfileClassifier(lm, class_head)
 
 
-def save_model(model, tokenizer, accelerator, args, step, metrics):
+def deepspeed_config(args):
+    """ZeRO settings of ../SFT/deepspeed_llm_trainer.py (see ../SFT/README.md "Training speed optimization log")."""
+    zero = {"stage": args.zero_stage, "overlap_comm": True, "contiguous_gradients": True, "reduce_scatter": True,
+            "reduce_bucket_size": 5e8}
+    if args.zero_stage == 3:
+        zero.update(stage3_param_persistence_threshold=1e4, stage3_max_live_parameters=1e9,
+                    stage3_prefetch_bucket_size=5e8, stage3_gather_16bit_weights_on_model_save=True)
+    else:
+        zero.update(allgather_bucket_size=5e8)
+    return {"train_micro_batch_size_per_gpu": args.batch_size, "gradient_accumulation_steps": 1,
+            "gradient_clipping": 1.0, "bf16": {"enabled": True}, "zero_optimization": zero}
+
+
+def save_checkpoint(model, tokenizer, accelerator, args, step, metrics):
+    """step_<N>/: the full Qwen3.5 model (standard save_pretrained, loadable with from_pretrained), the tokenizer,
+    class_head.pt and metrics.json."""
     save_dir = os.path.join(args.output_dir, f"step_{step}")
     accelerator.wait_for_everyone()
+    state = accelerator.get_state_dict(model)  # gathers the ZeRO shards; every rank must call it
+    classifier = accelerator.unwrap_model(model)
     if accelerator.is_main_process:
         os.makedirs(save_dir, exist_ok=True)
-    accelerator.unwrap_model(model).save_pretrained(
-        save_dir, is_main_process=accelerator.is_main_process, save_function=accelerator.save,
-        state_dict=accelerator.get_state_dict(model))
-    if accelerator.is_main_process:
+        lm_state = {k[len("lm."):]: v for k, v in state.items() if k.startswith("lm.")}
+        classifier.lm.config.use_cache = True  # save the standard config; training runs without a KV cache
+        classifier.lm.save_pretrained(save_dir, state_dict=lm_state, safe_serialization=True)
+        classifier.lm.config.use_cache = False
         tokenizer.save_pretrained(save_dir)
+        torch.save({"answers": ANSWERS, "token_ids": answer_token_ids(tokenizer).tolist(),
+                    "weight": classifier.class_head.detach().cpu()}, os.path.join(save_dir, CLASS_HEAD_FILE))
         with open(os.path.join(save_dir, "metrics.json"), "w") as f:
             json.dump(metrics or {}, f, indent=2)
         print(f"Saved {save_dir}")
@@ -224,7 +272,7 @@ def save_model(model, tokenizer, accelerator, args, step, metrics):
 # =========================================================
 def parse_args():
     parser = argparse.ArgumentParser("Qwen3.5 profile-behavior 3-class classifier")
-    parser.add_argument("--model_name_or_path", default="/yufan/open_source_models/Qwen3.5_VLM/Qwen3.5-9B/")
+    parser.add_argument("--model_name_or_path", default="/yufan/open_source_models/Qwen3.5_VLM/Qwen3.5-4B/")
     parser.add_argument("--data_dir", default="../data/EVAL_Dataset",
                         help="Local EVAL_Dataset folder with train-*.parquet and test-*.parquet")
     parser.add_argument("--max_length", type=int, default=16384,
@@ -236,11 +284,9 @@ def parse_args():
                              "the final eval uses the whole test split. Evaluation is sharded across all GPUs")
     parser.add_argument("--seed", type=int, default=42)
 
-    parser.add_argument("--use_lora", type=int, default=1)
-    parser.add_argument("--lora_rank", type=int, default=128)
-    parser.add_argument("--lora_alpha", type=int, default=256)
-    parser.add_argument("--lora_path", default="", help="Resume from, or evaluate, a saved LoRA adapter")
-    parser.add_argument("--eval_only", action="store_true", help="Only evaluate --lora_path (or the base model)")
+    parser.add_argument("--checkpoint", default="",
+                        help="A saved step_<N> directory to evaluate (--eval_only) or to continue training from")
+    parser.add_argument("--eval_only", action="store_true", help="Only evaluate --checkpoint (or the base model)")
 
     parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=4, help="Per GPU (no gradient accumulation)")
@@ -249,21 +295,27 @@ def parse_args():
     parser.add_argument("--warmup_ratio", type=float, default=0.03)
     parser.add_argument("--weight_decay", type=float, default=0.0)
     parser.add_argument("--gradient_checkpointing", type=int, default=1)
+    parser.add_argument("--zero_stage", type=int, default=2, choices=[2, 3],
+                        help="DeepSpeed ZeRO stage for full-parameter training (2 is faster on one node)")
     parser.add_argument("--attn_implementation", default="flash_attention_2",
                         help="Attention of the full-attention layers (flash_attention_2 or sdpa)")
     parser.add_argument("--num_workers", type=int, default=4, help="DataLoader workers per GPU (tokenization)")
 
-    parser.add_argument("--eval_steps", type=int, default=1000, help="Evaluate and save every N optimizer steps")
-    parser.add_argument("--output_dir", default="../output/qwen35_9B_profile_classifier")
-    parser.add_argument("--wandb_project", default="qwen35_9B_profile_classifier",
+    parser.add_argument("--eval_steps", type=int, default=1000, help="Evaluate every N optimizer steps")
+    parser.add_argument("--save_steps", type=int, default=5000,
+                        help="Save a full checkpoint (~8 GB for 4B) every N steps; the final model is always saved")
+    parser.add_argument("--output_dir", default="../output/qwen35_4B_profile_classifier")
+    parser.add_argument("--wandb_project", default="qwen35_4B_profile_classifier",
                         help="W&B project ('' disables W&B); key from WANDB_API_KEY or UU_LLM/wandb_key.txt")
-    parser.add_argument("--wandb_name", default="qwen35_9B_profile_classifier")
+    parser.add_argument("--wandb_name", default="qwen35_4B_profile_classifier")
     return parser.parse_args()
 
 
 def main():
     args = parse_args()
-    accelerator = Accelerator(mixed_precision="bf16", dataloader_config=DataLoaderConfiguration(non_blocking=True))
+    accelerator = Accelerator(
+        mixed_precision="bf16", dataloader_config=DataLoaderConfiguration(non_blocking=True),
+        deepspeed_plugin=None if args.eval_only else DeepSpeedPlugin(hf_ds_config=deepspeed_config(args)))
     if args.eval_only:
         args.wandb_project = ""
     if args.wandb_project and accelerator.is_main_process:
@@ -275,7 +327,7 @@ def main():
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
     tokenizer.padding_side = "left"
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    answer_ids = answer_token_ids(tokenizer).to(accelerator.device)
+    answer_ids = answer_token_ids(tokenizer)
     collator = LeftPadCollator(pad_token_id, args.max_length)
 
     test = load_split(args.data_dir, "test")
@@ -287,17 +339,21 @@ def main():
         print("===== First prompt =====\n" + tokenizer.decode(full_eval_ds[0]["input_ids"]) + "\n========================")
 
     require_linear_attention_kernels()
-    model = load_model(args)
-    if accelerator.is_main_process and hasattr(model, "print_trainable_parameters"):
-        model.print_trainable_parameters()
+    model = load_classifier(args.checkpoint or args.model_name_or_path, answer_ids, args)
+    if accelerator.is_main_process:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        print(f"Model {args.checkpoint or args.model_name_or_path}: {trainable / 1e9:.2f}B trainable of "
+              f"{sum(p.numel() for p in model.parameters()) / 1e9:.2f}B parameters")
 
     def make_eval_loader(dataset):
         return DataLoader(dataset, batch_size=args.eval_batch_size, shuffle=False, collate_fn=collator,
                           num_workers=args.num_workers, pin_memory=True, persistent_workers=args.num_workers > 0)
 
     if args.eval_only:
-        model, full_eval_loader = accelerator.prepare(model, make_eval_loader(full_eval_ds))
-        evaluate(model, full_eval_loader, answer_ids, accelerator, desc="Eval (full test)")
+        # Forward only: each GPU holds the whole model, the test batches are sharded across GPUs.
+        model.to(accelerator.device)
+        full_eval_loader = accelerator.prepare(make_eval_loader(full_eval_ds))
+        evaluate(model, full_eval_loader, accelerator, desc="Eval (full test)")
         return
 
     train = load_split(args.data_dir, "train")
@@ -310,14 +366,18 @@ def main():
     train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, collate_fn=collator,
                               num_workers=args.num_workers, pin_memory=True, persistent_workers=args.num_workers > 0)
 
-    optimizer = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=args.learning_rate,
-                                  weight_decay=args.weight_decay, fused=True)
-    model, optimizer, train_loader, eval_loader, full_eval_loader = accelerator.prepare(
-        model, optimizer, train_loader, make_eval_loader(eval_ds), make_eval_loader(full_eval_ds))
-    total_steps = args.epochs * len(train_loader)
+    from deepspeed.ops.adam import FusedAdam  # the SFT trainer's optimizer
+
+    optimizer = FusedAdam([p for p in model.parameters() if p.requires_grad], lr=args.learning_rate,
+                          betas=(0.9, 0.95), weight_decay=args.weight_decay)
+    # The loader is not sharded yet: each rank will see every num_processes-th batch.
+    total_steps = args.epochs * math.ceil(len(train_loader) / accelerator.num_processes)
     lr_scheduler = get_cosine_schedule_with_warmup(optimizer, int(total_steps * args.warmup_ratio), total_steps)
+    model, optimizer, train_loader, eval_loader, full_eval_loader, lr_scheduler = accelerator.prepare(
+        model, optimizer, train_loader, make_eval_loader(eval_ds), make_eval_loader(full_eval_ds), lr_scheduler)
     if accelerator.is_main_process:
-        print(f"{len(train_loader)} steps per epoch, global batch {args.batch_size * accelerator.num_processes}")
+        print(f"ZeRO-{args.zero_stage}: {len(train_loader)} steps per epoch, "
+              f"global batch {args.batch_size * accelerator.num_processes}")
 
     if args.wandb_project and accelerator.is_main_process:
         import wandb
@@ -329,30 +389,31 @@ def main():
             wandb.log({f"{prefix}/{k}": v for k, v in metrics.items()}, step=global_step)
 
     global_step = 0
-    log(evaluate(model, eval_loader, answer_ids, accelerator, desc="Eval @ step 0"), "eval")
+    metrics = evaluate(model, eval_loader, accelerator, desc="Eval @ step 0")
+    log(metrics, "eval")
     model.train()
     for epoch in range(args.epochs):
         progress = tqdm(total=len(train_loader), desc=f"Epoch {epoch + 1}", disable=not accelerator.is_main_process,
                         dynamic_ncols=True)
         for batch in train_loader:
-            loss = F.cross_entropy(class_logits(model, batch, answer_ids), batch["class_label"])
-            accelerator.backward(loss)
-            accelerator.clip_grad_norm_(model.parameters(), 1.0)
+            loss = F.cross_entropy(class_logits(model, batch), batch["class_label"])
+            accelerator.backward(loss)  # DeepSpeed: backward, clipping (gradient_clipping 1.0) and the engine step
             optimizer.step()
             lr_scheduler.step()
-            optimizer.zero_grad(set_to_none=True)
+            optimizer.zero_grad()
             global_step += 1
             progress.update(1)
             progress.set_postfix(loss=f"{loss.item():.4f}", lr=f"{lr_scheduler.get_last_lr()[0]:.2e}")
             log({"loss": loss.item(), "lr": lr_scheduler.get_last_lr()[0]}, "train")
             if global_step % args.eval_steps == 0:
-                metrics = evaluate(model, eval_loader, answer_ids, accelerator, desc=f"Eval @ step {global_step}")
+                metrics = evaluate(model, eval_loader, accelerator, desc=f"Eval @ step {global_step}")
                 log(metrics, "eval")
-                save_model(model, tokenizer, accelerator, args, global_step, metrics)
+            if global_step % args.save_steps == 0:
+                save_checkpoint(model, tokenizer, accelerator, args, global_step, metrics)
         progress.close()
 
-    metrics = evaluate(model, full_eval_loader, answer_ids, accelerator, desc="Final eval (full test)")
-    save_model(model, tokenizer, accelerator, args, global_step, metrics)
+    metrics = evaluate(model, full_eval_loader, accelerator, desc="Final eval (full test)")
+    save_checkpoint(model, tokenizer, accelerator, args, global_step, metrics)
     if args.wandb_project and accelerator.is_main_process:
         import wandb
         wandb.finish()
