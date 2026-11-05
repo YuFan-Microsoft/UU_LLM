@@ -10,7 +10,7 @@ from transformers import AutoProcessor
 
 DEFAULT_DATASET_NAME = "yufan/user_profile_dataset"
 DEFAULT_MODEL_PATH = "/yufan/open_source_models/Qwen3.5_VLM/Qwen3.5-4B/"
-DEFAULT_CONFIGS = ("User_Profile_L1_gpt54", "User_Profile_L2_gpt54")
+DEFAULT_CONFIGS = ("SFT_User_Profile_L1_gpt56_V3", "SFT_User_Profile_L2_gpt56_V3")
 DEFAULT_SPLITS = ("train", "test")
 
 

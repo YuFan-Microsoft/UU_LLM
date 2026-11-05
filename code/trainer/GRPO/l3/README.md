@@ -50,8 +50,8 @@ Required columns are `user_id`, `cutoff`, `past_behaviors`, and `future_behavior
 the dataset's `history_start`, `future_end`, and `split` columns are also validated.
 
 Parquet records are temporarily staged as JSONL for indexed, multi-GPU inference.
-The history comes from `past_behaviors`, not the already deduplicated
-`raw_history_targets`, so recurring actions in different weeks remain available.
+The history comes from `past_behaviors`, so recurring actions in different weeks
+remain available.
 File/row provenance in outputs points to the pinned HF shard, not a temporary path.
 
 Authentication reuses the L1 convention: `HF_TOKEN`, or the git-ignored `hf_token.txt`
