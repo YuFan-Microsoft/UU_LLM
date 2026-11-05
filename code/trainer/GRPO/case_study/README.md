@@ -77,7 +77,8 @@ its default output directory is `outputs/<run>_global_step_<N>`.
 `{"user_id", "raw_history_targets", "future_targets"}`, behaviors `{"date", "source", "action", "detailed_source"}`;
 only the test shard is downloaded, to a temporary directory) and generates **one** answer per user, sampled with the
 inference setting (temperature 0.6, top-p 0.8). `prepare` takes every row (`--num_prompts` to limit) in the seeded
-order of `row_key` and cleans both weeks as above; `rollout` is `layer1_sampling.py`'s with `n = 1`, followed by
+order of `row_key` over each row's `user_id` (so the users and their order do not depend on the file format) and
+cleans both weeks as above; `rollout` is `layer1_sampling.py`'s with `n = 1`, followed by
 `report`. There is no retrieval reward (no embedding model): `report` only applies the GRPO rule check
 (`l1_reward.judge`: V3 JSON, `user_profile_rules`, the label token limits with the generation tokenizer, truncation)
 and writes `summary.json` (JSON-valid and rule-pass shares, interest counts, violations) and the same `report.html`

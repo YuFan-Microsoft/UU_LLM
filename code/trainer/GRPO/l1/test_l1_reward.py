@@ -577,7 +577,8 @@ class CaseStudyTest(unittest.TestCase):
 
 class Layer1InferenceTest(unittest.TestCase):
     def test_prepare_reads_test_rows(self):
-        import gzip
+        import pyarrow as pa
+        import pyarrow.parquet as pq
 
         from case_study import layer1_inference
 
@@ -588,8 +589,7 @@ class Layer1InferenceTest(unittest.TestCase):
                  "future_targets": behaviors([f"F{index}"] if index else [], "2026-07-17")} for index in range(3)]
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            with gzip.open(root / "test-00000-of-00001.jsonl.gz", "wt", encoding="utf-8") as sink:
-                sink.writelines(json.dumps(row) + "\n" for row in rows)
+            pq.write_table(pa.Table.from_pylist(rows), root / "test-00000-of-00001.parquet")
             args = argparse.Namespace(data_dir=root, output_dir=root / "out", seed=0, num_prompts=0)
             with patch("builtins.print"):
                 layer1_inference.prepare(args)

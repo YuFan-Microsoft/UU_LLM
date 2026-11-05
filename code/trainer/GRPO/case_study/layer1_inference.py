@@ -13,7 +13,6 @@ the single answer per prompt differ.
 import argparse
 from collections import Counter
 from contextlib import contextmanager
-import gzip
 import json
 import os
 from pathlib import Path
@@ -38,14 +37,14 @@ SPLIT = "test"
 # ---------------------------------------------------------------------------
 
 def download(directory: Path) -> list[Path]:
-    """The test shards (<config>/test-*.jsonl.gz) of the gated dataset, downloaded into `directory`."""
+    """The test shards (<config>/test-*.parquet) of the gated dataset, downloaded into `directory`."""
     from huggingface_hub import HfApi, hf_hub_download
 
     token = hf_token()
     files = sorted(name for name in HfApi().list_repo_files(HF_REPO, repo_type="dataset", token=token)
-                   if name.startswith(f"{HF_CONFIG}/{SPLIT}-") and name.endswith(".jsonl.gz"))
+                   if name.startswith(f"{HF_CONFIG}/{SPLIT}-") and name.endswith(".parquet"))
     if not files:
-        raise SystemExit(f"No {HF_CONFIG}/{SPLIT}-*.jsonl.gz in {HF_REPO}")
+        raise SystemExit(f"No {HF_CONFIG}/{SPLIT}-*.parquet in {HF_REPO}")
     print(f"Downloading {len(files)} {SPLIT} file(s) of {HF_REPO}/{HF_CONFIG} to a temporary directory", flush=True)
     return [Path(hf_hub_download(HF_REPO, name, repo_type="dataset", token=token, local_dir=directory))
             for name in files]
@@ -53,45 +52,46 @@ def download(directory: Path) -> list[Path]:
 
 @contextmanager
 def data_files(data_dir: Path | None):
-    """Local test-*.jsonl.gz copies in `data_dir`, else the Hub's, downloaded to a temporary directory (deleted on
+    """Local test-*.parquet copies in `data_dir`, else the Hub's, downloaded to a temporary directory (deleted on
     exit)."""
     if data_dir:
-        paths = sorted(data_dir.glob(f"{SPLIT}-*.jsonl.gz"))
+        paths = sorted(data_dir.glob(f"{SPLIT}-*.parquet"))
         if not paths:
-            raise SystemExit(f"No {SPLIT}-*.jsonl.gz under {data_dir}")
+            raise SystemExit(f"No {SPLIT}-*.parquet under {data_dir}")
         yield paths
     else:
         with tempfile.TemporaryDirectory(prefix=f"l1_inference_{SPLIT}_") as directory:
             yield download(Path(directory))
 
 
-def read_lines(paths: list[Path]) -> list[tuple[str, int, bytes]]:
-    """(file name, line number, raw line) of every non-empty row."""
-    lines = []
-    for path in paths:
-        with gzip.open(path, "rb") as source:
-            lines += [(path.name, number, line) for number, line in enumerate(source) if line.strip()]
-    return lines
+def read_rows(paths: list[Path]) -> list[tuple[str, int, dict]]:
+    """(file name, row number, row) of every row."""
+    import pyarrow.parquet as pq
+
+    columns = ["user_id", "raw_history_targets", "future_targets"]
+    return [(path.name, number, row) for path in paths
+            for number, row in enumerate(pq.read_table(path, columns=columns).to_pylist())]
 
 
 def prepare(args: argparse.Namespace) -> None:
-    """Every test row (or the first --num_prompts) in the seeded order of rl_data.row_key, both weeks cleaned as
-    run_inference.py cleans one window. One row is one user: {"user_id", "raw_history_targets", "future_targets"},
-    behaviors {"date", "source", "action", "detailed_source"}. Rows left without a signal or a next-week action are
-    skipped."""
+    """Every test row (or the first --num_prompts) in the seeded order of rl_data.row_key of its user_id (one row per
+    user, so the order does not depend on the file format), both weeks cleaned as run_inference.py cleans one window.
+    One row is one user: {"user_id", "raw_history_targets", "future_targets"}, behaviors {"date", "source", "action",
+    "detailed_source"}. Rows left without a signal or a next-week action are skipped."""
     with data_files(args.data_dir) as paths:
-        lines = read_lines(paths)
-    lines.sort(key=lambda entry: row_key(args.seed, entry[2]))
+        rows = read_rows(paths)
+    if len({row["user_id"] for _, _, row in rows}) != len(rows):
+        raise SystemExit(f"{HF_CONFIG}/{SPLIT}: expected one row per user_id")
+    rows.sort(key=lambda entry: row_key(args.seed, entry[2]["user_id"].encode()))
     prompts, skipped = [], 0
-    for file_name, line_number, line in lines:
-        row = json.loads(line)
+    for file_name, row_number, row in rows:
         signals = clean_behaviors(row["user_id"], row["raw_history_targets"])
         future = clean_behaviors(row["user_id"], row["future_targets"])
         if not signals or not future:
             skipped += 1
             continue
         prompts.append({
-            "prompt_id": len(prompts), "user_id": row["user_id"], "file": file_name, "line": line_number,
+            "prompt_id": len(prompts), "user_id": row["user_id"], "file": file_name, "line": row_number,
             "raw_past": len(row["raw_history_targets"]), "raw_future": len(row["future_targets"]),
             "signals": signals, "future": future,
         })
@@ -103,7 +103,7 @@ def prepare(args: argparse.Namespace) -> None:
         for prompt in prompts:
             sink.write(dumps(prompt) + "\n")
     sizes = [len(p["signals"]) for p in prompts]
-    print(f"Read {len(lines)} {SPLIT} rows; kept {len(prompts)} prompts, skipped {skipped} "
+    print(f"Read {len(rows)} {SPLIT} rows; kept {len(prompts)} prompts, skipped {skipped} "
           f"(signals min/median/max {min(sizes)}/{int(statistics.median(sizes))}/{max(sizes)}) "
           f"-> {args.output_dir / 'prompts.jsonl'}")
 
@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
 
     p = sub.add_parser("prepare", parents=[common], help=f"The {SPLIT} rows of {HF_CONFIG}, in a seeded order")
     p.add_argument("--data_dir", type=Path,
-                   help=f"Local {SPLIT}-*.jsonl.gz copies of {HF_CONFIG}; default: download them from {HF_REPO} to "
+                   help=f"Local {SPLIT}-*.parquet copies of {HF_CONFIG}; default: download them from {HF_REPO} to "
                         "a temporary directory (token: HF_TOKEN, else hf_token.txt or HF_Key in UU_LLM or the "
                         "directory above it)")
     p.add_argument("--num_prompts", type=int, default=0, help="Prompts to keep (0 = every usable row)")
