@@ -106,9 +106,10 @@ class ProfileBehaviorDataset(Dataset):
         return {"input_ids": input_ids, "class_label": int(self.labels[row])}
 
 
-class LeftPadCollator:
-    """Every batch is left-padded to the same fixed length (--max_length): constant memory, so an OOM shows up at the
-    first step. Left padding keeps the answer position at index -1 for every row."""
+class FixedLengthCollator:
+    """Every batch is right-padded to the same fixed length (--max_length), as the SFT trainer pads to --max_seq_len:
+    constant memory, so an OOM shows up at the first step. With right padding the real tokens never see a pad token,
+    so the recurrent linear-attention layers do not depend on how pads are masked."""
 
     def __init__(self, pad_token_id, length):
         self.pad_token_id = pad_token_id
@@ -120,8 +121,8 @@ class LeftPadCollator:
         attention_mask = torch.zeros((len(examples), length), dtype=torch.long)
         for row, example in enumerate(examples):
             ids = example["input_ids"]
-            input_ids[row, length - len(ids):] = torch.tensor(ids, dtype=torch.long)
-            attention_mask[row, length - len(ids):] = 1
+            input_ids[row, :len(ids)] = torch.tensor(ids, dtype=torch.long)
+            attention_mask[row, :len(ids)] = 1
         return {"input_ids": input_ids, "attention_mask": attention_mask,
                 "class_label": torch.tensor([example["class_label"] for example in examples], dtype=torch.long)}
 
@@ -202,7 +203,10 @@ class ProfileClassifier(torch.nn.Module):
 
     def forward(self, input_ids, attention_mask):
         hidden = self.lm.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False)[0]
-        return F.linear(hidden[:, -1, :], self.class_head.to(hidden.dtype))
+        # Right padding: the answer position is each row's last real token.
+        last = attention_mask.sum(dim=-1) - 1
+        hidden = hidden[torch.arange(hidden.shape[0], device=hidden.device), last]
+        return F.linear(hidden, self.class_head.to(hidden.dtype))
 
 
 def load_classifier(path, answer_ids, args):
@@ -325,10 +329,10 @@ def main():
     torch.manual_seed(args.seed)
 
     tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
-    tokenizer.padding_side = "left"
+    tokenizer.padding_side = "right"
     pad_token_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
     answer_ids = answer_token_ids(tokenizer)
-    collator = LeftPadCollator(pad_token_id, args.max_length)
+    collator = FixedLengthCollator(pad_token_id, args.max_length)
 
     test = load_split(args.data_dir, "test")
     full_eval_ds = ProfileBehaviorDataset(test, tokenizer, args.max_length)

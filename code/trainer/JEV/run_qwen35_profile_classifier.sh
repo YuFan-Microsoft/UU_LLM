@@ -24,8 +24,8 @@ fi
 # Speed (see ../SFT/README.md "Training speed optimization log"): FLA + causal-conv1d fast paths (checked at start),
 # FlashAttention 2 for the full-attention layers, DeepSpeed ZeRO-2 (ZERO_STAGE=3 for more memory headroom) with the
 # SFT communication buckets and FusedAdam, gradient checkpointing, no gradient accumulation, and the answer scores read
-# from the last hidden state only (no 248320-way lm_head). Every batch is padded to --max_length, so memory is
-# constant and an OOM shows at step 1.
+# from the last hidden state only (no 248320-way lm_head). Every batch is right-padded to --max_length, as in
+# the SFT trainer, so memory is constant and an OOM shows at step 1.
 # W&B is on by default: key from WANDB_API_KEY, else the git-ignored UU_LLM/wandb_key.txt.
 accelerate launch --multi_gpu --num_processes "$NUM_GPUS" --num_machines 1 --mixed_precision bf16 \
     Qwen35_profile_classifier.py \
