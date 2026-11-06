@@ -25,7 +25,7 @@ GRPO/
 ## Reward
 
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, any `interest_name` or
-`topic` with **7 or more tokens**, cut at the response length), else the mean of four signals, each in [0, 1].
+`topic` with **7 or more tokens**, cut at the response length), else the mean of three signals, each in [0, 1].
 The label-length rule uses the **generation checkpoint's tokenizer**, with `add_special_tokens=False`, not the
 embedding tokenizer. Every name and every topic is checked, including interests beyond the credit cap and topics
 not selected for retrieval. A violation sets `rule_pass=False` and the entire rollout's reward to 0
@@ -34,33 +34,42 @@ not selected for retrieval. A violation sets `rule_pass=False` and the entire ro
 generation tokenizer (including `model.tokenizer_path` overrides and node-local path resolution). The scorer keeps
 one private copy per process, isolated from concurrent response decoding; it does not reload the checkpoint or
 multimodal processor. Sync `verl/trainer/ppo/reward.py` together with the L1 reward code on every Ray node.
-**Only the first N interests earn credit, but every
-interest written counts in precision's denominator:**
 
-- `past_recall@10`: share of the user's visible input actions in the top 10 of one of the first N interests;
-- `past_precision@10`: number of the first N interests matched one-to-one to a distinct input action in their
-  top 10, divided by the number of interests written;
+- `past_assignment`: visible input actions owned by a topic that cites them, divided by the larger of the number of
+  actions cited and 0.7 of the visible actions (`PAST_COVERAGE_TARGET`). Every topic of
+  the answer is one query, `<interest name>: <topic>`, and each visible action is owned by its most similar topic
+  (a tie counts if a citing topic is among the tied). It compares the user's own topics only, never other users'
+  actions, so a word shared by every label (a place, a language) does not help; an action left uncited, cited by a
+  topic that does not own it, or owned by a more similar sibling topic earns nothing. Ownership is exact to the
+  topic, not just the interest. Below 0.7 of the actions, citing fewer costs; above it only correctness counts, so
+  skipping noise is free and a wrong citation always costs (the V35 GPT-5.6 labels cite 0.78 of the input actions on
+  average, 0.67 at P25).
+
+**For the two future signals, only the first N interests earn credit, but every interest written counts in
+precision's denominator:**
+
 - `future_recall@10`: share of the user's next-week actions in the top 10 of one of the first N interests;
 - `future_precision@10`: number of the first N interests matched one-to-one to a distinct next-week action in their
   top 10 (maximum matching: interests that only hit the same action count once), divided by the number of interests
   written.
 
 `coverage` remains the share of input indices cited by the first N interests, but is diagnostic only:
-it is logged to W&B and does not enter the reward. There is no coverage threshold or extra penalty.
-Both precisions are interest-level one-to-one matching rates, not retrieved-document precision;
-past retrieval does not prove that every evidence citation is correct.
+it is logged to W&B and does not enter the reward directly (`past_assignment` does reward citing every action its
+owner topic would win). The future precision is an interest-level one-to-one matching rate, not retrieved-document
+precision.
 
 N = round(0.9 + 18.2 n / (33 + n)) for n input signals (`interest_cap` in `l1/l1_reward.py`) is the approximate P90 of the SFT
 Layer-1 interest count, a saturation curve fitted to the V3 train split's P90 per signal-count bucket: 1 at n = 1, 5
 at 10, 9 at 25, 13 at 60, 17 at 200 (the prompt holds at most 200 signals). Recall grows with every interest (10 more
 retrieved actions), which made the first run inflate the interest count from 8.7 to 15.4 in 200 steps; an interest
-past N adds no recall or matched interest and increases both precision denominators.
+past N adds no recall or matched interest and increases the precision denominator. The cap applies to the future
+signals only; `past_assignment` uses every topic written.
 
-Each interest is one query, `<interest name>: <top topic>`, independently ranking two Qwen3-Embedding-8B pools:
-every batch user's visible prompt actions, and every batch user's next-week actions (64 users by default).
-Past targets and candidates exclude signals removed by the 200-signal cap or token-budget trimming.
-The future pool and future metric definitions are unchanged. Query embeddings and shared action embeddings
-are reused, but candidate membership and rankings remain separate. See `case_study/README.md` for details.
+For the future, each interest is one query, `<interest name>: <top topic>`, ranking a Qwen3-Embedding-8B pool of
+every batch user's next-week actions (64 users by default). The batch's visible prompt actions are embedded once per
+batch and read back for each answer's `past_assignment`; they are excluded when removed by the 200-signal cap or
+token-budget trimming. Query embeddings and shared action embeddings are reused. See `case_study/README.md` for
+details.
 
 ## Where it comes from
 
@@ -219,11 +228,14 @@ NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_r
 
 ## Following the reward
 
-Every validation logs only the mean over all validation answers of nine signals (W&B / console, set by
+Every validation logs only the mean over all validation answers of twelve signals (W&B / console, set by
 `trainer.val_core_metrics` in the launcher): `val-core/user_profile_l1/<signal>` for `reward`, `n_interests`,
-`coverage` (diagnostic only), `past_recall`, `past_precision`, `future_recall`, `future_precision`, `json_valid`
-and `rule_pass`. Step 0 is the starting checkpoint, scored like `case_study/` scores it.
-Each training step logs the same nine means over its rollouts
+`coverage` (diagnostic only), `past_assignment`, `future_recall`, `future_precision`, `json_valid`,
+`rule_pass`, and the diagnostic answer shape: `topics_per_interest`, `evidence_per_topic` (distinct idx),
+`interest_name_tokens` and `topic_tokens` (generation-tokenizer tokens, as the 6-token label limit counts them),
+each first averaged within an answer, over every interest and topic written, and skipped for answers without any.
+Step 0 is the starting checkpoint, scored like `case_study/` scores it.
+Each training step logs the same twelve means over its rollouts
 (`trainer.train_core_metrics`): `train-core/user_profile_l1/<signal>`,
 `reward` being `critic/score/mean`;
 the `training/`, `num_turns/`, `timing_s/`, `timing_per_token_ms/` and `prompt_length/` metrics are not logged
@@ -239,7 +251,8 @@ python layer1_sampling.py score --output_dir outputs/<run>_val_300 --checkpoint 
 ```
 
 `trend.md` has one row per validation step (reward, best of 16, each signal, answer length); watch `n_interests`
-next to the reward. Older runs lack past retrieval metrics and included coverage in the reward, so compare
+next to the reward. Older runs lack past retrieval metrics and included coverage in the reward, and runs before
+`past_assignment` logged the batch-pool `past_recall` / `past_precision` instead, so compare
 objectives by rescoring the same answers rather than directly comparing their rewards.
 Runs from before the interest cap recorded `coverage` and `future_recall` over every interest
 and `future_interest_hit` instead of `future_precision`; `from_val` + `score` rescore a step's answers with the

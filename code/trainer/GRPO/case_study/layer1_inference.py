@@ -158,7 +158,7 @@ def report(args: argparse.Namespace) -> None:
                         "n_interests": len(output["interests"]) if output else 0,
                         "output_tokens": raw.get("output_tokens")},
             "violations": rules["violations"], "output": output,
-            "queries": None, "past_hits": None, "future_hits": None,
+            "queries": None, "past_owners": None, "future_hits": None,
         })
 
     summary = summarize(results)

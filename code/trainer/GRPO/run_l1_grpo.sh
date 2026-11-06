@@ -5,7 +5,9 @@
 # Defaults: 64 prompts x 16 answers; replay 2 rows/GPU, coefficient 0.1.
 # Limits: context 25600 tokens, response 8192 tokens.
 # SFT_REPLAY=0 disables replay and extra SFT evaluation.
-# Reward: mean past/future recall and precision from independent batch pools; coverage is diagnostic only.
+# Reward: mean of past_assignment (visible actions owned by the topic citing them, within the user, over the
+# larger of the actions cited and 0.7 of them) and future
+# recall / precision against the batch next-week pool; coverage is diagnostic only.
 # Embeddings: EMBEDDING_URL / EMBEDDING_NODE; otherwise the last local GPU.
 # See README.md for configuration, metrics and resume behavior.
 set -euo pipefail
@@ -234,8 +236,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.save_freq="${SAVE_FREQ:-100}" \
     trainer.test_freq="${TEST_FREQ:-100}" \
     trainer.validation_data_dir="$OUTPUT_DIR/validation" \
-    +trainer.val_core_metrics="['reward','n_interests','coverage','past_recall','past_precision','future_recall','future_precision','json_valid','rule_pass']" \
-    +trainer.train_core_metrics="['reward','n_interests','coverage','past_recall','past_precision','future_recall','future_precision','json_valid','rule_pass']" \
+    +trainer.val_core_metrics="['reward','n_interests','coverage','past_assignment','future_recall','future_precision','json_valid','rule_pass','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens']" \
+    +trainer.train_core_metrics="['reward','n_interests','coverage','past_assignment','future_recall','future_precision','json_valid','rule_pass','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens']" \
     +trainer.drop_metric_prefixes="['training/','num_turns/','timing_s/','timing_per_token_ms/','prompt_length/']" \
     trainer.total_epochs=1 \
     "${SFT_ARGS[@]}" \

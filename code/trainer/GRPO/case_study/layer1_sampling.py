@@ -34,7 +34,7 @@ sys.path.insert(0, str(UU_LLM / "code" / "inference"))
 sys.path.insert(0, str(HERE.parent / "l1"))
 
 import layer1  # noqa: E402
-from l1_reward import DEFAULT_EMBEDDING_MODEL, REWARD_SIGNALS, SIGNALS, TOP_K, L1Reward, input_signals  # noqa: E402
+from l1_reward import DEFAULT_EMBEDDING_MODEL, FUTURE_SIGNALS, SIGNALS, TOP_K, L1Reward, input_signals  # noqa: E402
 from rl_data import DEFAULT_CHECKPOINT, HF_CONFIG, HF_REPO, clean_behaviors, iter_lines, rl_data_files, row_key  # noqa: E402
 import user_profile_rules  # noqa: E402
 from utils import MAX_MODEL_LEN, build_prompt_ids, dumps, new_item  # noqa: E402
@@ -219,7 +219,7 @@ def sample_metrics(sample: dict, k: int) -> dict:
     """The reward of one sample and the signals it is computed from (l1_reward.L1Reward), with the judgement."""
     return {"reward": sample["reward"], "json_valid": int(sample["json_valid"]), "rule_pass": int(sample["rule_pass"]),
             "n_interests": sample["n_interests"], "coverage": sample["coverage"],
-            **{f"{name}@{k}": sample[name] for name in REWARD_SIGNALS}}
+            "past_assignment": sample["past_assignment"], **{f"{name}@{k}": sample[name] for name in FUTURE_SIGNALS}}
 
 
 def centered_correlation(groups: list[list[dict]], a: str, b: str) -> float | None:
@@ -293,7 +293,7 @@ def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings:
             "signals": [[s["date"], s["source"], s["action"]] for s in row["signals"]],
             "future": [[b["date"], b["source"], b["action"]] for b in row["future"]],
             "samples": [{"metrics": result["metrics"], "violations": result["violations"], "output": result["output"],
-                         "queries": result["queries"], "past_hits": result["past_hits"],
+                         "queries": result["queries"], "past_owners": result["past_owners"],
                          "future_hits": result.get("future_hits"), "text": sample["text"]}
                         for sample, result in zip(row["samples"], samples)],
         } for row, samples in zip(rows, scored)],
@@ -304,7 +304,7 @@ def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings:
 
 
 def score(args: argparse.Namespace) -> None:
-    """Independent batch pools: visible prompt actions and next-week actions."""
+    """One pool over every prompt: its visible actions (each user's own past_assignment) and next-week actions."""
     from transformers import AutoProcessor
 
     rows = read_jsonl(args.output_dir / "rollouts.jsonl")
@@ -324,7 +324,7 @@ def score(args: argparse.Namespace) -> None:
                 sample = reward_fn(row["content"], raw["text"], raw["finish_reason"], future)
                 result = {"metrics": sample_metrics(sample, args.top_k), "violations": sample["violations"],
                           "output": sample["output"], "queries": sample["queries"],
-                          "past_hits": sample["past_hits"], "future_hits": sample["hits"]}
+                          "past_owners": sample["past_owners"], "future_hits": sample["hits"]}
                 samples.append(result)
                 sink.write(dumps({"prompt_id": row["prompt_id"], "sample": index, **result["metrics"],
                                   "violations": result["violations"]}) + "\n")
@@ -403,11 +403,13 @@ def from_val(args: argparse.Namespace) -> None:
 def trend(args: argparse.Namespace) -> None:
     """Per validation step (verl's dumps, <step>.jsonl): the mean reward, the mean best reward of each prompt's group,
     the mean of every reward signal and the mean answer length, as recorded by the run's reward (each signal the dumps
-    all have: older runs lack past metrics or recorded future_interest_hit instead of future_precision)."""
+    all have: older runs lack past metrics, logged the batch-pool past_recall / past_precision before past_assignment,
+    or recorded future_interest_hit instead of future_precision)."""
     paths = sorted(args.validation_dir.glob("*.jsonl"), key=lambda path: int(path.stem))
     dumps = [(path, read_validation_dump(path)) for path in paths]
     dumps = [(path, groups, [entry for group in groups.values() for entry in group]) for path, groups in dumps]
-    signals = [name for name in ("json_valid", "rule_pass", "n_interests", *SIGNALS, "future_interest_hit")
+    signals = [name for name in ("json_valid", "rule_pass", "n_interests", *SIGNALS, "past_recall", "past_precision",
+                                 "future_interest_hit")
                if dumps and all(entries and name in entries[0] for _, _, entries in dumps)]
     columns = ["reward", "best_of_group", *signals, "answer_chars"]
     steps = []

@@ -67,9 +67,13 @@ class FakeEmbedder:
             if key not in self.cache:
                 vector = [0.0] * 66
                 if query:
-                    index = int(text.split(":")[0][1:])
+                    head, _, tail = text.partition(":")
+                    index = int(head[1:])
                     vector[index if index < 25 else 64] = 1.0
                     vector[32 + index if index < 20 else 65] = 1.0
+                    tail = tail.strip()
+                    if tail[:1] == "P" and tail[1:].isdigit():  # a topic named after a past action leans toward it
+                        vector[int(tail[1:])] += 2.0
                 elif text in ("PC", "FC"):
                     vector[0] = vector[32] = 4.0
                 elif text in ("DP", "DF"):
@@ -94,6 +98,15 @@ def answer(count, evidence=None):
         {"interest_name": f"I{index}", "actual_activity": "Synthetic activity",
          "topics": [{"topic": "topic", "evidence": [0] if evidence is None else evidence}]}
         for index in range(count)
+    ]})
+
+
+def topics_answer(interests):
+    """One interest I<i> per item of `interests`, a list of (topic, evidence) pairs."""
+    return json.dumps({"interests": [
+        {"interest_name": f"I{index}", "actual_activity": "Synthetic activity",
+         "topics": [{"topic": topic, "evidence": evidence} for topic, evidence in topics]}
+        for index, topics in enumerate(interests)
     ]})
 
 
@@ -122,49 +135,94 @@ class DualPoolRewardTest(unittest.TestCase):
         self.past = [f"P{index}" for index in range(25)]
         self.future = [f"F{index}" for index in range(20)]
         self.scorer.set_pools(self.past + ["DP"], self.future + ["DF"])
+        self.target = reward.PAST_COVERAGE_TARGET * 25
 
     def score(self, count=1, evidence=None):
         return self.scorer(content(self.past), answer(count, evidence), None, self.future)
 
-    def test_four_signal_mean_and_interest_cap(self):
+    def test_three_signal_mean_and_future_interest_cap(self):
         cap = reward.interest_cap(25)
         self.assertEqual(cap, 9)
         for count in (1, 5, 9, 12, 18, 27):
             with self.subTest(count=count):
                 result = self.score(count)
                 matched = min(count, cap)
-                self.assertAlmostEqual(result["past_recall"], matched / 25)
-                self.assertAlmostEqual(result["past_precision"], matched / count)
+                # Every interest cites only P0, which I0 owns: 1 correct, below the coverage target of 25.
+                self.assertAlmostEqual(result["past_assignment"], 1 / self.target)
                 self.assertAlmostEqual(result["future_recall"], matched / 20)
                 self.assertAlmostEqual(result["future_precision"], matched / count)
-                expected = (matched / 25 + matched / count + matched / 20 + matched / count) / 4
+                expected = (1 / self.target + matched / 20 + matched / count) / 3
                 self.assertAlmostEqual(result["reward"], expected)
                 self.assertTrue(0 <= result["reward"] <= 1)
 
     def test_existing_cap_curve_is_unchanged(self):
         self.assertEqual([reward.interest_cap(n) for n in (1, 10, 25, 60, 200)], [1, 5, 9, 13, 17])
 
-    def test_coverage_does_not_affect_reward(self):
+    def test_past_assignment_credits_actions_owned_by_their_citing_topic(self):
+        def past(interests):
+            return self.scorer(content(self.past), topics_answer(interests), None, self.future)
+
+        owned = past([[("topic", [index])] for index in range(5)])
+        self.assertAlmostEqual(owned["past_assignment"], 5 / self.target)
+        self.assertEqual(owned["past_owners"][:6], [[0, 0], [1, 0], [2, 0], [3, 0], [4, 0], [0, 0]])
+        swapped = past([[("topic", [1])], [("topic", [0])]])
+        self.assertEqual(swapped["past_assignment"], 0)
+        # Past interest_cap: every topic competes and earns; 20 correct citations pass the target of 17.5.
+        every = past([[("topic", [index])] for index in range(20)])
+        self.assertEqual(every["past_assignment"], 1)
+        # One topic citing everything owns everything: the extreme the future signals must balance.
+        bucket = past([[("topic", list(range(25)))]])
+        self.assertEqual(bucket["past_assignment"], 1)
+
+    def test_past_assignment_coverage_target(self):
+        def past(interests):
+            return self.scorer(content(self.past), topics_answer(interests), None, self.future)
+
+        self.assertEqual(self.target, 17.5)
+        # Below the target, fewer citations cost even when all are correct.
+        self.assertAlmostEqual(past([[("topic", [index])] for index in range(10)])["past_assignment"], 10 / 17.5)
+        # Past the target, skipping is free: 18 or 20 correct citations both score 1.
+        self.assertEqual(past([[("topic", [index])] for index in range(18)])["past_assignment"], 1)
+        # Citing the rest wrongly (I20.. each cites the action the next one owns) costs: 20 correct of 25 cited.
+        shifted = [[("topic", [index])] for index in range(20)] + [[("topic", [20 + (index + 1) % 5])]
+                                                                    for index in range(5)]
+        self.assertAlmostEqual(past(shifted)["past_assignment"], 20 / 25)
+
+    def test_past_assignment_is_exact_to_the_topic(self):
+        def past(topics):
+            return self.scorer(content(self.past), topics_answer([topics]), None, self.future)
+
+        exact = past([("P1", [1]), ("P2", [2])])
+        self.assertAlmostEqual(exact["past_assignment"], 2 / self.target)
+        self.assertEqual(exact["past_owners"][1:3], [[0, 0], [0, 1]])
+        # The same interest is not enough: each action must be cited by the topic that owns it.
+        self.assertEqual(past([("P1", [2]), ("P2", [1])])["past_assignment"], 0)
+        # A tie (two topics with the same query) counts when a citing topic is among the tied.
+        tied = past([("a", []), ("b", [0])])
+        self.assertAlmostEqual(tied["past_assignment"], 1 / self.target)
+        self.assertEqual(tied["past_owners"][0], [0, 0])
+
+    def test_coverage_is_diagnostic_and_future_ignores_evidence(self):
         sparse = self.score(evidence=[0])
         dense = self.score(evidence=list(range(25)))
         self.assertEqual(sparse["coverage"], 1 / 25)
         self.assertEqual(dense["coverage"], 1)
-        self.assertEqual(sparse["reward"], dense["reward"])
-        for name in reward.REWARD_SIGNALS:
+        self.assertAlmostEqual(sparse["past_assignment"], 1 / self.target)
+        self.assertEqual(dense["past_assignment"], 1)
+        for name in reward.FUTURE_SIGNALS:
             self.assertEqual(sparse[name], dense[name])
 
-    def test_pools_are_ranked_independently(self):
+    def test_past_never_ranks_other_users_actions(self):
         original = self.score()
         self.scorer.set_pools(self.past + ["DP", "PC"], self.future + ["DF"])
         changed_past = self.score()
-        self.assertEqual(changed_past["past_recall"], 0)
+        self.assertEqual(changed_past["past_assignment"], original["past_assignment"])
         self.assertEqual(changed_past["future_recall"], original["future_recall"])
         self.assertEqual(changed_past["future_precision"], original["future_precision"])
         self.scorer.set_pools(self.past + ["DP"], self.future + ["DF", "FC"])
         changed_future = self.score()
         self.assertEqual(changed_future["future_recall"], 0)
-        self.assertEqual(changed_future["past_recall"], original["past_recall"])
-        self.assertEqual(changed_future["past_precision"], original["past_precision"])
+        self.assertEqual(changed_future["past_assignment"], original["past_assignment"])
 
     def test_query_and_shared_action_embeddings_are_reused(self):
         before = self.embedder.clear_count
@@ -174,7 +232,9 @@ class DualPoolRewardTest(unittest.TestCase):
         self.assertEqual(self.scorer.future_pool, ["P0", "F0"])
         self.assertEqual(self.embedder.computed.count((False, "P0")), 1)
         self.scorer(content(["P0"]), answer(1), None, ["F0"])
-        self.assertEqual(sum(query for query, _ in self.embedder.calls), 1)
+        # The topic query and the future query are the same text, and the user's actions come from the pool.
+        self.assertEqual(self.embedder.computed[-1:], [(True, "I0: topic")])
+        self.assertEqual(self.embedder.computed.count((False, "P0")), 1)
 
     def test_one_to_one_matching(self):
         self.assertEqual(reward.matched_interests([[[0, 1]], [[0, 1]]]), 1)
@@ -186,17 +246,18 @@ class DualPoolRewardTest(unittest.TestCase):
         self.assertTrue(all(invalid[name] == 0 for name in reward.SIGNALS))
         truncated = self.scorer(content(self.past), answer(1), "length", self.future)
         self.assertEqual(truncated["reward"], 0)
-        self.assertGreater(truncated["past_recall"], 0)
+        self.assertGreater(truncated["past_assignment"], 0)
         self.assertGreater(truncated["future_recall"], 0)
 
     def test_empty_answer_and_future_targets(self):
         empty = self.score(0)
         self.assertEqual(empty["reward"], 0)
-        self.assertEqual(empty["past_precision"], 0)
+        self.assertEqual(empty["past_assignment"], 0)
+        self.assertIsNone(empty["past_owners"])
         no_future = self.scorer(content(self.past), answer(1), None, [])
         self.assertEqual(no_future["future_recall"], 0)
         self.assertEqual(no_future["future_precision"], 0)
-        self.assertAlmostEqual(no_future["reward"], (1 / 25 + 1) / 4)
+        self.assertAlmostEqual(no_future["reward"], (1 / self.target) / 3)
 
     def test_missing_past_pool_and_invalid_prompt_fail(self):
         self.scorer.set_pools([], self.future)
@@ -217,8 +278,32 @@ class DualPoolRewardTest(unittest.TestCase):
                                                   {"batch_id": "train-000000", "content": content(self.past)},
                                                   "pools.parquet", tokenizer=self.scorer.tokenizer)
             loader.assert_called_once_with("pools.parquet", "train-000000")
-        self.assertEqual(set(result), {"score", "json_valid", "rule_pass", "n_interests", *reward.SIGNALS})
+        self.assertEqual(set(result), {"score", "json_valid", "rule_pass", "n_interests", *reward.SIGNALS,
+                                       *reward.STRUCTURE_SIGNALS})
         self.assertTrue(all(isinstance(value, float) for value in result.values()))
+        with patch.object(verl_reward, "_state", {"reward_fn": self.scorer, "batch_id": "train-000000"}):
+            invalid = verl_reward.compute_score("user_profile_l1", "not JSON", self.future,
+                                                {"batch_id": "train-000000", "content": content(self.past)},
+                                                "pools.parquet", tokenizer=self.scorer.tokenizer)
+        self.assertTrue(all(invalid[name] is None for name in reward.STRUCTURE_SIGNALS))
+
+    def test_structure_signals_average_within_the_answer(self):
+        self.scorer.tokenizer = fake_tokenizer({"I0": 2, "I1": 4, "a": 1, "b": 2, "c": 3})
+        output = {"interests": [
+            {"interest_name": "I0", "actual_activity": "Synthetic activity",
+             "topics": [{"topic": "a", "evidence": [0, 1, 1]}, {"topic": "b", "evidence": [2]}]},
+            {"interest_name": "I1", "actual_activity": "Synthetic activity",
+             "topics": [{"topic": "c", "evidence": [3, 4, 5]}]},
+        ]}
+        result = self.scorer(content(self.past), json.dumps(output), None, self.future)
+        self.assertEqual(result["topics_per_interest"], 1.5)
+        self.assertEqual(result["evidence_per_topic"], 2)  # distinct idx: 2, 1, 3
+        self.assertEqual(result["interest_name_tokens"], 3)
+        self.assertEqual(result["topic_tokens"], 2)
+        for text in ("not JSON", answer(0)):
+            with self.subTest(text=text):
+                empty = self.scorer(content(self.past), text, None, self.future)
+                self.assertTrue(all(empty[name] is None for name in reward.STRUCTURE_SIGNALS))
 
 
 class TokenLimitRewardTest(unittest.TestCase):
@@ -247,7 +332,7 @@ class TokenLimitRewardTest(unittest.TestCase):
                     self.assertEqual(result["rule_pass"], count < 7)
                     self.assertEqual(result["reward"], 1.0 if count < 7 else 0.0)
                     self.assertEqual(result["violations"], [] if count < 7 else [violation])
-                    self.assertEqual(result["past_recall"], 1.0)
+                    self.assertEqual(result["past_assignment"], 1.0)
                     self.assertEqual(result["future_recall"], 1.0)
                     tokenizer.encode.assert_any_call(label, add_special_tokens=False)
                     self.assertTrue(all(call.kwargs == {"add_special_tokens": False}
@@ -260,7 +345,7 @@ class TokenLimitRewardTest(unittest.TestCase):
         self.assertFalse(result["rule_pass"])
         self.assertEqual(result["reward"], 0.0)
         self.assertEqual(result["violations"], ["interest_name_too_long"])
-        self.assertEqual(result["past_recall"], 1.0)
+        self.assertEqual(result["past_assignment"], 1.0)
 
     def test_unselected_topic_rejects_whole_rollout(self):
         output = json.loads(answer(1))
@@ -287,7 +372,7 @@ class TokenLimitRewardTest(unittest.TestCase):
         result = self.score()
         self.assertTrue(result["rule_pass"])
         self.assertEqual(result["reward"], 1.0)
-        self.assertEqual([call.args[0] for call in tokenizer.encode.call_args_list], ["I0", "topic"])
+        self.assertNotIn("Synthetic activity", [call.args[0] for call in tokenizer.encode.call_args_list])
 
     def test_new_violations_preserve_existing_evidence_and_truncation_failures(self):
         self.scorer.tokenizer = fake_tokenizer({"I0": 7, "topic": 7})
@@ -549,11 +634,11 @@ class CaseStudyTest(unittest.TestCase):
             processor.from_pretrained.assert_called_once_with("generation-checkpoint", trust_remote_code=True)
             constructor.assert_called_once_with("synthetic", 256, top_k=1, embedding_url=None, tokenizer=tokenizer)
             summary = json.loads((root / "summary.json").read_text())
-            self.assertEqual(summary["metrics"]["past_recall@1"]["mean"], 0.5)
-            self.assertEqual(summary["metrics"]["past_precision@1"]["mean"], 0.5)
+            self.assertEqual(summary["metrics"]["past_assignment"]["mean"], 0.5)
+            self.assertNotIn("past_recall@1", summary["metrics"])
             self.assertEqual(summary["metrics"]["future_recall@1"]["mean"], 0.5)
             self.assertEqual(summary["metrics"]["future_precision@1"]["mean"], 0.5)
-            self.assertIn("past_hits", (root / "report.html").read_text())
+            self.assertIn("past_owners", (root / "report.html").read_text())
 
     def test_trend_reads_old_and_new_dumps(self):
         from case_study import layer1_sampling
@@ -563,7 +648,8 @@ class CaseStudyTest(unittest.TestCase):
                 "coverage": 0.5, "future_recall": 0.5, "future_precision": 0.5}
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            for name, extra in (("old", {}), ("new", {"past_recall": 0.4, "past_precision": 0.6})):
+            for name, extra in (("old", {}), ("batch_pool", {"past_recall": 0.4, "past_precision": 0.6}),
+                                ("assignment", {"past_assignment": 0.7})):
                 validation = root / name
                 validation.mkdir()
                 (validation / "0.jsonl").write_text(json.dumps({**base, **extra, "step": 0}) + "\n")
@@ -571,7 +657,8 @@ class CaseStudyTest(unittest.TestCase):
                 with patch("builtins.print"):
                     layer1_sampling.trend(argparse.Namespace(validation_dir=validation, output_dir=output))
                 step = json.loads((output / "trend.json").read_text())[0]
-                self.assertEqual("past_recall" in step, name == "new")
+                self.assertEqual("past_recall" in step, name == "batch_pool")
+                self.assertEqual("past_assignment" in step, name == "assignment")
                 self.assertEqual(step["future_recall"], 0.5)
 
 
