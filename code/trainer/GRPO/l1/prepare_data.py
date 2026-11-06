@@ -13,10 +13,8 @@ has its own pool, topped up to --batch_size users with the next same-language te
 
     <output_dir>/train.parquet   verl RL rows, batch after batch (train with data.shuffle=False)
     <output_dir>/val.parquet     one batch (data.val_batch_size unset: the whole set), pools "val-<language>"
-    <output_dir>/pools.parquet   batch_id -> separate past_actions / future_actions pools with their action_idx
-                                 (past_action_idx / future_action_idx, rows of l1_reward.ACTION_EMBEDDING_FILES;
-                                 one row group per batch); past actions come only from the visible, already
-                                 capped/trimmed prompts
+    <output_dir>/pools.parquet   batch_id -> separate past_actions / future_actions pools (one row group per batch);
+                                 past actions come only from the visible, already capped/trimmed prompts
     <output_dir>/meta.json       the settings, the dataset, the reward and data.* values the launcher must match
 
 Rows without an allowed past signal, without a future action, or whose prompt has more than --max_prompt_length
@@ -42,25 +40,17 @@ from rl_data import (DEFAULT_CHECKPOINT, HF_CONFIG_NAME, HF_REPO, clean_behavior
                      rl_data_files)  # (also puts code/inference first)
 import layer1  # noqa: E402
 from l1_reward import input_signals  # noqa: E402
-from utils import MAX_ACTION_CHARS, build_prompt_ids  # noqa: E402
+from utils import build_prompt_ids  # noqa: E402
 
 DATA_SOURCE = "user_profile_l1"
 VAL_BATCH_ID = "val"
-# 3: pools carry the action_idx of their actions (ACTION_EMBEDDING_FILES rows); 4: single-language batches and pools
-POOL_FORMAT_VERSION = 4
+POOL_FORMAT_VERSION = 4  # 2: separate past / future pools; 4: single-language batches and pools
 DATASET = f"{HF_REPO}/{HF_CONFIG_NAME}"  # recorded in meta.json; the launcher checks it
 CHUNK_ROWS = 256  # candidate rows of one file per worker task
 
 
-def action_index(behaviors: list[dict]) -> dict[str, int]:
-    """{cleaned action: action_idx} of raw behaviors (cleaning keeps an action's first MAX_ACTION_CHARS characters;
-    one action has one action_idx, and the few action_idx shared by several actions differ only by whitespace)."""
-    return {(behavior.get("action") or "")[:MAX_ACTION_CHARS]: behavior["action_idx"] for behavior in behaviors}
-
-
 def build_example(row: dict, encode, max_prompt_length: int) -> dict | None:
-    """The verl row of one user, or None when it is skipped. extra_info.past_action_idx is aligned with the visible
-    signals of the prompt (input_signals), extra_info.future_action_idx with the ground truth."""
+    """The verl row of one user, or None when it is skipped."""
     signals = clean_behaviors(row["user_id"], row["past_behaviors"])
     future = clean_behaviors(row["user_id"], row["future_behaviors"])  # dedupe: one per action
     if not signals or not future:
@@ -69,7 +59,6 @@ def build_example(row: dict, encode, max_prompt_length: int) -> dict | None:
     if len(prompt_ids) > max_prompt_length:
         return None
     content = layer1.build_message(kept)
-    past_idx, future_idx = action_index(row["past_behaviors"]), action_index(row["future_behaviors"])
     return {
         "data_source": DATA_SOURCE,
         "prompt": [{"role": "user", "content": content}],
@@ -78,9 +67,7 @@ def build_example(row: dict, encode, max_prompt_length: int) -> dict | None:
         "extra_info": {"user_id": row["user_id"], "language": row.get("language") or "und", "content": content,
                        "prompt_tokens": len(prompt_ids),
                        "signals": len(kept), "signals_dropped": len(signals) - len(kept),
-                       "future": [{"date": b["date"], "source": b["source"], "action": b["action"]} for b in future],
-                       "past_action_idx": [past_idx[signal["action"]] for signal in input_signals(content)],
-                       "future_action_idx": [future_idx[b["action"]] for b in future]},
+                       "future": [{"date": b["date"], "source": b["source"], "action": b["action"]} for b in future]},
     }
 
 
@@ -200,34 +187,29 @@ def select(args: argparse.Namespace, encode=None) -> tuple[list[dict], list[dict
 
 def assign_batches(rows: list[dict], split: str, batch_size: int | None, distractors: list[dict] = (),
                    pool_users: int = 0) -> dict[str, dict[str, list]]:
-    """Set index / split / batch_id; build separate visible-past and next-week candidate pools, each action with its
-    action_idx (the first one of a repeated action). Training rows (batch_size) are in single-language batches, one
+    """Set index / split / batch_id; build separate visible-past and next-week candidate pools. Training rows
+    (batch_size) are in single-language batches, one
     pool each; validation rows (batch_size None) are grouped by language (stably, so val.parquet is in that order),
     one pool "val-<language>" each, topped up to `pool_users` users with the same-language distractors' future
     actions."""
-    pools: dict[str, dict[str, dict[str, int]]] = {}
+    pools: dict[str, dict] = {}
     if batch_size is None:
         rows.sort(key=lambda row: row["extra_info"]["language"])
     for index, row in enumerate(rows):
         extra = row["extra_info"]
         batch_id = f"{VAL_BATCH_ID}-{extra['language']}" if batch_size is None else f"train-{index // batch_size:06d}"
         extra.update(index=index, split=split, batch_id=batch_id)
-        pool = pools.setdefault(batch_id, {"past": {}, "future": {}, "users": 0})
+        pool = pools.setdefault(batch_id, {"past": [], "future": [], "users": 0})
         pool["users"] += 1
-        for signal, action_idx in zip(input_signals(extra["content"]), extra["past_action_idx"], strict=True):
-            pool["past"].setdefault(signal["action"], action_idx)
-        for action, action_idx in zip(row["reward_model"]["ground_truth"], extra["future_action_idx"], strict=True):
-            pool["future"].setdefault(action, action_idx)
+        pool["past"].extend(signal["action"] for signal in input_signals(extra["content"]))
+        pool["future"].extend(row["reward_model"]["ground_truth"])
     for row in distractors:
         pool = pools.get(f"{VAL_BATCH_ID}-{row['extra_info']['language']}")
         if pool is not None and pool["users"] < pool_users:
             pool["users"] += 1
-            for action, action_idx in zip(row["reward_model"]["ground_truth"], row["extra_info"]["future_action_idx"],
-                                          strict=True):
-                pool["future"].setdefault(action, action_idx)
-    return {batch_id: {"past_actions": list(pool["past"]), "past_action_idx": list(pool["past"].values()),
-                       "future_actions": list(pool["future"]), "future_action_idx": list(pool["future"].values()),
-                       "users": pool["users"]}
+            pool["future"].extend(row["reward_model"]["ground_truth"])
+    return {batch_id: {"past_actions": list(dict.fromkeys(pool["past"])),
+                       "future_actions": list(dict.fromkeys(pool["future"])), "users": pool["users"]}
             for batch_id, pool in pools.items()}
 
 
@@ -240,9 +222,9 @@ def write(args: argparse.Namespace, val: list[dict], train: list[dict], distract
     args.output_dir.mkdir(parents=True, exist_ok=True)
     pq.write_table(pa.Table.from_pylist(train), args.output_dir / "train.parquet")
     pq.write_table(pa.Table.from_pylist(val), args.output_dir / "val.parquet")
-    columns = ("past_actions", "past_action_idx", "future_actions", "future_action_idx")
     pq.write_table(pa.Table.from_pydict({"batch_id": list(pools),
-                                       **{name: [pool[name] for pool in pools.values()] for name in columns}}),
+                                       "past_actions": [pool["past_actions"] for pool in pools.values()],
+                                       "future_actions": [pool["future_actions"] for pool in pools.values()]}),
                    args.output_dir / "pools.parquet", row_group_size=1)
     tokens = [row["extra_info"]["prompt_tokens"] for row in val + train]
     pool_sizes = [len(pool["future_actions"]) for pool in pools.values()]

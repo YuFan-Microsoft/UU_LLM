@@ -9,7 +9,7 @@ The reward itself is l1_reward.L1Reward; this file only feeds it what verl passe
                                   (prepare_data.py)
     tokenizer                    this reward worker's already-localized generation tokenizer
 and ranks every answer independently against the visible past and next-week actions of every user of its batch,
-read with their action_idx (whose vectors are precomputed: l1_reward.ACTION_EMBEDDING_FILES) from the dual-pool file
+read from the dual-pool file
 (reward.custom_reward_function.reward_kwargs.pool_file) by batch_id. That pool is the current batch only because the
 data loader reads the rows in order (data.shuffle=False, no filtering) in batches of the size the data was cut into;
 the validation rows are grouped by language, so a worker switches pools once per language.
@@ -17,10 +17,9 @@ the validation rows are grouped by language, so a worker switches pools once per
 One L1Reward per worker process. The vendored reward loader injects the generation tokenizer already loaded by
 that worker (respecting model.tokenizer_path and copy_to_local). A private copy avoids sharing mutable tokenizer
 state with the reward manager's concurrent response decoding; no checkpoint/processor is loaded again.
-Its query embeddings come from the vLLM embedding server at reward_kwargs.embedding_url
+Its embeddings come from the vLLM embedding server at reward_kwargs.embedding_url
 (Qwen3-Embedding-8B on a GPU of its own, started by run_l1_grpo.sh), else from reward_kwargs.embedding_model in the
-worker on the CPU; the pool actions' vectors are rows of the memory-mapped ACTION_EMBEDDING_FILES. L1_REWARD_NUM_THREADS
-(default 8) torch threads rank them (Ray starts actors with a single OpenMP
+worker on the CPU; L1_REWARD_NUM_THREADS (default 8) torch threads rank them (Ray starts actors with a single OpenMP
 thread). verl may score several answers of a worker at once in threads, so they take turns. A cut answer is judged on its text only (verl does not pass the finish reason): it is not valid JSON.
 """
 
@@ -43,11 +42,11 @@ _lock = threading.Lock()
 _state: dict = {"reward_fn": None, "batch_id": None}
 
 
-def load_pools(pool_file: str, batch_id: str) -> dict[str, list]:
-    """Separate visible-past and next-week pools of this batch with their action_idx (one row group per batch)."""
+def load_pools(pool_file: str, batch_id: str) -> dict[str, list[str]]:
+    """Separate visible-past and next-week pools of this batch (one row group per batch)."""
     import pyarrow.parquet as pq
 
-    rows = pq.read_table(pool_file, columns=["past_actions", "past_action_idx", "future_actions", "future_action_idx"],
+    rows = pq.read_table(pool_file, columns=["past_actions", "future_actions"],
                          filters=[("batch_id", "=", batch_id)]).to_pylist()
     if len(rows) != 1:
         raise ValueError(f"{pool_file}: {len(rows)} rows for batch_id {batch_id!r}, expected 1")

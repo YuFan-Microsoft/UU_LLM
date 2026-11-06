@@ -27,14 +27,11 @@ This batch's visible past actions are embedded once per batch (set_pools), so pa
 next-week actions are the future pool. Query embeddings and repeated action embeddings are shared.
 The embeddings are Qwen3-Embedding-8B's, computed in process (Embedder) or by a vLLM
 embedding server (EmbeddingClient, `vllm serve <model> --runner pooling`; GRPO runs it on a GPU of its own) on the
-same texts. The batch's actions are not sent to either: given their action_idx (prepare_data.py's pools), their
-vectors are rows of ACTION_EMBEDDING_FILES, the same model's document embeddings of every past action and every
-future action of RL_User_Profile_Layer1_V1, precomputed by embed_actions.py (row i = action_idx i; past and future
-are separate index spaces) and memory-mapped once per process. Only the topic queries are embedded per answer.
+same texts.
 
     reward_fn = L1Reward(tokenizer=tokenizer)  # generation checkpoint's tokenizer, not the embedding tokenizer
     reward_fn = L1Reward(tokenizer=tokenizer, embedding_url="http://127.0.0.1:8100")  # or: a vLLM embedding server
-    reward_fn.set_pools(past_actions, future_actions, past_action_idx, future_action_idx)  # batch pools
+    reward_fn.set_pools(past_actions, future_actions)  # batch visible actions (embedded once) and next-week pool
     reward_fn(content, text, finish_reason, next_week_actions)["reward"]
 """
 
@@ -63,12 +60,6 @@ REWARD_SIGNALS = ("past_assignment", "future_retrieval")
 # past_assignment's denominator is at least this share of the visible actions: skipping beyond it is not penalized.
 PAST_COVERAGE_TARGET = 0.7
 SIGNALS = ("coverage", *REWARD_SIGNALS)  # All logged content metrics; coverage is diagnostic only.
-# embed_actions.py's precomputed document embeddings of RL_User_Profile_Layer1_V1: row i is action_idx i, separately
-# for the past and the future behaviors.
-ACTION_EMBEDDING_FILES = {
-    "past": "/yufan/MAI_Profile/data_factory/RL_Dataset/past_behavior_actions_emb.pt",
-    "future": "/yufan/MAI_Profile/data_factory/RL_Dataset/future_behavior_actions_emb.pt",
-}
 # Diagnostic answer-shape metrics; None when the answer has no interest (or, for the topic ones, no topic).
 STRUCTURE_SIGNALS = ("topics_per_interest", "evidence_per_topic", "interest_name_tokens", "topic_tokens")
 DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B"
@@ -250,44 +241,12 @@ class L1Reward:
             embedder = EmbeddingClient(embedding_url, batch_size) if embedding_url else Embedder(embedding_model,
                                                                                                    batch_size)
         self.embedder = embedder
-        self.action_matrices = {}  # "past" / "future" -> the memory-mapped ACTION_EMBEDDING_FILES tensor
         self.set_pools([], [])
 
-    def action_vectors(self, side: str, action_idx: list[int]):
-        """Rows `action_idx` of the precomputed `side` ("past" or "future") embeddings, as float32. The file is
-        memory-mapped on first use (shared through the page cache by every process reading it)."""
-        import torch
-
-        if side not in self.action_matrices:
-            path = Path(ACTION_EMBEDDING_FILES[side])
-            if not path.exists():
-                raise FileNotFoundError(f"{path}: the precomputed {side} action embeddings (embed_actions.py)")
-            self.action_matrices[side] = torch.load(path, map_location="cpu", mmap=True, weights_only=True)
-        matrix = self.action_matrices[side]
-        if action_idx and max(action_idx) >= matrix.shape[0]:
-            raise ValueError(f"{side} action_idx {max(action_idx)} beyond {ACTION_EMBEDDING_FILES[side]} "
-                             f"({matrix.shape[0]} rows)")
-        return matrix[torch.tensor(action_idx, dtype=torch.long)].float()
-
-    def _cache_actions(self, side: str, actions: list[str], action_idx: list[int] | None) -> None:
-        """Put the precomputed vectors of these document texts in the embedder's cache (the first idx of a text)."""
-        if action_idx is None:
-            return
-        if len(action_idx) != len(actions):
-            raise ValueError(f"{len(actions)} {side} actions but {len(action_idx)} action_idx")
-        first = dict(zip(reversed(actions), reversed(action_idx)))
-        missing = [action for action in first if (False, action) not in self.embedder.cache]
-        for action, vector in zip(missing, self.action_vectors(side, [first[action] for action in missing])):
-            self.embedder.cache[(False, action)] = vector
-
-    def set_pools(self, past_actions: list[str], future_actions: list[str], past_action_idx: list[int] | None = None,
-                  future_action_idx: list[int] | None = None) -> None:
+    def set_pools(self, past_actions: list[str], future_actions: list[str]) -> None:
         """This batch's visible actions, embedded once for every answer's past_assignment (never ranked across users),
-        and its next-week candidate pool. Clear the cache once; action embeddings are shared. With their action_idx
-        (aligned with the actions), the vectors are read from ACTION_EMBEDDING_FILES instead of being embedded."""
+        and its next-week candidate pool. Clear the cache once; action embeddings are shared."""
         self.embedder.clear()
-        self._cache_actions("past", past_actions, past_action_idx)
-        self._cache_actions("future", future_actions, future_action_idx)
         self.past_pool = list(dict.fromkeys(past_actions))
         self.future_pool = list(dict.fromkeys(future_actions))
         self.past_index = {action: column for column, action in enumerate(self.past_pool)}

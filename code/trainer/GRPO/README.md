@@ -114,7 +114,7 @@ The launcher builds the data once per `DATA_DIR` (default `outputs/data/l1v1_see
 all 197,269 training rows take minutes with one process per CPU core, up to 32, and print their progress;
 `NUM_TRAIN_BATCHES=2` takes seconds) and refuses a `DATA_DIR` prepared from another dataset (`meta.json`
 `dataset` must be `yufan/user_profile_dataset/RL_User_Profile_Layer1_V1`), cut for another batch size or using an
-older pool format (without action_idx). Explicit old cache paths must be replaced with a new directory and regenerated.
+older pool format (mixed-language batches). Explicit old cache paths must be replaced with a new directory and regenerated.
 Use a new `EXPERIMENT_NAME` when starting this objective from SFT; the same output directory would resume
 its previous checkpoint automatically.
 With replay enabled, its separate preparation downloads the seven V3 SFT training sets once and tokenizes
@@ -286,7 +286,7 @@ shows progress.
 `RL_User_Profile_Layer1_V1` (folder `User_Profile_Layer1_For_RL_V1`, Parquet) of `yufan/user_profile_dataset` has
 two splits with disjoint users, one row per user: `train` (197,269 rows in 40 shards) and `test` (1,976 rows).
 A row is `{"user_id", "past_behaviors", "future_behaviors", "language"}`, behaviors `{"date", "source", "action",
-"action_idx", "action_freq"}` (`action_idx` / `action_freq` and `language` are not used): one history window of the
+"action_idx", "action_freq"}` (`action_idx` / `action_freq` are not used; `language` sets the batches): one history window of the
 user and the actions after it (at least 10).
 `l1/prepare_data.py` builds one prompt per user exactly as the inference and the case study do
 (`load_users` + `dedupe`, `layer1.fit_prompt` / `build_message`) and takes the rows in the seeded random order of
@@ -303,21 +303,15 @@ Each row carries its user's cleaned future actions (`reward_model.ground_truth`,
 `extra_info.future`), the Layer-1 user message, its `batch_id` and its source `file` / `row` (`extra_info`).
 
 verl computes rewards one answer at a time in its reward workers, so both candidate pools of every batch are written
-ahead (`pools.parquet`, one row group per batch, columns `batch_id`, `past_actions`, `past_action_idx`,
-`future_actions`, `future_action_idx`) and looked up by `batch_id`. Pool format version 4 (single-language pools) is recorded in `meta.json`. Past actions are parsed from the actual prepared
+ahead (`pools.parquet`, one row group per batch, columns `batch_id`, `past_actions`, `future_actions`) and looked up
+by `batch_id`. Pool format version 4 (single-language pools) is recorded in `meta.json`. Past actions are parsed from the actual prepared
 prompts, not from the untrimmed source history. The pools represent the current batch only because
 verl reads the rows in order: the launcher sets `data.shuffle=False` and `data.filter_overlong_prompts=False`, and
 the data step already dropped every row verl could reject.
 
-The pool actions are not embedded during training: their vectors are rows `action_idx` of the Qwen3-Embedding-8B
-document embeddings precomputed by `embed_actions.py` for every action of the dataset, one file per side (separate
-index spaces), hard-coded in `l1/l1_reward.py` (`ACTION_EMBEDDING_FILES`):
-`/yufan/MAI_Profile/data_factory/RL_Dataset/past_behavior_actions_emb.pt` and `.../future_behavior_actions_emb.pt`.
-Each reward worker memory-maps them on first use (`torch.load(mmap=True)`: the page cache is shared, nothing is
-copied per worker) and reads only the rows of its batch. They must be readable on every node that runs reward
-workers. Only the topic queries come from the vLLM server of the Run section (on this node it logs to
+The embeddings come from the vLLM server of the Run section (on this node it logs to
 `outputs/<run>/embedding_server.log`; verl splits each step's 64 x 16 answers evenly over the training GPUs). The
-reward workers are CPU-only Ray actors: each asks the server for the queries
+reward workers are CPU-only Ray actors: each asks the server for its batch's two pools once per batch and for the queries
 of every answer (retrying for about 3 minutes, long enough for the watchdog to restart a server), then ranks them
 (`L1_REWARD_NUM_THREADS`, default 8 torch threads) and runs the rules with the fastText language model. verl does not
 pass the finish reason, so an answer cut at the response length is judged on its text (it is not valid JSON, so it

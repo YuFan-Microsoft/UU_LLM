@@ -278,28 +278,6 @@ class DualPoolRewardTest(unittest.TestCase):
         self.scorer.set_pools(self.past + ["DP"], self.future + ["DF", "FC"] + self.others)
         self.assertEqual(self.score()["past_assignment"], original["past_assignment"])
 
-    def test_precomputed_action_vectors_replace_document_embedding(self):
-        reference = self.score(5)
-        vectors = {}
-
-        def action_vectors(side, action_idx):
-            vectors.setdefault(side, []).extend(action_idx)
-            texts = {"past": self.past + ["DP"], "future": self.future + ["DF"] + self.others}[side]
-            return [self.embedder.encode([texts[i]], query=False).rows[0] for i in action_idx]
-
-        with patch.object(self.scorer, "action_vectors", side_effect=action_vectors):
-            past, future = self.past + ["DP"], self.future + ["DF"] + self.others
-            self.scorer.set_pools(past, future, list(range(len(past))), list(range(len(future))))
-        self.assertEqual(sorted(vectors["past"]), list(range(len(past))))
-        self.assertEqual(sorted(vectors["future"]), list(range(len(future))))
-        self.embedder.computed.clear()
-        result = self.score(5)
-        self.assertEqual(result["past_assignment"], reference["past_assignment"])
-        self.assertEqual(result["future_retrieval"], reference["future_retrieval"])
-        self.assertTrue(all(query for query, _ in self.embedder.computed))  # only the topic queries are embedded
-        with self.assertRaisesRegex(ValueError, "action_idx"):
-            self.scorer.set_pools(["P0"], [], [0, 1], None)
-
     def test_query_and_shared_action_embeddings_are_reused(self):
         before = self.embedder.clear_count
         self.scorer.set_pools(["P0", "P0"], ["P0", "F0", "F0"])
@@ -629,7 +607,7 @@ class PoolPreparationTest(unittest.TestCase):
         old_pools = self.launch_with_meta({"dataset": prepare_data.DATASET, "batch_size": 64,
                                            "max_prompt_length": 17408})
         self.assertNotEqual(old_pools.returncode, 0)
-        self.assertIn("expected dual past/future pools", old_pools.stderr)
+        self.assertIn("expected single-language dual past/future pools", old_pools.stderr)
         self.assertIn("regenerate", old_pools.stderr)
 
     def test_rows_are_read_in_the_seeded_user_order(self):
@@ -680,38 +658,30 @@ class PoolPreparationTest(unittest.TestCase):
                 prepare_data.index_rows([root / name for name in files], 0)
 
     def test_past_pool_uses_only_visible_signals(self):
-        past = [{"date": "2026-10-03", "source": "Bing", "action": action, "action_idx": 10 + index}
-                for index, action in enumerate(("P0", "P1"))]
+        past = [{"date": "2026-10-03", "source": "Bing", "action": action} for action in ("P0", "P1")]
         row = {"user_id": "synthetic-user", "past_behaviors": past,
-               "future_behaviors": [{"date": "2026-10-10", "source": "Bing", "action": "F0", "action_idx": 7}]}
+               "future_behaviors": [{"date": "2026-10-10", "source": "Bing", "action": "F0"}]}
         with patch.object(prepare_data.layer1, "fit_prompt", return_value=(past[:1], [1, 2])):
             example = prepare_data.build_example(row, lambda text: [1], 10000)
         if example is None:
             raise AssertionError("The synthetic row should survive prompt preparation")
-        self.assertEqual((example["extra_info"]["past_action_idx"], example["extra_info"]["future_action_idx"]),
-                         ([10], [7]))
         self.assertEqual(example["extra_info"]["language"], "und")
         pool = prepare_data.assign_batches([example], "train", 1)["train-000000"]
-        self.assertEqual(pool, {"past_actions": ["P0"], "past_action_idx": [10],
-                                "future_actions": ["F0"], "future_action_idx": [7], "users": 1})
+        self.assertEqual(pool, {"past_actions": ["P0"], "future_actions": ["F0"], "users": 1})
 
     def test_batches_and_validation_pools(self):
         def row(past, future, language="en"):
-            return {"extra_info": {"content": content(past), "language": language,
-                                   "past_action_idx": [int(a[1:]) for a in past],
-                                   "future_action_idx": [100 + int(a[1:]) for a in future]},
+            return {"extra_info": {"content": content(past), "language": language},
                     "reward_model": {"ground_truth": future}}
         rows = [row(["P0"], ["F0"]), row(["P1", "P0"], ["F1", "F0"])]
         pools = prepare_data.assign_batches(rows, "train", 1)
-        self.assertEqual(pools["train-000000"], {"past_actions": ["P0"], "past_action_idx": [0],
-                                                 "future_actions": ["F0"], "future_action_idx": [100], "users": 1})
+        self.assertEqual(pools["train-000000"], {"past_actions": ["P0"], "future_actions": ["F0"], "users": 1})
         # Validation: one pool per language, topped up with same-language distractors' future actions only.
         val = [row(["P2"], ["F2"], "sv"), row(["P0"], ["F0"]), row(["P1"], ["F1"])]
         distractors = [row(["P3"], ["F3"], "sv"), row(["P4"], ["F4"]), row(["P5"], ["F5"]), row(["P6"], ["F6"], "ja")]
         pools = prepare_data.assign_batches(val, "val", None, distractors, pool_users=3)
         self.assertEqual([r["extra_info"]["batch_id"] for r in val], ["val-en", "val-en", "val-sv"])
-        self.assertEqual(pools["val-en"], {"past_actions": ["P0", "P1"], "past_action_idx": [0, 1],
-                                           "future_actions": ["F0", "F1", "F4"], "future_action_idx": [100, 101, 104],
+        self.assertEqual(pools["val-en"], {"past_actions": ["P0", "P1"], "future_actions": ["F0", "F1", "F4"],
                                            "users": 3})
         self.assertEqual(pools["val-sv"]["future_actions"], ["F2", "F3"])
         self.assertEqual(pools["val-sv"]["past_actions"], ["P2"])
@@ -736,8 +706,7 @@ class PoolPreparationTest(unittest.TestCase):
         pa.Table = SimpleNamespace(from_pylist=lambda rows: rows, from_pydict=lambda values: values)
         pq.write_table = Mock()
         def row(past, future):
-            return {"extra_info": {"content": content(past), "prompt_tokens": 2, "past_action_idx": [3],
-                                   "future_action_idx": [4], "language": "en"},
+            return {"extra_info": {"content": content(past), "prompt_tokens": 2, "language": "en"},
                     "reward_model": {"ground_truth": future}}
         with TemporaryDirectory() as directory, patch.dict(sys.modules, {"pyarrow": pa, "pyarrow.parquet": pq}):
             args = argparse.Namespace(output_dir=Path(directory), batch_size=1, seed=0,
@@ -748,8 +717,7 @@ class PoolPreparationTest(unittest.TestCase):
         self.assertEqual(meta["pool_format_version"], prepare_data.POOL_FORMAT_VERSION)
         table = pq.write_table.call_args_list[2].args[0]
         self.assertEqual(table, {"batch_id": ["val-en", "train-000000"],
-                                 "past_actions": [["P0"], ["P1"]], "past_action_idx": [[3], [3]],
-                                 "future_actions": [["F0"], ["F1"]], "future_action_idx": [[4], [4]]})
+                                 "past_actions": [["P0"], ["P1"]], "future_actions": [["F0"], ["F1"]]})
         self.assertEqual(pq.write_table.call_args_list[2].kwargs, {"row_group_size": 1})
 
 

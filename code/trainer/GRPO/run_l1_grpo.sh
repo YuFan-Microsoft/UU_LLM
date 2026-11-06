@@ -86,7 +86,7 @@ if meta.get("dataset") != DATASET:
     sys.exit(f"{sys.argv[1]}: prepared from {meta.get('dataset', 'an older RL dataset')}, not {DATASET}; "
              "use another DATA_DIR and regenerate the data")
 if meta.get("pool_format_version") != POOL_FORMAT_VERSION:
-    sys.exit(f"{sys.argv[1]}: expected dual past/future pools with action_idx (format {POOL_FORMAT_VERSION}); "
+    sys.exit(f"{sys.argv[1]}: expected single-language dual past/future pools (format {POOL_FORMAT_VERSION}); "
              "use another DATA_DIR and regenerate the data")
 if meta["batch_size"] != int(sys.argv[2]) or meta["max_prompt_length"] > int(sys.argv[3]):
     sys.exit(f"{sys.argv[1]}: batch_size {meta['batch_size']} / max_prompt_length {meta['max_prompt_length']} do not "
