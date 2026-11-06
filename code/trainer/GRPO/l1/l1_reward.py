@@ -2,30 +2,29 @@
 
 The reward of one answer: 0 if it breaks the Layer-1 rules (not V3 JSON, a user_profile_rules violation such as a
 duplicate interest / topic, bad evidence or the wrong language, any interest_name or topic with 7 or more generation
-tokenizer tokens (no special tokens), or cut at max_tokens), else the mean of three signals, each in [0, 1]:
-    past_assignment     visible input actions owned by a topic that cites them, divided by the larger of the number
-                        of actions cited and PAST_COVERAGE_TARGET (0.7) of the visible actions; an action is
-                        owned by the topic, among every topic written, whose query "<interest name>: <topic>"
-                        (topic_query) is the most similar to it (a tie counts if a citing topic is among the tied)
-    future_recall@K     share of the user's next-week actions in the top K of one of the first N interests
-    future_precision@K  first-N interests matched one-to-one to a distinct next-week action in their top K, divided
-                        by the number of interests written
+tokenizer tokens (no special tokens), or cut at max_tokens), else the mean of two signals, each in [0, 1]. Both use
+the same queries, one per topic written: "<interest name>: <topic>" (topic_query).
+    past_assignment     within the user: each visible input action is owned by its most similar topic (a tie counts
+                        if a citing topic is among the tied); the actions owned by a topic citing them, divided by
+                        the larger of the number of actions cited and PAST_COVERAGE_TARGET (0.7) of the visible
+                        actions
+    future_retrieval    across the batch: every next-week action of every batch user is scored by its most similar
+                        topic of this answer (other users' answers play no part); of the top B, B being the number of
+                        this user's distinct next-week actions, the share that are this user's (recall = precision)
 past_assignment compares the user's own topics only, never other users' actions: a word shared by every label (a
 place, a language) does not help, and only correct citations earn: an action left uncited, cited by a topic that
 does not own it, or owned by a more similar sibling topic earns nothing. Below the coverage target, citing fewer
 actions costs; above it, only the citations' correctness counts (the V35 GPT-5.6 labels cite 0.78 of the input
-actions on average, 0.67 at P25), so skipping noise is free and a wrong citation always costs.
-Coverage, the share of input indices cited by the first N interests, is logged but does not affect the reward.
+actions on average, 0.67 at P25), so skipping noise is free and a wrong citation always costs. One topic citing
+everything owns everything there; future_retrieval checks that the topics also pick this user's next week out of the
+batch: B is fixed, so a topic earns only if it ranks this user's actions above other users'; one broad topic or a
+topic common to everyone (a messenger, a login page) also ranks other users' actions, sibling topics retrieve the
+same actions, and more interests or topics add no slots.
+Coverage, the share of input indices cited by the answer, is logged but does not affect the reward directly.
 So is the answer's shape (STRUCTURE_SIGNALS, every interest and topic written): topics per interest, distinct
 evidence per topic, and generation-tokenizer tokens per interest_name and per topic.
-N = interest_cap(n) = round(0.9 + 18.2 n / (33 + n)) for n input signals: the approximate SFT P90 interest count,
-a saturation curve fitted to the V3 train split's per-bucket P90 (1 at n = 1, 5 at 10, 9 at 25, 13 at 60, 17 at 200;
-the prompt holds at most 200 signals). Recall grows with every interest (K more retrieved actions), which made GRPO
-inflate the interest count; an interest past N adds no recall or matched interest and only lowers precision. The cap
-applies to the future signals only.
-Each interest is one future query (interest_query) ranking this batch's next-week actions. This batch's visible past
-actions are embedded once per batch (set_pools), so past_assignment reuses them. Query embeddings and repeated
-action embeddings are shared.
+This batch's visible past actions are embedded once per batch (set_pools), so past_assignment reuses them, and its
+next-week actions are the future pool. Query embeddings and repeated action embeddings are shared.
 The embeddings are Qwen3-Embedding-8B's, computed in process (Embedder) or by a vLLM
 embedding server (EmbeddingClient, `vllm serve <model> --runner pooling`; GRPO runs it on a GPU of its own) on the
 same texts.
@@ -37,7 +36,6 @@ same texts.
 """
 
 import json
-import math
 import statistics
 import sys
 import time
@@ -56,20 +54,14 @@ if str(INFERENCE_DIR) not in sys.path:
 import user_profile_rules  # noqa: E402
 from utils import parse_json_object  # noqa: E402
 
-TOP_K = 10
 MAX_LABEL_TOKENS = 6
 INVALID_REWARD = 0.0
-FUTURE_SIGNALS = ("future_recall", "future_precision")  # top-K retrieval signals (reported as <name>@K)
-REWARD_SIGNALS = ("past_assignment", *FUTURE_SIGNALS)
+REWARD_SIGNALS = ("past_assignment", "future_retrieval")
 # past_assignment's denominator is at least this share of the visible actions: skipping beyond it is not penalized.
 PAST_COVERAGE_TARGET = 0.7
 SIGNALS = ("coverage", *REWARD_SIGNALS)  # All logged content metrics; coverage is diagnostic only.
 # Diagnostic answer-shape metrics; None when the answer has no interest (or, for the topic ones, no topic).
 STRUCTURE_SIGNALS = ("topics_per_interest", "evidence_per_topic", "interest_name_tokens", "topic_tokens")
-# The interest cap (P90 of the SFT interest count) at n input signals: CAP_BASE + CAP_SCALE * n / (CAP_HALF + n),
-# rounded; fitted to the V3 train split's P90 per signal-count bucket (1: 1, 3-4: 3, 8-11: 5, 20-29: 9, 50-74: 12,
-# 100-149: 15, 200: 17).
-CAP_BASE, CAP_SCALE, CAP_HALF = 0.9, 18.2, 33.0
 DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B"
 SERVED_EMBEDDING_MODEL = "l1-embedding"  # --served-model-name of the vLLM embedding server
 # Same query instruction as code/evaluation/evaluate_behavior_retrieval.py; documents (actions) have none.
@@ -130,19 +122,8 @@ def input_signals(content: str) -> list[dict]:
     return payload["activities"]
 
 
-def interest_query(interest: dict) -> str:
-    """The retrieval query of one interest: "<interest name>: <top topic>", the topic citing the most distinct
-    signals (the first on ties), or the name alone without a topic. Joining every topic blurs the embedding, and a
-    query per topic would reward padding interests with topics."""
-    topics = [topic for topic in interest["topics"] if isinstance(topic.get("topic"), str) and topic["topic"].strip()]
-    if not topics:
-        return interest["interest_name"]
-    top = max(topics, key=lambda topic: len(set(topic["evidence"])))  # max keeps the first on ties
-    return f"{interest['interest_name']}: {top['topic'].strip()}"
-
-
 def topic_query(interest: dict, topic: dict) -> str:
-    """The past_assignment query of one topic: "<interest name>: <topic>", or the name alone for an empty topic."""
+    """The query of one topic, for both signals: "<interest name>: <topic>", or the name alone for an empty topic."""
     label = topic["topic"].strip() if isinstance(topic.get("topic"), str) else ""
     return f"{interest['interest_name']}: {label}" if label else interest["interest_name"]
 
@@ -158,29 +139,6 @@ def assign_owners(similarity: list[list[float]], citations: list[set[int]], indi
         owners.append(scores.index(best))
         correct += any(scores[t] == best for t, cited in enumerate(citations) if idx in cited)
     return correct, owners
-
-
-def interest_cap(n_signals: int) -> int:
-    """N, the number of leading interests that earn credit in an answer to n_signals input signals (see the module
-    docstring); at least 1."""
-    return max(1, math.floor(CAP_BASE + CAP_SCALE * n_signals / (CAP_HALF + n_signals) + 0.5))
-
-
-def matched_interests(hits: list[list[list[int]]]) -> int:
-    """The size of a maximum matching between interests and the next-week actions in their top K (hits: per interest,
-    its [position in future, rank] pairs): each action credits at most one interest and each interest needs one."""
-    owner: dict[int, int] = {}  # future position -> the interest it is matched to
-
-    def augment(interest: int, seen: set) -> bool:
-        for position, _ in hits[interest]:
-            if position not in seen:
-                seen.add(position)
-                if position not in owner or augment(owner[position], seen):
-                    owner[position] = interest
-                    return True
-        return False
-
-    return sum(augment(interest, set()) for interest in range(len(hits)))
 
 
 class Embedder:
@@ -273,7 +231,7 @@ class L1Reward:
     """The Layer-1 reward of one answer (see the module docstring)."""
 
     def __init__(self, embedding_model: str = DEFAULT_EMBEDDING_MODEL, batch_size: int = 256,
-                 embedder: Embedder | EmbeddingClient | None = None, top_k: int = TOP_K,
+                 embedder: Embedder | EmbeddingClient | None = None,
                  embedding_url: str | None = None, *, tokenizer: "PreTrainedTokenizerBase"):
         """Use the generation `tokenizer` for label limits. Embeddings come from `embedder`, the vLLM server at
         `embedding_url`, or `embedding_model` in process."""
@@ -283,7 +241,6 @@ class L1Reward:
             embedder = EmbeddingClient(embedding_url, batch_size) if embedding_url else Embedder(embedding_model,
                                                                                                    batch_size)
         self.embedder = embedder
-        self.top_k = top_k
         self.set_pools([], [])
 
     def set_pools(self, past_actions: list[str], future_actions: list[str]) -> None:
@@ -298,33 +255,30 @@ class L1Reward:
             self.embedder.encode(self.past_pool, query=False)  # cached: each answer reads its user's actions back
         self.future_vectors = self.embedder.encode(self.future_pool, query=False) if self.future_pool else None
 
-    def _rank_hits(self, query_vectors, pool: list[str], pool_index: dict[str, int], pool_vectors,
-                   targets: list[str]) -> list[list[list[int]]]:
-        """Per query, [target position, rank] of its top-K hits, using only this candidate pool."""
-        if query_vectors is None:
-            return []
-        if not targets:
-            return [[] for _ in range(query_vectors.shape[0])]
-        extra = [action for action in targets if action not in pool_index]
-        columns = {**{action: len(pool) + i for i, action in enumerate(extra)}, **pool_index}
+    def _rank_future(self, query_vectors, targets: list[str]) -> list[list[int]]:
+        """future_retrieval's ranking: every candidate (the next-week pool, plus any target missing from it) is scored
+        by its most similar query; per target among the top B candidates (B = len(targets)), in rank order:
+        [target position, rank from 1, row of the most similar query]."""
+        extra = [action for action in targets if action not in self.future_index]
+        columns = {**{action: len(self.future_pool) + i for i, action in enumerate(extra)}, **self.future_index}
         position = {columns[action]: pos for pos, action in enumerate(targets)}
         parts = [query_vectors @ vectors.T for vectors in
-                 (pool_vectors, self.embedder.encode(extra, query=False) if extra else None)
+                 (self.future_vectors, self.embedder.encode(extra, query=False) if extra else None)
                  if vectors is not None]
-        scores = self.embedder.torch.cat(parts, dim=1)
-        top = scores.topk(min(self.top_k, scores.shape[1]), dim=1).indices.tolist()
-        return [[[position[column], rank] for rank, column in enumerate(row, 1) if column in position]
-                for row in top]
+        best = self.embedder.torch.cat(parts, dim=1).max(dim=0)
+        owners = best.indices.tolist()
+        top = best.values.topk(len(targets)).indices.tolist()
+        return [[position[column], rank, owners[column]] for rank, column in enumerate(top, 1) if column in position]
 
     def __call__(self, content: str, text: str, finish_reason: str | None, future: list[str]) -> dict:
         """The reward of one answer `text` to the Layer-1 user message `content`, whose user does the actions `future`
         next week, with what it is computed from:
             reward, json_valid, rule_pass, violations, output (the parsed answer, None unless JSON-valid), n_interests,
-            coverage and the three REWARD_SIGNALS (0 unless JSON-valid), STRUCTURE_SIGNALS (None unless JSON-valid
-            with interests / topics), queries (one future query per interest), past_owners (per visible input
-            action, in prompt order, [interest, topic] of the topic owning it; None without topics) and
-            hits (future hits): per interest, [position in the distinct target actions, rank from 1] of its top K;
-            None unless JSON-valid. Interests past interest_cap get diagnostic hits too, but earn nothing.
+            coverage and the two REWARD_SIGNALS (0 unless JSON-valid), STRUCTURE_SIGNALS (None unless JSON-valid
+            with interests / topics), and, None unless JSON-valid: queries (per interest, its topics' queries),
+            past_owners (per visible input action, in prompt order, [interest, topic] of the topic owning it; None
+            without topics) and hits (per interest, [position in the distinct next-week actions, rank from 1] of the
+            user's next-week actions in the top B whose most similar topic is one of the interest's).
         A JSON-valid answer that breaks a rule gets its signals too, for diagnostics, but INVALID_REWARD."""
         rules, output = judge(content, text, finish_reason, self.tokenizer)
         result = {"reward": INVALID_REWARD, "json_valid": rules["json_valid"], "rule_pass": rules["rule_pass"],
@@ -341,37 +295,39 @@ class L1Reward:
             raise ValueError("Past candidate pool is empty; call set_pools with the batch's visible past actions")
         if any(action not in self.past_index for action in past):
             raise ValueError("Past candidate pool does not contain all visible input actions; check batch/data alignment")
-        # Past: every topic of the answer competes for each of the user's own visible actions.
-        topics = [(position, index, interest, topic) for position, interest in enumerate(output["interests"])
+        interests = output["interests"]
+        topics = [(position, index, interest, topic) for position, interest in enumerate(interests)
                   for index, topic in enumerate(interest["topics"])]
+        queries = [topic_query(interest, topic) for _, _, interest, topic in topics]
+        query_vectors = self.embedder.encode(queries, query=True) if queries else None
+        citations = [set(topic["evidence"]) for *_, topic in topics]
+        # Past: every topic of the answer competes for each of the user's own visible actions.
         past_assignment, past_owners = 0.0, None
         if topics and signals:
-            similarity = (self.embedder.encode([topic_query(interest, topic) for _, _, interest, topic in topics],
-                                               query=True)
+            similarity = (query_vectors
                           @ self.embedder.encode([signal["action"] for signal in signals], query=False).T).tolist()
-            citations = [set(topic["evidence"]) for *_, topic in topics]
             visible = [signal["idx"] for signal in signals]
             correct, owners = assign_owners(similarity, citations, visible)
             cited = set().union(*citations) & set(visible)
             past_assignment = correct / max(len(cited), PAST_COVERAGE_TARGET * len(visible))
             past_owners = [list(topics[owner][:2]) for owner in owners]
-        queries = [interest_query(interest) for interest in output["interests"]]
+        # Future: the same topics pick this user's next-week actions out of every batch user's.
         future = list(dict.fromkeys(future))
-        query_vectors = self.embedder.encode(queries, query=True) if queries else None
-        hits = self._rank_hits(query_vectors, self.future_pool, self.future_index, self.future_vectors, future)
-        # Only the first N interests earn future credit; every interest written counts in precision's denominator.
-        n_credited = interest_cap(len(indices))
-        credited, credited_hits = output["interests"][:n_credited], hits[:n_credited]
-        cited = {idx for interest in credited for topic in interest["topics"] for idx in topic["evidence"]} & indices
-        retrieved = {pos for interest_hits in credited_hits for pos, _ in interest_hits}
-        n_interests = len(output["interests"])
+        future_retrieval, hits = 0.0, [[] for _ in interests]
+        if topics and future:
+            ranked = self._rank_future(query_vectors, future)
+            future_retrieval = len(ranked) / len(future)
+            for target, rank, row in ranked:
+                hits[topics[row][0]].append([target, rank])
+        by_interest = [[] for _ in interests]
+        for (position, *_), query in zip(topics, queries):
+            by_interest[position].append(query)
         result.update({
-            "n_interests": n_interests,
-            "coverage": len(cited) / len(indices) if indices else 0.0,
+            "n_interests": len(interests),
+            "coverage": len(set().union(*citations) & indices) / len(indices) if indices else 0.0,
             "past_assignment": past_assignment,
-            "future_recall": len(retrieved) / len(future) if future else 0.0,
-            "future_precision": matched_interests(credited_hits) / n_interests if n_interests else 0.0,
-            "queries": queries, "past_owners": past_owners, "hits": hits,
+            "future_retrieval": future_retrieval,
+            "queries": by_interest, "past_owners": past_owners, "hits": hits,
         })
         if rules["rule_pass"]:
             result["reward"] = statistics.mean(result[name] for name in REWARD_SIGNALS)

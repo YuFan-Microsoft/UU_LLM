@@ -18,29 +18,21 @@ data, or takes the answers a GRPO run generated at one validation step, and scor
 
 The reward of one answer is 0 when it breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation,
 any `interest_name` or `topic` with 7 or more generation-tokenizer tokens, or cut at max_tokens), else the mean of
-three signals, each in [0, 1], with K = 10. Token counts exclude special tokens and apply to every name and topic,
-including those not credited by retrieval; `actual_activity` has no such limit.
+two signals, each in [0, 1]. Token counts exclude special tokens and apply to every name and topic;
+`actual_activity` has no such limit. Both signals use the same queries, one per topic written:
+`<interest name>: <topic>`, embedded with Qwen3-Embedding.
 
 - `past_assignment`: the user's visible input actions owned by a topic that cites them, divided by the larger of
-  the number of actions cited and 0.7 of the visible actions; every topic written is one query,
-  `<interest name>: <topic>`, and each visible action is owned by its most similar topic (a tie counts if a citing
-  topic is among the tied). Only the user's own topics compete, never other users' actions.
+  the number of actions cited and 0.7 of the visible actions; each visible action is owned by its most similar
+  topic (a tie counts if a citing topic is among the tied). Only the user's own topics compete, never other users'
+  actions.
+- `future_retrieval`: every next-week action in the pool is scored by its most similar topic of the answer; of the
+  top B, B being the number of this user's distinct next-week actions, the share that are this user's.
 
-For the two future signals, only the first N interests earn credit, but every interest written counts in
-precision's denominator:
-
-- `future_recall@K`: each interest is one query, `<interest name>: <top topic>` (the topic citing the most distinct
-  signals), ranking a pool of actions with Qwen3-Embedding (the distractor pool plus this user's next-week actions);
-  share of the user's next-week actions in the top K of one of the first N interests.
-- `future_precision@K`: number of the first N interests matched one-to-one to a distinct next-week action in their
-  top K (maximum matching: interests that only hit the same action count once), divided by the number of interests
-  written.
-
-`coverage` is still reported as the share of input indices cited by the first N interests, but is not in the reward.
-The past pool holds all prompts' actual visible actions, embedded once and read back for each answer's
-`past_assignment` (never ranked); the future pool holds all prompts' next-week actions, ranked by every interest query.
-N = round(0.9 + 18.2 n / (33 + n)) for n input signals, the approximate SFT P90 interest count (see `../README.md`);
-it applies to the future signals only.
+`coverage` is still reported as the share of input indices cited by the answer, but is not in the reward.
+`score` builds one pool per `--pool_users` consecutive prompts (64, the GRPO batch size, since `future_retrieval`
+depends on the pool size): their actual visible actions, embedded once and read back for each answer's
+`past_assignment` (never ranked), and their next-week actions, ranked for `future_retrieval`.
 
 ```python
 reward_fn = L1Reward(tokenizer=tokenizer)   # tokenizer from the generation checkpoint, not the embedding model
@@ -109,9 +101,9 @@ python layer1_sampling.py score --output_dir outputs/<run>_val_300 --checkpoint 
 ```
 
 `trend` has one row per validation step: the mean reward, the mean best reward of each user's 16 answers, the mean
-of `json_valid`, `rule_pass`, `n_interests`, `coverage`, `past_assignment` (or, for runs before it, `past_recall` /
-`past_precision`), `future_recall` and `future_precision` when available, and `future_interest_hit` for older runs (as the run's reward
-recorded them) and the mean answer length in characters. `from_val` turns one step's answers into `rollouts.jsonl`
+of `json_valid`, `rule_pass`, `n_interests`, `coverage`, `past_assignment` and `future_retrieval` (or, for runs before them,
+`past_recall` / `past_precision` and `future_recall` / `future_precision`, or `future_interest_hit`, as the run's
+reward recorded them) and the mean answer length in characters. `from_val` turns one step's answers into `rollouts.jsonl`
 (signals parsed back from each Layer-1 message, next-week actions from the run's `val.parquet`) so that `score`
 writes the same report as for a checkpoint rollout, ranked against the same two pools as the current validation reward.
 Old dumps can be rescored: past candidates are reconstructed from their actual prompts, even when the old run only
@@ -145,8 +137,8 @@ their summary (`summary.json`, also printed), `report.md` and
 `report.html`. Open `report.html` in a browser (self-contained, works offline, follows light / dark mode) to read
 every rollout's actual output (rendered, or the raw text) next to its reward signals and violations, one prompt at
 a time, with the prompt's input signals on the side (hover an interest to highlight the signals it cites and the
-next-week actions it retrieves; `j` / `k` switch prompts; "Model input" shows the exact prompt text). Every interest lists this user's next-week actions in its top K (`--top_k`, 10) with their rank,
-and each rollout shows how many next-week actions some interest retrieves. `report.md` has the
+next-week actions it retrieves; `j` / `k` switch prompts; "Model input" shows the exact prompt text). Every interest lists its topics' queries and this user's next-week actions in the top B whose most similar topic is
+one of its own, with their rank, and each rollout shows how many of the user's next-week actions are in the top B. `report.md` has the
 summary and, for the first `--report_prompts` prompts, the input signals and every sample's interests.
 
 | Signal | Meaning |
@@ -154,11 +146,10 @@ summary and, for the first `--report_prompts` prompts, the input signals and eve
 | `reward` | The GRPO reward of `../l1/l1_reward.py` (above) |
 | `json_valid` | Exactly the V3 Layer-1 schema `{"interests":[{"topics":[{"evidence","topic"}],"interest_name","actual_activity"}]}` with the right value types (no topic source, intent or content locale) |
 | `rule_pass` | The shared GRPO judgement: JSON-valid and no violation (`user_profile_rules.score_example`, `truncated`, `interest_name_too_long` / `topic_too_long` for any name or topic with 7+ generation-tokenizer tokens) |
-| `n_interests` | Number of interests written (only the first N earn future credit; all count in the future precision denominator) |
-| `coverage` | Share of the input indices cited by the first N interests (diagnostic only, not in the reward) |
+| `n_interests` | Number of interests written |
+| `coverage` | Share of the input indices cited by the answer (diagnostic only, not in the reward) |
 | `past_assignment` | This user's visible input actions owned (most similar topic, `<interest name>: <topic>`, among the answer's topics) by a topic citing them, over the larger of the actions cited and 0.7 of the visible actions (reward signal) |
-| `future_recall@K` | Share of this user's next-week actions in the top K of one of the first N interests (reward signal) |
-| `future_precision@K` | First-N interests matched one-to-one to a distinct next-week action in their top K, over all interests written (reward signal) |
+| `future_retrieval` | Of the pool's next-week actions ranked by their most similar topic, the share of the top B (B = this user's distinct next-week actions) that are this user's (reward signal) |
 
 Content signals are 0 for an answer that is not JSON-valid; a JSON-valid answer that breaks a rule still gets them,
 but its reward is 0. For GRPO only the variation within a group matters, so the summary reports each signal's mean,

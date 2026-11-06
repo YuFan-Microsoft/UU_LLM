@@ -127,7 +127,6 @@ function src(name) {
 }
 const fmt = v => v == null ? "–" : Number.isInteger(v) ? String(v) : v.toFixed(3);
 const HIDDEN = new Set(["json_valid", "rule_pass"]);  // shown as badges
-const K = D.top_k;
 
 let P = 0, view = "rendered";
 const S = D.settings || {};
@@ -139,25 +138,26 @@ function signalRows(list) {
 }
 
 // V3 answers carry no topic source: as layer1.to_record, it is rebuilt from the sources of the evidence signals.
-// hits[j]: [[next-week position, rank], ...] of interest j in its top K (absent without an embedding model).
+// hits[j]: [[next-week position, rank], ...] of the user's next-week actions in the top B (B = the user's next-week
+// actions) whose most similar topic is one of interest j's (absent without an embedding model).
 function rendered(out, sigs, hits, fut, queries) {
   const n = sigs.length, ok = i => Number.isInteger(i) && i >= 0 && i < n;
   const covered = hits ? new Set(hits.flat().map(([i]) => i)).size : null;
-  return `<div class="locale">${out.interests.length} interests${hits ? ` · next-week actions in some top ${K}: <b>${covered} / ${fut.length}</b>` : ""}</div>` +
+  return `<div class="locale">${out.interests.length} interests${hits ? ` · next-week actions in the top ${fut.length}: <b>${covered} / ${fut.length}</b>` : ""}</div>` +
     (out.interests.length ? out.interests.map((it, j) => {
       const ev = [...new Set(it.topics.flatMap(t => t.evidence))];
       return `<div class="interest" data-ev="${ev.join(",")}" data-fut="${hits ? hits[j].map(([i]) => i).join(",") : ""}"><div class="nm">${esc(it.interest_name)}</div>
-        <div class="txt"><b>Activity</b>${esc(it.actual_activity)}</div>${hits && queries ? `<div class="txt"><b>Query</b>${esc(queries[j])}</div>` : ""}
+        <div class="txt"><b>Activity</b>${esc(it.actual_activity)}</div>${hits && queries ? `<div class="txt"><b>Queries</b>${esc(queries[j].join(" · "))}</div>` : ""}
         ${it.topics.map(t => `<div class="topic"><span>${esc(t.topic)}</span>${[...new Set(t.evidence.filter(ok).map(i => sigs[i][1]))].map(src).join("")}
           ${t.evidence.map(i => `<span class="ev ${ok(i) ? "" : "bad"}">${esc(i)}</span>`).join("")}</div>`).join("")}
         ${hits ? futureHits(hits[j], fut) : ""}</div>`;
     }).join("") : `<div class="empty">No interests.</div>`);
 }
 
-// The user's next-week actions in this interest's top K, by rank.
+// The user's next-week actions in the top B retrieved through this interest's topics, by rank.
 function futureHits(h, fut) {
-  if (!h.length) return `<details class="fut none"><summary>Next week: none in top ${K}</summary></details>`;
-  return `<details class="fut" open><summary>Next week: ${h.length} in top ${K}</summary>` +
+  if (!h.length) return `<details class="fut none"><summary>Next week: none in the top ${fut.length}</summary></details>`;
+  return `<details class="fut" open><summary>Next week: ${h.length} in the top ${fut.length}</summary>` +
     h.map(([i, r]) => `<div class="row"><span class="rk">#${r}</span><span class="d">${esc(fut[i][0])}</span>${src(fut[i][1])}<span>${esc(fut[i][2])}</span></div>`).join("") +
     `</details>`;
 }

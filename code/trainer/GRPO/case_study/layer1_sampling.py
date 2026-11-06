@@ -34,7 +34,7 @@ sys.path.insert(0, str(UU_LLM / "code" / "inference"))
 sys.path.insert(0, str(HERE.parent / "l1"))
 
 import layer1  # noqa: E402
-from l1_reward import DEFAULT_EMBEDDING_MODEL, FUTURE_SIGNALS, SIGNALS, TOP_K, L1Reward, input_signals  # noqa: E402
+from l1_reward import DEFAULT_EMBEDDING_MODEL, REWARD_SIGNALS, SIGNALS, L1Reward, input_signals  # noqa: E402
 from rl_data import DEFAULT_CHECKPOINT, HF_CONFIG, HF_REPO, clean_behaviors, iter_lines, rl_data_files, row_key  # noqa: E402
 import user_profile_rules  # noqa: E402
 from utils import MAX_MODEL_LEN, build_prompt_ids, dumps, new_item  # noqa: E402
@@ -215,11 +215,11 @@ def rollout(args: argparse.Namespace) -> None:
 # score: candidate reward signals
 # ---------------------------------------------------------------------------
 
-def sample_metrics(sample: dict, k: int) -> dict:
+def sample_metrics(sample: dict) -> dict:
     """The reward of one sample and the signals it is computed from (l1_reward.L1Reward), with the judgement."""
     return {"reward": sample["reward"], "json_valid": int(sample["json_valid"]), "rule_pass": int(sample["rule_pass"]),
             "n_interests": sample["n_interests"], "coverage": sample["coverage"],
-            "past_assignment": sample["past_assignment"], **{f"{name}@{k}": sample[name] for name in FUTURE_SIGNALS}}
+            **{name: sample[name] for name in REWARD_SIGNALS}}
 
 
 def centered_correlation(groups: list[list[dict]], a: str, b: str) -> float | None:
@@ -281,11 +281,11 @@ def write_report(path: Path, rows: list[dict], scored: list[list[dict]], summary
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
-def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings: dict, top_k: int) -> None:
+def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings: dict) -> None:
     """report_template.html with the data embedded: a self-contained page (no network) showing every rollout's
     output next to its reward signals and, per interest, the next-week actions it retrieves."""
     data = {
-        "settings": settings, "top_k": top_k,
+        "settings": settings,
         "prompts": [{
             "id": row["prompt_id"], "user_id": row["user_id"], "prompt_tokens": row["prompt_tokens"],
             "model_input": row.get("model_input") or row["content"],
@@ -304,31 +304,34 @@ def write_html(path: Path, rows: list[dict], scored: list[list[dict]], settings:
 
 
 def score(args: argparse.Namespace) -> None:
-    """One pool over every prompt: its visible actions (each user's own past_assignment) and next-week actions."""
+    """Pools of --pool_users consecutive prompts (the GRPO batch size; future_retrieval depends on the pool size):
+    their visible actions (each user's own past_assignment) and their next-week actions."""
     from transformers import AutoProcessor
 
     rows = read_jsonl(args.output_dir / "rollouts.jsonl")
     tokenizer = AutoProcessor.from_pretrained(args.checkpoint, trust_remote_code=True).tokenizer
-    reward_fn = L1Reward(args.embedding_model, args.embedding_batch_size, top_k=args.top_k,
+    reward_fn = L1Reward(args.embedding_model, args.embedding_batch_size,
                          embedding_url=args.embedding_url, tokenizer=tokenizer)
-    reward_fn.set_pools(
-        past_actions=[signal["action"] for row in rows for signal in input_signals(row["content"])],
-        future_actions=[behavior["action"] for row in rows for behavior in row["future"]],
-    )
     scored = []
     with (args.output_dir / "scores.jsonl").open("w", encoding="utf-8") as sink:
-        for row in rows:
-            samples = []
-            future = [behavior["action"] for behavior in row["future"]]
-            for index, raw in enumerate(row["samples"]):
-                sample = reward_fn(row["content"], raw["text"], raw["finish_reason"], future)
-                result = {"metrics": sample_metrics(sample, args.top_k), "violations": sample["violations"],
-                          "output": sample["output"], "queries": sample["queries"],
-                          "past_owners": sample["past_owners"], "future_hits": sample["hits"]}
-                samples.append(result)
-                sink.write(dumps({"prompt_id": row["prompt_id"], "sample": index, **result["metrics"],
-                                  "violations": result["violations"]}) + "\n")
-            scored.append(samples)
+        for start in range(0, len(rows), args.pool_users):
+            group = rows[start:start + args.pool_users]
+            reward_fn.set_pools(
+                past_actions=[signal["action"] for row in group for signal in input_signals(row["content"])],
+                future_actions=[behavior["action"] for row in group for behavior in row["future"]],
+            )
+            for row in group:
+                samples = []
+                future = [behavior["action"] for behavior in row["future"]]
+                for index, raw in enumerate(row["samples"]):
+                    sample = reward_fn(row["content"], raw["text"], raw["finish_reason"], future)
+                    result = {"metrics": sample_metrics(sample), "violations": sample["violations"],
+                              "output": sample["output"], "queries": sample["queries"],
+                              "past_owners": sample["past_owners"], "future_hits": sample["hits"]}
+                    samples.append(result)
+                    sink.write(dumps({"prompt_id": row["prompt_id"], "sample": index, **result["metrics"],
+                                      "violations": result["violations"]}) + "\n")
+                scored.append(samples)
     summary = summarize([[sample["metrics"] for sample in samples] for samples in scored])
     violations = Counter(v for samples in scored for sample in samples for v in sample["violations"])
     summary["violations"] = dict(violations.most_common())
@@ -337,7 +340,7 @@ def score(args: argparse.Namespace) -> None:
     write_report(args.output_dir / "report.md", rows, scored, summary, args.report_prompts)
     settings_path = args.output_dir / "rollout_settings.json"
     settings = json.loads(settings_path.read_text(encoding="utf-8")) if settings_path.exists() else {}
-    write_html(args.output_dir / "report.html", rows, scored, settings, args.top_k)
+    write_html(args.output_dir / "report.html", rows, scored, settings)
 
     print(f"{summary['prompts']} prompts, {summary['samples']} samples")
     print(f"{'metric':<28}{'mean':>10}{'grp std':>10}{'zero-var':>10}")
@@ -403,13 +406,13 @@ def from_val(args: argparse.Namespace) -> None:
 def trend(args: argparse.Namespace) -> None:
     """Per validation step (verl's dumps, <step>.jsonl): the mean reward, the mean best reward of each prompt's group,
     the mean of every reward signal and the mean answer length, as recorded by the run's reward (each signal the dumps
-    all have: older runs lack past metrics, logged the batch-pool past_recall / past_precision before past_assignment,
-    or recorded future_interest_hit instead of future_precision)."""
+    all have: older runs lack past metrics, logged the batch-pool past_recall / past_precision before past_assignment
+    and the top-K future_recall / future_precision (or future_interest_hit) before future_retrieval)."""
     paths = sorted(args.validation_dir.glob("*.jsonl"), key=lambda path: int(path.stem))
     dumps = [(path, read_validation_dump(path)) for path in paths]
     dumps = [(path, groups, [entry for group in groups.values() for entry in group]) for path, groups in dumps]
     signals = [name for name in ("json_valid", "rule_pass", "n_interests", *SIGNALS, "past_recall", "past_precision",
-                                 "future_interest_hit")
+                                 "future_recall", "future_precision", "future_interest_hit")
                if dumps and all(entries and name in entries[0] for _, _, entries in dumps)]
     columns = ["reward", "best_of_group", *signals, "answer_chars"]
     steps = []
@@ -487,7 +490,8 @@ def parse_args() -> argparse.Namespace:
     s.add_argument("--embedding_url", help="A vLLM embedding server of the same model instead (as the GRPO run's: "
                                             "vllm serve <model> --runner pooling --served-model-name l1-embedding)")
     s.add_argument("--embedding_batch_size", type=int, default=256)
-    s.add_argument("--top_k", type=int, default=TOP_K, help="Actions each interest retrieves (the K of the reward)")
+    s.add_argument("--pool_users", type=int, default=64,
+                   help="Consecutive prompts per pool, as the GRPO batch (future_retrieval depends on the pool size)")
     s.add_argument("--report_prompts", type=int, default=16, help="Prompts shown sample by sample in report.md")
     return parser.parse_args()
 

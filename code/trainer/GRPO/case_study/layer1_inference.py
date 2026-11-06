@@ -163,7 +163,7 @@ def report(args: argparse.Namespace) -> None:
 
     summary = summarize(results)
     (args.output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
-    base.write_html(args.output_dir / "report.html", rows, [[result] for result in results], settings, None)
+    base.write_html(args.output_dir / "report.html", rows, [[result] for result in results], settings)
     print(f"{summary['prompts']} prompts: JSON-valid {summary['json_valid']:.3f}, rule pass {summary['rule_pass']:.3f}")
     print("interests (JSON-valid answers):", summary.get("n_interests_valid"))
     print("violations:", summary["violations"])
