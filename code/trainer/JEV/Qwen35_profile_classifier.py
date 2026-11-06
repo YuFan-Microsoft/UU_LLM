@@ -319,6 +319,9 @@ def main():
     args = parse_args()
     accelerator = Accelerator(
         mixed_precision="bf16", dataloader_config=DataLoaderConfiguration(non_blocking=True),
+        # One scheduler step per optimizer step: total_steps below already counts per-rank steps, and the default
+        # (True) would step the scheduler num_processes times per call.
+        step_scheduler_with_optimizer=False,
         deepspeed_plugin=None if args.eval_only else DeepSpeedPlugin(hf_ds_config=deepspeed_config(args)))
     if args.eval_only:
         args.wandb_project = ""
@@ -381,7 +384,8 @@ def main():
         model, optimizer, train_loader, make_eval_loader(eval_ds), make_eval_loader(full_eval_ds), lr_scheduler)
     if accelerator.is_main_process:
         print(f"ZeRO-{args.zero_stage}: {len(train_loader)} steps per epoch, "
-              f"global batch {args.batch_size * accelerator.num_processes}")
+              f"global batch {args.batch_size * accelerator.num_processes}; lr schedule over {total_steps} steps "
+              f"({int(total_steps * args.warmup_ratio)} warmup)")
 
     if args.wandb_project and accelerator.is_main_process:
         import wandb
