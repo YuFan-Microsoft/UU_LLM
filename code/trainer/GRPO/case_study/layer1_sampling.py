@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Layer-1 sampling: roll out a group of answers per prompt with a checkpoint on a fixed subset of
-User_Profile_Weekly_For_RL, to see how they vary; score every answer with the GRPO reward (../l1/l1_reward.py) and
+RL_User_Profile_Layer1_V1, to see how they vary; score every answer with the GRPO reward (../l1/l1_reward.py) and
 read them in a report.
 
 Steps (see README.md); the rollouts are generated once and can be re-scored as the reward changes:
@@ -16,7 +16,6 @@ build_message), so the prompts are exactly what run_inference.py sends for one w
 
 import argparse
 from collections import Counter
-import heapq
 import json
 import math
 import multiprocessing as mp
@@ -35,7 +34,8 @@ sys.path.insert(0, str(HERE.parent / "l1"))
 
 import layer1  # noqa: E402
 from l1_reward import DEFAULT_EMBEDDING_MODEL, REWARD_SIGNALS, SIGNALS, L1Reward, input_signals  # noqa: E402
-from rl_data import DEFAULT_CHECKPOINT, HF_CONFIG, HF_REPO, clean_behaviors, iter_lines, rl_data_files, row_key  # noqa: E402
+from rl_data import (DEFAULT_CHECKPOINT, HF_CONFIG_NAME, HF_REPO, clean_behaviors, index_rows, read_rows,  # noqa: E402
+                     rl_data_files)
 import user_profile_rules  # noqa: E402
 from utils import MAX_MODEL_LEN, build_prompt_ids, dumps, new_item  # noqa: E402
 
@@ -46,35 +46,32 @@ from utils import MAX_MODEL_LEN, build_prompt_ids, dumps, new_item  # noqa: E402
 
 def prepare(args: argparse.Namespace) -> None:
     """The RL data of --split (test: held-out users, the GRPO validation users) comes from Hugging Face (downloaded to a
-    temporary directory, deleted afterwards) unless --data_dir points at local copies of the same JSONL files."""
+    temporary directory, deleted afterwards) unless --data_dir points at local copies of the same Parquet files."""
     with rl_data_files(args.data_dir, args.split) as paths:
         select_rows(paths, args)
 
 
 def select_rows(paths: list[Path], args: argparse.Namespace) -> None:
-    """Pick rows by the smallest seeded hash of the raw line, so the subset is fixed for a seed and does not depend
-    on the file order or location. Rows without an allowed past signal are skipped."""
-    pool_size = args.num_prompts * 4
-    heap = []  # max-heap of (-hash, file, line_number, line): the pool_size smallest hashes
-    total = 0
-    for file_name, line_number, line in iter_lines(paths):
-        total += 1
-        key = row_key(args.seed, line)
-        entry = (-key, file_name, line_number, line)
-        if len(heap) < pool_size:
-            heapq.heappush(heap, entry)
-        elif key < -heap[0][0]:
-            heapq.heapreplace(heap, entry)
+    """Take rows in the seeded order of row_key over their user_id (rl_data.index_rows), so the subset is fixed for a
+    seed and does not depend on the file order or location. Rows without enough allowed past signals are skipped."""
+    order = index_rows(paths, args.seed)
+    total = len(order)
+    candidates = order[:args.num_prompts * 4]
+    by_file: dict[str, list[int]] = {}
+    for path, number in candidates:
+        by_file.setdefault(path, []).append(number)
+    rows = {(path, number): row for path, numbers in by_file.items()
+            for number, row in zip(numbers, read_rows(path, numbers))}
 
     prompts = []
-    for _, file_name, line_number, line in sorted(heap, reverse=True):
-        row = json.loads(line)
+    for path, number in candidates:
+        row = rows[(path, number)]
         signals = clean_behaviors(row["user_id"], row["past_behaviors"])
         if len(signals) < args.min_signals:
             continue
         future = clean_behaviors(row["user_id"], row["future_behaviors"])
         prompts.append({
-            "prompt_id": len(prompts), "user_id": row["user_id"], "file": file_name, "line": line_number,
+            "prompt_id": len(prompts), "user_id": row["user_id"], "file": Path(path).name, "line": number,
             "raw_past": len(row["past_behaviors"]), "raw_future": len(row["future_behaviors"]),
             "signals": signals, "future": future,
         })
@@ -450,9 +447,9 @@ def parse_args() -> argparse.Namespace:
 
     p = sub.add_parser("prepare", parents=[common], help="Fixed seeded subset of the RL data")
     p.add_argument("--split", choices=["test", "train"], default="test",
-                   help="test: the 2,000 rows of held-out users (the GRPO run's validation users come first)")
+                   help="test: the 1,976 rows of held-out users (the GRPO run's validation users come first)")
     p.add_argument("--data_dir", type=Path,
-                   help=f"Local {HF_CONFIG} files (<split>-*.jsonl); default: download them from {HF_REPO} to a "
+                   help=f"Local {HF_CONFIG_NAME} files (<split>-*.parquet); default: download them from {HF_REPO} to a "
                         f"temporary directory (token: HF_TOKEN, else hf_token.txt or HF_Key in UU_LLM or the "
                         f"directory above it)")
     p.add_argument("--num_prompts", type=int, default=64)

@@ -49,7 +49,7 @@ if [ "$PPO_MAX_TOKEN_LEN_PER_GPU" -lt $((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH
        "($((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)))" >&2
   exit 1
 fi
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/seed${SEED}_batch${TRAIN_BATCH_SIZE}_prompt${MAX_PROMPT_LENGTH}_pools_v2}
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${TRAIN_BATCH_SIZE}_prompt${MAX_PROMPT_LENGTH}_pools_v4}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
@@ -76,14 +76,17 @@ if [ ! -f "$DATA_DIR/train.parquet" ]; then
     --batch_size "$TRAIN_BATCH_SIZE" --num_train_batches "${NUM_TRAIN_BATCHES:-0}" --num_val "${NUM_VAL:-64}" \
     --max_prompt_length "$MAX_PROMPT_LENGTH"
 fi
-# Preserve reward-pool batch alignment.
+# Preserve reward-pool batch alignment and the dataset (RL_User_Profile_Layer1_V1).
 python3 - "$DATA_DIR/meta.json" "$TRAIN_BATCH_SIZE" "$MAX_PROMPT_LENGTH" <<'EOF'
 import json, sys
-from l1.prepare_data import POOL_FORMAT_VERSION
+from l1.prepare_data import DATASET, POOL_FORMAT_VERSION
 
 meta = json.load(open(sys.argv[1]))
+if meta.get("dataset") != DATASET:
+    sys.exit(f"{sys.argv[1]}: prepared from {meta.get('dataset', 'an older RL dataset')}, not {DATASET}; "
+             "use another DATA_DIR and regenerate the data")
 if meta.get("pool_format_version") != POOL_FORMAT_VERSION:
-    sys.exit(f"{sys.argv[1]}: expected dual past/future pools (format {POOL_FORMAT_VERSION}); "
+    sys.exit(f"{sys.argv[1]}: expected dual past/future pools with action_idx (format {POOL_FORMAT_VERSION}); "
              "use another DATA_DIR and regenerate the data")
 if meta["batch_size"] != int(sys.argv[2]) or meta["max_prompt_length"] > int(sys.argv[3]):
     sys.exit(f"{sys.argv[1]}: batch_size {meta['batch_size']} / max_prompt_length {meta['max_prompt_length']} do not "

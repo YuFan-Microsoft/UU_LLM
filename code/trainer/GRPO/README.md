@@ -13,7 +13,7 @@ GRPO/
 ├── GRPO_TRAINING_NOTES.md    record of the first 2-node run: deployment, the problems hit and their fixes (Chinese)
 ├── l1/                       Layer-1 RL code
 │   ├── l1_reward.py          the reward (L1Reward)
-│   ├── rl_data.py            RL_User_Profile_Layer1_V0: download, cleaning, seeded row order (shared)
+│   ├── rl_data.py            RL_User_Profile_Layer1_V1: download, cleaning, seeded row order (shared)
 │   ├── prepare_data.py       -> verl train / val parquet with fixed batches + the reward pool of every batch
 │   ├── sft_replay.py         V3 replay preparation, fixed test subsets and deterministic weighted sampling
 │   ├── sft_runtime.py        joint actor updates, held-out PPL and SFT guardrail evaluation
@@ -110,10 +110,11 @@ nohup bash run_l1_grpo.sh > l1_grpo_launch.out 2>&1 &
 NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_grpo_smoke bash run_l1_grpo.sh trainer.total_training_steps=5
 ```
 
-The launcher builds the data once per `DATA_DIR` (default `outputs/data/seed<SEED>_batch<TRAIN_BATCH_SIZE>_prompt<MAX_PROMPT_LENGTH>_pools_v2`;
-all 139,629 training rows take minutes with one process per CPU core, up to 32, and print their progress;
-`NUM_TRAIN_BATCHES=2` takes seconds) and refuses a `DATA_DIR` cut for another batch size or using the old
-future-only pool format. Explicit old cache paths must be replaced with a new directory and regenerated.
+The launcher builds the data once per `DATA_DIR` (default `outputs/data/l1v1_seed<SEED>_batch<TRAIN_BATCH_SIZE>_prompt<MAX_PROMPT_LENGTH>_pools_v4`;
+all 197,269 training rows take minutes with one process per CPU core, up to 32, and print their progress;
+`NUM_TRAIN_BATCHES=2` takes seconds) and refuses a `DATA_DIR` prepared from another dataset (`meta.json`
+`dataset` must be `yufan/user_profile_dataset/RL_User_Profile_Layer1_V1`), cut for another batch size or using an
+older pool format (without action_idx). Explicit old cache paths must be replaced with a new directory and regenerated.
 Use a new `EXPERIMENT_NAME` when starting this objective from SFT; the same output directory would resume
 its previous checkpoint automatically.
 With replay enabled, its separate preparation downloads the seven V3 SFT training sets once and tokenizes
@@ -276,30 +277,47 @@ grep -a "AgentLoopWorker" outputs/<run>/train.log | grep -av "Using blocking\|Us
 
 On 8 A100s a first launch takes about 1 minute for Ray and the config, 1 for the actor weights, 5 for the vLLM
 rollout engines and 3 or more for the step-0 validation; then about 4 minutes per step (64 x 16 answers), so one
-epoch of 2,181 steps is about 6 days (`trainer.total_training_steps=<N>` stops earlier). GPU utilization snapshots of
+epoch of about 3,080 steps (197,269 rows in batches of 64, less the rows skipped) is about 8.5 days (`trainer.total_training_steps=<N>` stops earlier). GPU utilization snapshots of
 0% between rollout and training (vLLM sleep, weight sync, reward) are normal; the step counter in `train.log` is what
 shows progress.
 
 ## Data and reward pools
 
-`RL_User_Profile_Layer1_V0` (folder `User_Profile_Weekly_For_RL`) of `yufan/user_profile_dataset` has two splits with disjoint users: `train` (139,629
-user-weeks, 31,543 users) and `test` (2,000 user-weeks of 456 held-out users: whole users in a seeded random order).
-`l1/prepare_data.py` builds one prompt per user-week exactly as the inference and the case study do
-(`load_users` + `dedupe`, `layer1.fit_prompt` / `build_message`) and takes the rows in a seeded random order: the
-training rows from `train`, cut into batches of 64, and the 64 validation prompts from `test`.
-Each row carries its user's cleaned next-week actions (`reward_model.ground_truth`, with date and source in
-`extra_info.future`), the Layer-1 user message and its `batch_id` (`extra_info`).
+`RL_User_Profile_Layer1_V1` (folder `User_Profile_Layer1_For_RL_V1`, Parquet) of `yufan/user_profile_dataset` has
+two splits with disjoint users, one row per user: `train` (197,269 rows in 40 shards) and `test` (1,976 rows).
+A row is `{"user_id", "past_behaviors", "future_behaviors", "language"}`, behaviors `{"date", "source", "action",
+"action_idx", "action_freq"}` (`action_idx` / `action_freq` and `language` are not used): one history window of the
+user and the actions after it (at least 10).
+`l1/prepare_data.py` builds one prompt per user exactly as the inference and the case study do
+(`load_users` + `dedupe`, `layer1.fit_prompt` / `build_message`) and takes the rows in the seeded random order of
+`rl_data.row_key` over the user_id (the order the case study uses too): the training rows from `train`, cut into
+**single-language batches** of 64 (the row's `language`; each language's remainder, at most 63 rows, is dropped; the
+batches in a seeded random order), and the 64 validation prompts from `test`, grouped by language. A batch is the
+reward's candidate pool, and in a mixed batch about 7% of the users have no same-language peer (21% at most 3), so
+their future actions are told apart by the language alone, and language or place words in labels pay (the anchors
+of the first runs). Each validation language has its own pool, `val-<language>`, topped up to 64 users with the
+next same-language `test` users (their future actions only). `meta.json` lists the batches per language and the
+users of each validation pool. Only the user_id column is read to order the rows; the
+candidate rows are then read file by file.
+Each row carries its user's cleaned future actions (`reward_model.ground_truth`, with date and source in
+`extra_info.future`), the Layer-1 user message, its `batch_id` and its source `file` / `row` (`extra_info`).
 
 verl computes rewards one answer at a time in its reward workers, so both candidate pools of every batch are written
-ahead (`pools.parquet`, one row group per batch, columns `batch_id`, `past_actions`, `future_actions`) and looked up by
-`batch_id`. Pool format version 2 is recorded in `meta.json`. Past actions are parsed from the actual prepared
+ahead (`pools.parquet`, one row group per batch, columns `batch_id`, `past_actions`, `past_action_idx`,
+`future_actions`, `future_action_idx`) and looked up by `batch_id`. Pool format version 4 (single-language pools) is recorded in `meta.json`. Past actions are parsed from the actual prepared
 prompts, not from the untrimmed source history. The pools represent the current batch only because
 verl reads the rows in order: the launcher sets `data.shuffle=False` and `data.filter_overlong_prompts=False`, and
 the data step already dropped every row verl could reject.
 
-The embeddings come from the vLLM server of the Run section (on this node it logs to
+The pool actions are not embedded during training: their vectors are rows `action_idx` of the Qwen3-Embedding-8B
+document embeddings precomputed by `embed_actions.py` for every action of the dataset, one file per side (separate
+index spaces), hard-coded in `l1/l1_reward.py` (`ACTION_EMBEDDING_FILES`):
+`/yufan/MAI_Profile/data_factory/RL_Dataset/past_behavior_actions_emb.pt` and `.../future_behavior_actions_emb.pt`.
+Each reward worker memory-maps them on first use (`torch.load(mmap=True)`: the page cache is shared, nothing is
+copied per worker) and reads only the rows of its batch. They must be readable on every node that runs reward
+workers. Only the topic queries come from the vLLM server of the Run section (on this node it logs to
 `outputs/<run>/embedding_server.log`; verl splits each step's 64 x 16 answers evenly over the training GPUs). The
-reward workers are CPU-only Ray actors: each asks the server for its batch's two pools once per batch and for the queries
+reward workers are CPU-only Ray actors: each asks the server for the queries
 of every answer (retrying for about 3 minutes, long enough for the watchdog to restart a server), then ranks them
 (`L1_REWARD_NUM_THREADS`, default 8 torch threads) and runs the rules with the fastText language model. verl does not
 pass the finish reason, so an answer cut at the response length is judged on its text (it is not valid JSON, so it

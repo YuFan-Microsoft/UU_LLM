@@ -210,7 +210,7 @@ https://dl.fbaipublicfiles.com/fasttext/supervised-models/lid.176.bin
 范围必须是：
 
 - 八个 **`SFT_*_V3`** 配置的 train/test。
-- `RL_User_Profile_Layer1_V0`（目录 `User_Profile_Weekly_For_RL`）的 train/test。
+- `RL_User_Profile_Layer1_V1`（目录 `User_Profile_Layer1_For_RL_V1`）的 train/test。`HF_DATA_REVISION` 必须不早于 `51df5533`（V1 的最终 schema：去掉 `detailed_source`，新增 `action_idx` / `action_freq`）。
 - **不包含 `SFT_User_Profile_TestSet`**；只用 `startswith("SFT_")` 会错误地把它也包含进来。
 
 HF token 放在权限为 `0600` 的文件中。不要打印 token、放进命令行实参、代码、日志或 Ray/Hydra 配置。
@@ -232,9 +232,9 @@ info = HfApi().dataset_info(repo, revision=revision, token=token)
 names = [
     c["config_name"] for c in info.card_data["configs"]
     if (c["config_name"].startswith("SFT_") and c["config_name"].endswith("_V3"))
-    or c["config_name"] == "RL_User_Profile_Layer1_V0"
+    or c["config_name"] == "RL_User_Profile_Layer1_V1"
 ]
-assert set(names) == set(REPLAY_CONFIGS) | {"RL_User_Profile_Layer1_V0"}
+assert set(names) == set(REPLAY_CONFIGS) | {"RL_User_Profile_Layer1_V1"}
 for name in names:
     data = load_dataset(repo, name, revision=info.sha, token=token)
     print(name, {split: len(rows) for split, rows in data.items()}, flush=True)
@@ -270,7 +270,7 @@ HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1 PYTHONPATH="$GRPO_DIR" python3 - <<'PY'
 import os
 from datasets import load_dataset
 from l1.sft_replay import REPLAY_CONFIGS
-for name in (*REPLAY_CONFIGS, "RL_User_Profile_Layer1_V0"):
+for name in (*REPLAY_CONFIGS, "RL_User_Profile_Layer1_V1"):
     data = load_dataset(
         "yufan/user_profile_dataset", name,
         revision=os.environ["HF_DATA_REVISION"], token=False,
@@ -292,10 +292,10 @@ HF cache 不等于已经有了 verl 的 parquet、reward pool 或 replay 索引�
 ### 6.1 RL 数据
 
 ```bash
-export DATA_DIR="$GRPO_DIR/outputs/data/prod_2nodes_seed0_batch64_prompt17408_sha84fd43abef6e"
+export DATA_DIR="$GRPO_DIR/outputs/data/prod_2nodes_l1v1_seed0_batch64_prompt17408"
 cd "$GRPO_DIR"
 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1 python3 l1/prepare_data.py \
-  --data_dir "$HF_HUB_CACHE/datasets--yufan--user_profile_dataset/snapshots/$HF_DATA_REVISION/User_Profile_Weekly_For_RL" \
+  --data_dir "$HF_HUB_CACHE/datasets--yufan--user_profile_dataset/snapshots/$HF_DATA_REVISION/User_Profile_Layer1_For_RL_V1" \
   --output_dir "$DATA_DIR" --tokenizer "$CHECKPOINT" \
   --seed 0 --batch_size 64 --num_train_batches 0 --num_val 64 \
   --max_prompt_length 17408 --num_workers 32

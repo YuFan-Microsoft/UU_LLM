@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Layer-1 inference: what a checkpoint writes for the test split of User_Profile_Layer1_For_RL_V1, one answer per
+"""Layer-1 inference: what a checkpoint writes for the test split of RL_User_Profile_Layer1_V1, one answer per
 user, read in report.html. No retrieval reward (no embeddings): each answer only gets the rule check.
 
     prepare   the test rows in a seeded order -> prompts.jsonl (cleaned history week, cleaned next-week actions)
@@ -12,57 +12,26 @@ the single answer per prompt differ.
 
 import argparse
 from collections import Counter
-from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
 import statistics
 import sys
-import tempfile
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 import layer1_sampling as base  # noqa: E402
 
 from l1_reward import judge  # noqa: E402
-from rl_data import DEFAULT_CHECKPOINT, HF_REPO, clean_behaviors, hf_token, row_key  # noqa: E402
+from rl_data import DEFAULT_CHECKPOINT, HF_CONFIG_NAME, HF_REPO, clean_behaviors, rl_data_files, row_key  # noqa: E402
 from utils import dumps  # noqa: E402
 
-HF_CONFIG = "User_Profile_Layer1_For_RL_V1"
 SPLIT = "test"
 
 
 # ---------------------------------------------------------------------------
 # prepare
 # ---------------------------------------------------------------------------
-
-def download(directory: Path) -> list[Path]:
-    """The test shards (<config>/test-*.parquet) of the gated dataset, downloaded into `directory`."""
-    from huggingface_hub import HfApi, hf_hub_download
-
-    token = hf_token()
-    files = sorted(name for name in HfApi().list_repo_files(HF_REPO, repo_type="dataset", token=token)
-                   if name.startswith(f"{HF_CONFIG}/{SPLIT}-") and name.endswith(".parquet"))
-    if not files:
-        raise SystemExit(f"No {HF_CONFIG}/{SPLIT}-*.parquet in {HF_REPO}")
-    print(f"Downloading {len(files)} {SPLIT} file(s) of {HF_REPO}/{HF_CONFIG} to a temporary directory", flush=True)
-    return [Path(hf_hub_download(HF_REPO, name, repo_type="dataset", token=token, local_dir=directory))
-            for name in files]
-
-
-@contextmanager
-def data_files(data_dir: Path | None):
-    """Local test-*.parquet copies in `data_dir`, else the Hub's, downloaded to a temporary directory (deleted on
-    exit)."""
-    if data_dir:
-        paths = sorted(data_dir.glob(f"{SPLIT}-*.parquet"))
-        if not paths:
-            raise SystemExit(f"No {SPLIT}-*.parquet under {data_dir}")
-        yield paths
-    else:
-        with tempfile.TemporaryDirectory(prefix=f"l1_inference_{SPLIT}_") as directory:
-            yield download(Path(directory))
-
 
 def read_rows(paths: list[Path]) -> list[tuple[str, int, dict]]:
     """(file name, row number, row) of every row."""
@@ -77,11 +46,11 @@ def prepare(args: argparse.Namespace) -> None:
     """Every test row (or the first --num_prompts) in the seeded order of rl_data.row_key of its user_id (one row per
     user, so the order does not depend on the file format), both weeks cleaned as run_inference.py cleans one window.
     One row is one user: {"user_id", "past_behaviors", "future_behaviors"}, behaviors {"date", "source", "action",
-    "detailed_source"}. Rows left without a signal or a next-week action are skipped."""
-    with data_files(args.data_dir) as paths:
+    "action_idx", "action_freq"}. Rows left without a signal or a future action are skipped."""
+    with rl_data_files(args.data_dir, SPLIT) as paths:
         rows = read_rows(paths)
     if len({row["user_id"] for _, _, row in rows}) != len(rows):
-        raise SystemExit(f"{HF_CONFIG}/{SPLIT}: expected one row per user_id")
+        raise SystemExit(f"{HF_CONFIG_NAME}/{SPLIT}: expected one row per user_id")
     rows.sort(key=lambda entry: row_key(args.seed, entry[2]["user_id"].encode()))
     prompts, skipped = [], 0
     for file_name, row_number, row in rows:
@@ -180,9 +149,9 @@ def parse_args() -> argparse.Namespace:
     common.add_argument("--output_dir", type=Path, required=True)
     common.add_argument("--seed", type=int, default=0)
 
-    p = sub.add_parser("prepare", parents=[common], help=f"The {SPLIT} rows of {HF_CONFIG}, in a seeded order")
+    p = sub.add_parser("prepare", parents=[common], help=f"The {SPLIT} rows of {HF_CONFIG_NAME}, in a seeded order")
     p.add_argument("--data_dir", type=Path,
-                   help=f"Local {SPLIT}-*.parquet copies of {HF_CONFIG}; default: download them from {HF_REPO} to "
+                   help=f"Local {SPLIT}-*.parquet copies of {HF_CONFIG_NAME}; default: download them from {HF_REPO} to "
                         "a temporary directory (token: HF_TOKEN, else hf_token.txt or HF_Key in UU_LLM or the "
                         "directory above it)")
     p.add_argument("--num_prompts", type=int, default=0, help="Prompts to keep (0 = every usable row)")
