@@ -394,7 +394,7 @@ PY
 **以下只用于新实验；不要对当前正在运行的 `irqqycsp` 再次调用 `wandb.init()`。**
 
 ```bash
-export PROJECT_NAME=MAI_SLM_V3_RL
+export PROJECT_NAME=MAI_Profile_SLM_V3_RL
 export WANDB_ENTITY=ecpknzhao-microsoft
 export EXPERIMENT_NAME="GRPO_L1_2nodes_$(date -u +%Y%m%d_%H%M%S)_replay"
 export OUTPUT_DIR="$GRPO_DIR/outputs/$EXPERIMENT_NAME"

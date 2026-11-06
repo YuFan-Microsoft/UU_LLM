@@ -100,7 +100,7 @@ Credentials (key files hold the key on their first line, are git-ignored, and ma
 directory above it, e.g. the job directory `UU_LLM` was copied into):
 
 - Hugging Face, for the data step (gated `yufan/user_profile_dataset`): `HF_TOKEN`, else `hf_token.txt`, else `HF_Key`.
-- W&B (project `MAI_SLM_V3_RL`, run `GRPO_L1_no_kl_qwen3_5_4B_Final_CKPT`): `WANDB_API_KEY`, else `wandb_key.txt`,
+- W&B (project `MAI_Profile_SLM_V3_RL`, run `GRPO_L1_no_kl_qwen3_5_4B_Final_CKPT`): `WANDB_API_KEY`, else `wandb_key.txt`,
   else the login in `~/.netrc`; the launcher stops at once without one (`LOGGER="['console']"` skips W&B).
 
 ```bash
