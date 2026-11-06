@@ -102,6 +102,9 @@ directory above it, e.g. the job directory `UU_LLM` was copied into):
 - Hugging Face, for the data step (gated `yufan/user_profile_dataset`): `HF_TOKEN`, else `hf_token.txt`, else `HF_Key`.
 - W&B (project `MAI_Profile_SLM_V3_RL`, run `GRPO_L1_no_kl_qwen3_5_4B_Final_CKPT`): `WANDB_API_KEY`, else `wandb_key.txt`,
   else the login in `~/.netrc`; the launcher stops at once without one (`LOGGER="['console']"` skips W&B).
+  Training logs are always uploaded: the Logs tab captures the TaskRunner's console (`console="redirect"`, set
+  explicitly so `WANDB_CONSOLE=off` cannot empty it), and `$OUTPUT_DIR/train.log` (driver + every Ray worker, tee'd by
+  the launcher and passed as `+trainer.train_log`) is live-synced to the Files tab.
 
 ```bash
 cd UU_LLM/code/trainer/GRPO

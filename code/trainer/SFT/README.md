@@ -418,7 +418,7 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
 | `--checkpoint_steps` | 5000 | Eval + checkpoint interval |
 | `--save_checkpoints` | on | `--no-save_checkpoints` keeps the evaluations but never writes a model |
 | `--do_eval` / `--max_eval_steps` | 1 / -1 | Perplexity on the test split |
-| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `Train/*`, `Eval/*`, `<Task>_Evaluation/*`. Login: `WANDB_API_KEY`, else the first line of `wandb_key.txt` in `UU_LLM` or the directory above it (git-ignored), else `~/.netrc` |
+| `--use_wandb` / `--wandb_run_name` | on / None | Metrics: `Train/*`, `Eval/*`, `<Task>_Evaluation/*`. Login: `WANDB_API_KEY`, else the first line of `wandb_key.txt` in `UU_LLM` or the directory above it (git-ignored), else `~/.netrc`. Logs: the Logs tab captures rank 0's console (`console="redirect"`, set explicitly so `WANDB_CONSOLE=off` cannot empty it), and `<output_dir>/train.log` (every rank, tee'd by the launch scripts) is live-synced to the Files tab |
 
 Eval perplexity (x-axis `eval_step`):
 

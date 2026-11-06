@@ -8,13 +8,15 @@ cd "$(dirname "$0")"
 
 MODEL=/yufan/open_source_models/Qwen3.5_VLM/Qwen3.5-4B/
 DATA_ROOT=../data
-OUTPUT_DIR=../output/qwen35_4B_profile_classifier
+OUTPUT_DIR=${OUTPUT_DIR:-../output/qwen35_4B_profile_classifier}
 NUM_GPUS=${NUM_GPUS:-8}
 BATCH_SIZE=${BATCH_SIZE:-4}
 ZERO_STAGE=${ZERO_STAGE:-2}
 
 # Same CUDA allocator setting as the SFT launchers (less fragmentation).
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# Unbuffered, so train.log (and its W&B copy) follow the run live.
+export PYTHONUNBUFFERED=1
 
 # Download only EVAL_Dataset (~1.7GB; gated dataset, needs HF_TOKEN).
 if ! ls "$DATA_ROOT"/EVAL_Dataset/test-*.parquet >/dev/null 2>&1; then
@@ -26,7 +28,9 @@ fi
 # SFT communication buckets and FusedAdam, gradient checkpointing, no gradient accumulation, and the answer scores read
 # from the last hidden state only (no 248320-way lm_head). Every batch is right-padded to --max_length, as in
 # the SFT trainer, so memory is constant and an OOM shows at step 1.
-# W&B is on by default: key from WANDB_API_KEY, else the git-ignored UU_LLM/wandb_key.txt.
+# W&B is on by default: key from WANDB_API_KEY, else the git-ignored UU_LLM/wandb_key.txt. Every rank's output also
+# goes to $OUTPUT_DIR/train.log, which the main process live-syncs to the W&B run's Files tab.
+mkdir -p "$OUTPUT_DIR"
 accelerate launch --multi_gpu --num_processes "$NUM_GPUS" --num_machines 1 --mixed_precision bf16 \
     Qwen35_profile_classifier.py \
     --model_name_or_path "$MODEL" \
@@ -41,7 +45,7 @@ accelerate launch --multi_gpu --num_processes "$NUM_GPUS" --num_machines 1 --mix
     --epochs 1 \
     --eval_steps 1000 \
     --eval_samples 5000 \
-    "$@"
+    "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"
 
 # A checkpoint step_<N>/ is a standard Qwen3.5 model directory (Qwen3_5ForConditionalGeneration.from_pretrained)
 # plus class_head.pt (the frozen No / Partial / Perfect head). Evaluate it on the full test split:

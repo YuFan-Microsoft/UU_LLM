@@ -414,6 +414,16 @@ def wandb_api_key():
     return None
 
 
+def upload_train_log(wandb_module, output_dir):
+    """Live-sync <output_dir>/train.log, the output of every rank tee'd by the launcher, to the run's Files tab
+    (the Logs tab only captures this process)."""
+    log_file = Path(output_dir).resolve() / "train.log"
+    if log_file.exists():
+        wandb_module.save(str(log_file), base_path=str(log_file.parent), policy="live")
+    else:
+        print(f"{log_file} not found (the launcher tees every rank into it): W&B keeps only rank 0's console")
+
+
 def get_all_reduce_mean(tensor):
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
     tensor = tensor / torch.distributed.get_world_size()
@@ -910,10 +920,14 @@ def main(argument_defaults=None, rollout_scorer=None, train_augmenters=None):
             "project": args.wandb_project,
             "name": args.wandb_run_name,
             "config": wandb_config,
+            # fd-level capture (also C++ and child-process output). Explicit, so an inherited WANDB_CONSOLE=off cannot
+            # empty the Logs tab; the default "wrap" (wrap_raw under the wandb service) can leave output.log empty.
+            "settings": wandb.Settings(console="redirect"),
         }
         if args.wandb_run_id:
             init_kwargs.update({"id": args.wandb_run_id, "resume": "allow"})
         wandb.init(**init_kwargs)
+        upload_train_log(wandb, args.output_dir)
         wandb.define_metric("train_step")
         wandb.define_metric("Train/*", step_metric="train_step")
         wandb.define_metric("eval_step")

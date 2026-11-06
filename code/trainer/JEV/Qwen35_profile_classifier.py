@@ -54,6 +54,16 @@ def wandb_login():
     wandb.login(key=key)
 
 
+def upload_train_log(wandb_module, output_dir):
+    """Live-sync <output_dir>/train.log, the output of every rank tee'd by the launcher, to the run's Files tab
+    (the Logs tab only captures the main process)."""
+    log_file = Path(output_dir).resolve() / "train.log"
+    if log_file.exists():
+        wandb_module.save(str(log_file), base_path=str(log_file.parent), policy="live")
+    else:
+        print(f"{log_file} not found (the launcher tees every rank into it): W&B keeps only the main process's console")
+
+
 # =========================================================
 # Data
 # =========================================================
@@ -389,7 +399,11 @@ def main():
 
     if args.wandb_project and accelerator.is_main_process:
         import wandb
-        wandb.init(project=args.wandb_project, name=f"{args.wandb_name}_lr{args.learning_rate}", config=vars(args))
+        # fd-level capture (also C++ and child-process output). Explicit, so an inherited WANDB_CONSOLE=off cannot
+        # empty the Logs tab; the default "wrap" (wrap_raw under the wandb service) can leave output.log empty.
+        wandb.init(project=args.wandb_project, name=f"{args.wandb_name}_lr{args.learning_rate}", config=vars(args),
+                   settings=wandb.Settings(console="redirect"))
+        upload_train_log(wandb, args.output_dir)
 
     def log(metrics, prefix):
         if args.wandb_project and accelerator.is_main_process and metrics:

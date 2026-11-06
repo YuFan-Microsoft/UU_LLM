@@ -17,6 +17,8 @@ cd "$HERE"
 # Prefer vendored verl.
 export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 export L1_REWARD_NUM_THREADS=${L1_REWARD_NUM_THREADS:-8}
+# Unbuffered, so $OUTPUT_DIR/train.log (live-synced to the W&B run's Files tab) follows the run.
+export PYTHONUNBUFFERED=1
 
 DEFAULT_CHECKPOINT=/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT
 CHECKPOINT=${CHECKPOINT:-$DEFAULT_CHECKPOINT}
@@ -54,6 +56,7 @@ EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwe
 LOGGER=${LOGGER:-"['console','wandb']"}
 
 mkdir -p "$OUTPUT_DIR"
+OUTPUT_DIR="$(cd "$OUTPUT_DIR" && pwd)"  # absolute: the Ray TaskRunner opens $OUTPUT_DIR/train.log from its own cwd
 
 UU_LLM="$(cd "$HERE/../../.." && pwd)"
 if [[ "$LOGGER" == *wandb* ]] && [ -z "${WANDB_API_KEY:-}" ]; then
@@ -232,6 +235,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.logger="$LOGGER" \
     trainer.project_name="$PROJECT_NAME" \
     trainer.experiment_name="$EXPERIMENT_NAME" \
+    +trainer.train_log="$OUTPUT_DIR/train.log" \
     trainer.default_local_dir="$OUTPUT_DIR/checkpoints" \
     trainer.n_gpus_per_node="$N_TRAIN_GPUS" \
     trainer.nnodes=1 \

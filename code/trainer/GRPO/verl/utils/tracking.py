@@ -78,11 +78,22 @@ class Tracking:
 
             import wandb
 
-            settings = None
+            # fd-level capture (also C++ and child-process output). Explicit, so an inherited WANDB_CONSOLE=off cannot
+            # empty the Logs tab; the default "wrap" (wrap_raw under the wandb service) can leave output.log empty.
+            settings = {"console": "redirect"}
             if config and config["trainer"].get("wandb_proxy", None):
-                settings = wandb.Settings(https_proxy=config["trainer"]["wandb_proxy"])
+                settings["https_proxy"] = config["trainer"]["wandb_proxy"]
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, settings=settings)
+            wandb.init(
+                project=project_name, name=experiment_name, entity=entity, config=config,
+                settings=wandb.Settings(**settings),
+            )
+            # The launcher's full log (driver + every Ray worker); the Logs tab only captures this process.
+            train_log = config and config["trainer"].get("train_log", None)
+            if train_log and os.path.exists(train_log):
+                wandb.save(train_log, base_path=os.path.dirname(os.path.abspath(train_log)), policy="live")
+            elif train_log:
+                print(f"{train_log} is not visible on this node: W&B keeps only the TaskRunner's console")
             self.logger["wandb"] = wandb
 
         if "trackio" in default_backend:

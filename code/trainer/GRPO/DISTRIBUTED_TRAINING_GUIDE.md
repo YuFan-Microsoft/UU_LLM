@@ -401,7 +401,8 @@ export OUTPUT_DIR="$GRPO_DIR/outputs/$EXPERIMENT_NAME"
 export WANDB_DIR="$OUTPUT_DIR"
 export WANDB_BASE_URL=https://api.wandb.ai
 export WANDB_MODE=online
-export WANDB_DISABLE_CODE=true WANDB_DISABLE_GIT=true WANDB_SAVE_CODE=false WANDB_CONSOLE=off
+export WANDB_DISABLE_CODE=true WANDB_DISABLE_GIT=true WANDB_SAVE_CODE=false
+# 不要设 WANDB_CONSOLE=off：训练 run 固定 console="redirect"（Logs 页），并实时上传 $OUTPUT_DIR/train.log（Files 页）。
 ```
 
 可在正式加载模型前验证在线写入，并创建之后要恢复的同一个 run：
