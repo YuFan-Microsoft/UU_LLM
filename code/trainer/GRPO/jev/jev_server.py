@@ -104,6 +104,12 @@ class Scorer:
                 raise
 
 
+class Server(ThreadingHTTPServer):
+    daemon_threads = True
+    # The reward workers open hundreds of connections at once; the default backlog of 5 would drop the overflow.
+    request_queue_size = 256
+
+
 class Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     scorer = None
@@ -182,8 +188,7 @@ def main():
     warmup = scorer.score_pairs(['[{"Interest": "Smartphones"}]'], ['{"Query": "galaxy s25 price"}'])
     print(f"[jev] warmup probability {[round(p, 4) for p in warmup[0]]}", flush=True)
     Handler.scorer, Handler.checkpoint = scorer, args.checkpoint
-    server = ThreadingHTTPServer((args.host, args.port), Handler)
-    server.daemon_threads = True
+    server = Server((args.host, args.port), Handler)
     print(f"[jev] serving on {args.host}:{args.port} (max_batch_tokens {args.max_batch_tokens})", flush=True)
     server.serve_forever()
 

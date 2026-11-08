@@ -11,7 +11,7 @@
 #   Layer 3   l3/training/l3_reward.py: the JEV expected match of the answer's mai_profile over the user's FUTURE_K
 #             (20) target future behaviors
 # Both are 0 when the answer breaks its task's rules. Every visible GPU trains; the embedding server (serve_embedding.sh,
-# GPU 0) and the JEV servers (serve_jev.sh, GPUs 1-5) run on another node.
+# GPU 0) and the JEV servers (serve_jev.sh, GPUs 1-7) run on another node.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -174,7 +174,7 @@ if [ -z "${EMBEDDING_URL:-}" ]; then
 fi
 if [ -z "${JEV_URLS:-}" ]; then
   if [ -z "${JEV_NODE:-}" ]; then
-    echo "Set JEV_URLS (serve_jev.sh's last line) or JEV_NODE (the node to serve JEV on, GPUs 1-5)" >&2
+    echo "Set JEV_URLS (serve_jev.sh's last line) or JEV_NODE (the node to serve JEV on, GPUs 1-7)" >&2
     exit 1
   fi
   JEV_URLS=$(bash "$HERE/serve_jev.sh" "$JEV_NODE" | tail -n 1)
@@ -220,6 +220,17 @@ EOF
 L1_METRICS="'n_interests','coverage','past_assignment','future_retrieval','json_valid','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens'"
 L3_METRICS="'commercial_share','entities_per_interest'"
 CORE_METRICS="['reward','rule_pass',$L1_METRICS,$L3_METRICS]"
+# W&B Logs tab: node-0's whole train.log, streamed into the run by log_to_wandb.py (the trainer creates the run in
+# shared mode, verl/utils/tracking.py); it stops by itself once this launcher exits.
+WANDB_ARGS=()
+if [[ "$LOGGER" == *wandb* ]]; then
+  # A given WANDB_RUN_ID (a run to resume, DISTRIBUTED_TRAINING_GUIDE.md) is kept; a new id starts with a letter, so
+  # Hydra keeps it a string.
+  WANDB_RUN_ID=${WANDB_RUN_ID:-r$(python3 -c "import secrets; print(secrets.token_hex(6))")}
+  python3 "$HERE/log_to_wandb.py" --run_id "$WANDB_RUN_ID" --project "$PROJECT_NAME" --log "$OUTPUT_DIR/train.log" \
+    --parent_pid $$ > /dev/null 2> "$OUTPUT_DIR/log_to_wandb.err" &
+  WANDB_ARGS=("+trainer.wandb_run_id=$WANDB_RUN_ID")
+fi
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=True \
@@ -287,4 +298,5 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     +trainer.drop_metric_prefixes="['training/','num_turns/','timing_s/','timing_per_token_ms/','prompt_length/']" \
     trainer.total_epochs=1 \
     "${SFT_ARGS[@]}" \
+    "${WANDB_ARGS[@]}" \
     "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"

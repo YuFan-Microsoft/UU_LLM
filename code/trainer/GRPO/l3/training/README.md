@@ -15,10 +15,12 @@ GRPO (no KL) of the Layer-3 Commercial task with the [Layer-1 SFT replay](../../
   watches, `commercial_share` and `entities_per_interest`.
 - `l3_verl_reward.py`: the verl entry point (`compute_score`).
 
-The JEV classifier runs on its own GPUs, one server per GPU ([serve_jev.sh](../../serve_jev.sh), default GPUs 1-5,
+The JEV classifier runs on its own node, one server per GPU ([serve_jev.sh](../../serve_jev.sh)): all 8 GPUs when
+Layer 3 trains alone (`run_l3_grpo.sh`, `JEV_GPUS` 0-7), GPUs 1-7 when it trains with Layer 1 (`run_l1_l3_grpo.sh`,
 GPU 0 left to the embedding server):
 
 ```bash
-bash serve_jev.sh node-2                                   # prints the comma-separated server URLs
-JEV_URLS=<that line> bash run_l3_grpo.sh                   # or JEV_NODE=node-2 bash run_l3_grpo.sh
+JEV_NODE=node-2 bash run_l3_grpo.sh                                    # Layer 3 alone: JEV on GPUs 0-7
+EMBEDDING_NODE=node-2 JEV_NODE=node-2 bash run_l1_l3_grpo.sh            # Layer 1 + 3: embeddings GPU 0, JEV 1-7
+JEV_GPUS=0,1,2,3,4,5,6,7 bash ../../serve_jev.sh node-2                 # or start them by hand: prints the URLs
 ```

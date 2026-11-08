@@ -7,8 +7,12 @@ used for training and for the case study, so a case-study report shows what the 
 ```
 GRPO/
 ├── run_l1_grpo.sh            launcher: data (once), embedding server, preflight, then python -m verl.trainer.main_ppo
+├── run_l3_grpo.sh            Layer-3 Commercial alone: the same setup with the JEV reward (JEV on 8 GPUs of a node)
+├── run_l1_l3_grpo.sh         Layer 1 + Layer 3 in one run: 32 + 32 prompts per step, each answer scored by its task
 ├── serve_embedding.sh        the reward's Qwen3-Embedding-8B on vLLM, on this node or another one (ssh)
-├── watchdog.sh               restarts a crashed run (and the embedding server) until training finishes
+├── serve_jev.sh              the Layer-3 reward's JEV classifier, one server per GPU (jev/), on another node (ssh)
+├── log_to_wandb.py           node-0's whole train.log into the W&B Logs tab (W&B shared mode, started by launchers)
+├── watchdog.sh               restarts a crashed run (RUN_SCRIPT) and its embedding / JEV servers until it finishes
 ├── DISTRIBUTED_TRAINING_GUIDE.md  distributed RL/replay setup, data, checkpoints and monitoring
 ├── GRPO_TRAINING_NOTES.md    record of the first 2-node run: deployment, the problems hit and their fixes (Chinese)
 ├── l1/                       Layer-1 RL code
@@ -18,6 +22,9 @@ GRPO/
 │   ├── sft_replay.py         V3 replay preparation, fixed test subsets and deterministic weighted sampling
 │   ├── sft_runtime.py        joint actor updates, held-out PPL and SFT guardrail evaluation
 │   └── verl_reward.py        verl entry point (compute_score): the batch's pool, then L1Reward
+├── l3/                       Layer-3 Commercial: prepare_data/ (the RL inputs), training/ (data, reward, see its README)
+├── joint/                    Layer 1 + 3: joint batches (prepare_joint_data.py), reward by data_source
+├── jev/                      the JEV server and its client (standard library only)
 ├── case_study/               read answers and their reward: checkpoint rollouts, a run's validation steps, trend
 └── verl/                     upstream verl v0.9.1 with local training/replay patches (Apache-2.0: verl/LICENSE, verl/Notice.txt)
 ```
@@ -102,9 +109,11 @@ directory above it, e.g. the job directory `UU_LLM` was copied into):
 - Hugging Face, for the data step (gated `yufan/user_profile_dataset`): `HF_TOKEN`, else `hf_token.txt`, else `HF_Key`.
 - W&B (project `MAI_Profile_SLM_V3_RL`, run `GRPO_L1_no_kl_qwen3_5_4B_Final_CKPT`): `WANDB_API_KEY`, else `wandb_key.txt`,
   else the login in `~/.netrc`; the launcher stops at once without one (`LOGGER="['console']"` skips W&B).
-  Training logs are always uploaded: the Logs tab captures the TaskRunner's console (`console="redirect"`, set
-  explicitly so `WANDB_CONSOLE=off` cannot empty it), and `$OUTPUT_DIR/train.log` (driver + every Ray worker, tee'd by
-  the launcher and passed as `+trainer.train_log`) is live-synced to the Files tab.
+  Training logs are always uploaded: the Logs tab shows node-0's whole `$OUTPUT_DIR/train.log` (driver + every Ray
+  worker, tee'd by the launcher), streamed into the run by `log_to_wandb.py` under the label `node-0` (the launcher
+  picks the run id, `+trainer.wandb_run_id`, and the trainer creates the run in W&B shared mode without capturing its
+  own console, which is in that log; an SDK without shared mode falls back to the TaskRunner's console,
+  `console="redirect"`). `train.log` (`+trainer.train_log`) is also live-synced to the Files tab.
 
 ```bash
 cd UU_LLM/code/trainer/GRPO

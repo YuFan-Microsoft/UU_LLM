@@ -402,7 +402,7 @@ export WANDB_DIR="$OUTPUT_DIR"
 export WANDB_BASE_URL=https://api.wandb.ai
 export WANDB_MODE=online
 export WANDB_DISABLE_CODE=true WANDB_DISABLE_GIT=true WANDB_SAVE_CODE=false
-# 不要设 WANDB_CONSOLE=off：训练 run 固定 console="redirect"（Logs 页），并实时上传 $OUTPUT_DIR/train.log（Files 页）。
+# 不要设 WANDB_CONSOLE=off：Logs 页是 log_to_wandb.py 以 W&B shared 模式实时上传的 node-0 完整 $OUTPUT_DIR/train.log（标签 node-0），Files 页也实时同步 train.log。
 ```
 
 可在正式加载模型前验证在线写入，并创建之后要恢复的同一个 run：

@@ -3,13 +3,15 @@
 # Commercial data and reward.
 # Usage: JEV_URLS=<serve_jev.sh's last line> bash run_l3_grpo.sh [Hydra overrides]
 #        JEV_NODE=node-2 bash run_l3_grpo.sh       (starts or reuses the JEV servers there with serve_jev.sh)
-# Defaults: 64 prompts x 16 answers; replay 2 rows/GPU, coefficient 0.1.
+# Defaults: 64 prompts x 16 answers; replay 2 rows/GPU, coefficient 0.1; a checkpoint and a validation every 50
+# steps: 64 users x VAL_N 4 answers, and the SFT guardrail on 200 test rows per task (as run_l1_l3_grpo.sh).
 # Limits: context 25600 tokens, response 8192 tokens.
 # SFT_REPLAY=0 disables replay and extra SFT evaluation.
 # Reward (l3/training/l3_reward.py): 0 when the answer breaks the Layer-3 Commercial rules, else the mean over the
 # user's FUTURE_K (20) target future behaviors of the JEV expected match (0 no / 1 partial / 2 perfect, over 2) of the
 # answer's mai_profile (its commercial interests, the first 10 in input order, joined with their category).
-# Every visible GPU trains; the JEV servers run elsewhere (serve_jev.sh).
+# Every visible GPU trains; the JEV servers run elsewhere (serve_jev.sh): with JEV_NODE, one on each of its 8 GPUs
+# (JEV_GPUS, default 0-7), as this run needs no embedding server.
 set -euo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -51,7 +53,10 @@ if [ "$PPO_MAX_TOKEN_LEN_PER_GPU" -lt $((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH
        "($((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)))" >&2
   exit 1
 fi
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}}
+NUM_TRAIN=${NUM_TRAIN:-0}  # training rows to prepare (0 = all); a few for a smoke test
+TRAIN_SUFFIX=""
+[ "$NUM_TRAIN" = 0 ] || TRAIN_SUFFIX="_train$NUM_TRAIN"  # a partial set never takes the full set's directory
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}$TRAIN_SUFFIX}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
 mkdir -p "$OUTPUT_DIR"
@@ -75,7 +80,7 @@ fi
 
 if [ ! -f "$DATA_DIR/train.parquet" ]; then
   python3 l3/training/prepare_rl_data.py --output_dir "$DATA_DIR" --tokenizer "$CHECKPOINT" --seed "$SEED" \
-    --future_k "$FUTURE_K" --num_train "${NUM_TRAIN:-0}" --num_val "${NUM_VAL:-64}" \
+    --future_k "$FUTURE_K" --num_train "$NUM_TRAIN" --num_val "${NUM_VAL:-64}" \
     --max_prompt_length "$MAX_PROMPT_LENGTH"
 fi
 python3 - "$DATA_DIR/meta.json" "$SEED" "$FUTURE_K" "$MAX_PROMPT_LENGTH" <<'EOF'
@@ -101,7 +106,7 @@ if [ "$SFT_REPLAY" = 1 ]; then
     echo "SFT requires sequence/prompt + response <= 25600 tokens and response <= 8192 tokens" >&2
     exit 1
   fi
-  SFT_EVAL_SAMPLES=${SFT_EVAL_SAMPLES:-500}
+  SFT_EVAL_SAMPLES=${SFT_EVAL_SAMPLES:-200}
   SFT_REPLAY_DIR=${SFT_REPLAY_DIR:-$HERE/outputs/data/sft_v2_$(basename "$CHECKPOINT")_seq${SFT_MAX_SEQ_LENGTH}_prompt${SFT_EVAL_MAX_PROMPT_LENGTH}_test${SFT_EVAL_SAMPLES}}
   if [ ! -f "$SFT_REPLAY_DIR/meta.json" ]; then
     python3 l1/sft_replay.py --output_dir "$SFT_REPLAY_DIR" --tokenizer "$CHECKPOINT" \
@@ -134,7 +139,8 @@ if [ -z "${JEV_URLS:-}" ]; then
     echo "Set JEV_URLS (serve_jev.sh's last line) or JEV_NODE (the node to serve JEV on)" >&2
     exit 1
   fi
-  JEV_URLS=$(bash "$HERE/serve_jev.sh" "$JEV_NODE" | tail -n 1)
+  # Layer 3 alone needs no embedding server: every GPU of JEV_NODE serves JEV (run_l1_l3_grpo.sh keeps GPU 0 for it).
+  JEV_URLS=$(JEV_GPUS="${JEV_GPUS:-0,1,2,3,4,5,6,7}" bash "$HERE/serve_jev.sh" "$JEV_NODE" | tail -n 1)
 fi
 TRAIN_GPUS=${TRAIN_GPUS:-${CUDA_VISIBLE_DEVICES:-$(nvidia-smi --query-gpu=index --format=csv,noheader | paste -sd, -)}}
 N_TRAIN_GPUS=$(echo "$TRAIN_GPUS" | tr ',' '\n' | grep -c .)
@@ -163,6 +169,17 @@ print(f"Preflight reward of 'not json': {result}", flush=True)
 EOF
 
 CORE_METRICS="['reward','rule_pass','commercial_share','entities_per_interest']"  # val-core/ and train-core/user_profile_l3/<metric>
+# W&B Logs tab: node-0's whole train.log, streamed into the run by log_to_wandb.py (the trainer creates the run in
+# shared mode, verl/utils/tracking.py); it stops by itself once this launcher exits.
+WANDB_ARGS=()
+if [[ "$LOGGER" == *wandb* ]]; then
+  # A given WANDB_RUN_ID (a run to resume, DISTRIBUTED_TRAINING_GUIDE.md) is kept; a new id starts with a letter, so
+  # Hydra keeps it a string.
+  WANDB_RUN_ID=${WANDB_RUN_ID:-r$(python3 -c "import secrets; print(secrets.token_hex(6))")}
+  python3 "$HERE/log_to_wandb.py" --run_id "$WANDB_RUN_ID" --project "$PROJECT_NAME" --log "$OUTPUT_DIR/train.log" \
+    --parent_pid $$ > /dev/null 2> "$OUTPUT_DIR/log_to_wandb.err" &
+  WANDB_ARGS=("+trainer.wandb_run_id=$WANDB_RUN_ID")
+fi
 CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     algorithm.adv_estimator=grpo \
     algorithm.norm_adv_by_std_in_grpo=True \
@@ -201,7 +218,7 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.calculate_log_probs=False \
     actor_rollout_ref.rollout.temperature=1.0 \
     actor_rollout_ref.rollout.top_p=1.0 \
-    actor_rollout_ref.rollout.val_kwargs.n="${VAL_N:-16}" \
+    actor_rollout_ref.rollout.val_kwargs.n="${VAL_N:-4}" \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
@@ -219,12 +236,13 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.n_gpus_per_node="$N_TRAIN_GPUS" \
     trainer.nnodes=1 \
     trainer.val_before_train=True \
-    trainer.save_freq="${SAVE_FREQ:-100}" \
-    trainer.test_freq="${TEST_FREQ:-100}" \
+    trainer.save_freq="${SAVE_FREQ:-50}" \
+    trainer.test_freq="${TEST_FREQ:-50}" \
     trainer.validation_data_dir="$OUTPUT_DIR/validation" \
     +trainer.val_core_metrics="$CORE_METRICS" \
     +trainer.train_core_metrics="$CORE_METRICS" \
     +trainer.drop_metric_prefixes="['training/','num_turns/','timing_s/','timing_per_token_ms/','prompt_length/']" \
     trainer.total_epochs=1 \
     "${SFT_ARGS[@]}" \
+    "${WANDB_ARGS[@]}" \
     "$@" 2>&1 | tee "$OUTPUT_DIR/train.log"

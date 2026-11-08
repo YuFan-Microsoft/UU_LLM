@@ -83,11 +83,32 @@ class Tracking:
             settings = {"console": "redirect"}
             if config and config["trainer"].get("wandb_proxy", None):
                 settings["https_proxy"] = config["trainer"]["wandb_proxy"]
+            # trainer.wandb_run_id (set by the launcher): the launcher's log_to_wandb.py joins this run and streams
+            # node-0's whole train.log (driver + every Ray worker) to the Logs tab, so this run is the W&B shared-mode
+            # primary and does not capture its own console, which is part of that log. An SDK without shared mode
+            # keeps the capture above.
+            run_id = config and config["trainer"].get("wandb_run_id", None)
+            wandb_settings = None
+            if run_id:
+                try:
+                    wandb_settings = wandb.Settings(**{**settings, "console": "off", "mode": "shared",
+                                                       "x_primary": True, "x_label": "trainer"})
+                except Exception as error:
+                    print(f"W&B shared mode unavailable ({error!r}): the Logs tab keeps only the TaskRunner's console")
             entity = os.environ.get("WANDB_ENTITY", None)
-            wandb.init(
-                project=project_name, name=experiment_name, entity=entity, config=config,
-                settings=wandb.Settings(**settings),
-            )
+
+            def init(wandb_settings):
+                wandb.init(project=project_name, name=experiment_name, entity=entity, config=config, id=run_id,
+                           settings=wandb_settings)
+
+            if wandb_settings is not None:
+                try:
+                    init(wandb_settings)
+                except Exception as error:
+                    print(f"W&B shared mode failed ({error!r}): the Logs tab keeps only the TaskRunner's console")
+                    wandb_settings = None
+            if wandb_settings is None:
+                init(wandb.Settings(**settings))
             # The launcher's full log (driver + every Ray worker); the Logs tab only captures this process.
             train_log = config and config["trainer"].get("train_log", None)
             if train_log and os.path.exists(train_log):

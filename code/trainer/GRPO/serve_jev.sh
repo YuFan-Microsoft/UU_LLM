@@ -5,15 +5,16 @@
 # at http://<host>:<JEV_PORT + i> (GET /health, POST /score), reachable from the other nodes. Detached (setsid nohup,
 # so they outlive the shell or ssh session that started them); returns once every /health answers and prints the
 # comma-separated server URLs as its last line: JEVClient (jev/jev_client.py) takes that string and spreads each
-# request over all of them. JEV servers already answering from JEV_PORT up are reused when they serve JEV_CHECKPOINT;
-# one of another checkpoint is an error (stop them first). A server that fails to start stops all of them.
+# request over all of them. JEV servers already answering from JEV_PORT up are reused when they are one per JEV_GPUS
+# GPU and serve JEV_CHECKPOINT; another number of them or another checkpoint is an error (stop them first). A server
+# that fails to start stops all of them.
 #
 # Usage:
 #   bash serve_jev.sh [node]          start (or reuse) on this machine, or on <node>
 #   bash serve_jev.sh stop [node]     stop the servers this script started there
 # Env: JEV_CHECKPOINT (absolute path; default the reward model /yufan/MAI_Profile/checkpoints/reward_model/step9K),
-#   JEV_GPUS (comma-separated GPU indices; default 1,2,3,4,5: GPU 0 is left to serve_embedding.sh, whose default GPU
-#   on another node is 0),
+#   JEV_GPUS (comma-separated GPU indices; default 1,2,3,4,5,6,7: GPU 0 is left to serve_embedding.sh, whose default GPU
+#   on another node is 0, for run_l1_l3_grpo.sh; run_l3_grpo.sh, which needs no embeddings, sets 0,1,...,7),
 #   JEV_PORT (first port, 8200), JEV_HOST (bind address, 0.0.0.0), JEV_PYTHON (python3), JEV_MAX_BATCH_TOKENS (32768
 #   padded tokens per forward), JEV_LOG_DIR (/tmp/jev_reward on the serving node: jev_server_<port>.log, and
 #   <log>.pid with the server's PID), JEV_WAIT (seconds to wait for every /health, 900).
@@ -66,8 +67,15 @@ urls() {  # the comma-separated URLs of the first $1 servers
   (IFS=,; echo "${list[*]}")
 }
 
+GPUS=${JEV_GPUS:-1,2,3,4,5,6,7}  # GPU 0 stays free for serve_embedding.sh (its default GPU on another node)
+IFS=, read -ra GPU_LIST <<< "$GPUS"
+if [ "${#GPU_LIST[@]}" = 0 ]; then
+  echo "JEV_GPUS is empty" >&2
+  exit 1
+fi
+
 # Reuse the JEV servers answering from PORT up (another service on a port, e.g. the embedding server, does not answer
-# "service": "jev"), all of the requested checkpoint.
+# "service": "jev"): one per GPU of GPU_LIST, all of the requested checkpoint.
 N=0
 while HEALTH=$(health $((PORT + N))); [[ $HEALTH == *'"service": "jev"'* ]]; do
   if [[ $HEALTH != *"\"checkpoint\": \"$CHECKPOINT\""* ]]; then
@@ -76,6 +84,11 @@ while HEALTH=$(health $((PORT + N))); [[ $HEALTH == *'"service": "jev"'* ]]; do
   fi
   N=$((N + 1))
 done
+if [ "$N" -gt 0 ] && [ "$N" != "${#GPU_LIST[@]}" ]; then
+  echo "$N JEV servers are up on ${NODE:-this machine}, not ${#GPU_LIST[@]} (JEV_GPUS $GPUS); stop them first:" \
+       "bash $0 stop $NODE" >&2
+  exit 1
+fi
 if [ "$N" -gt 0 ]; then
   echo "$N JEV servers already up on ${NODE:-this machine}" >&2
   urls "$N"
@@ -87,12 +100,6 @@ case $CHECKPOINT in
   *) echo "Set JEV_CHECKPOINT to the absolute path of a step_<N> directory of Qwen35_profile_classifier.py" >&2
      exit 1 ;;
 esac
-GPUS=${JEV_GPUS:-1,2,3,4,5}  # GPU 0 stays free for serve_embedding.sh (its default GPU on another node)
-IFS=, read -ra GPU_LIST <<< "$GPUS"
-if [ "${#GPU_LIST[@]}" = 0 ]; then
-  echo "JEV_GPUS is empty" >&2
-  exit 1
-fi
 if [ -n "$NODE" ]; then
   on_node <<< "mkdir -p '$CODE_DIR'"
   scp -q -o BatchMode=yes "$HERE/jev/jev_server.py" "$HERE/../JEV/Qwen35_profile_classifier.py" "$NODE:$CODE_DIR/"
