@@ -2,8 +2,9 @@
 
 Scores (profile, behavior) pairs exactly as JEV/Qwen35_profile_classifier_inference.py does: the trainer's prompt and
 chat template, the profile-end truncation at --max_length, the checkpoint's frozen class head, right padding per batch.
-One GPU: concurrent requests are pooled, sorted by length and packed into batches of at most --max_batch_tokens
-padded tokens.
+One GPU per server (serve_jev.sh starts one per GPU). One request is scored at a time: its pairs are sorted by length
+and packed into batches of at most --max_batch_tokens padded tokens. A failed request (e.g. CUDA OOM) frees the cache
+and answers 500; the client retries it.
 
   GET  /health -> {"status": "ok", "service": "jev", "checkpoint": ...}   (the port opens once the model is loaded)
   POST /score  {"pairs": [{"profile": <str | list>, "behavior": <str | dict>}, ...]}
@@ -16,7 +17,6 @@ as those were: json.dumps(ensure_ascii=False) without null keys.
 """
 import argparse
 import json
-import queue
 import sys
 import threading
 import time
@@ -58,79 +58,50 @@ def pack(lengths, max_batch_tokens):
     return batches
 
 
-class Job:
-    def __init__(self, input_ids):
-        self.input_ids = input_ids
-        self.probs = [None] * len(input_ids)
-        self.error = None
-        self.done = threading.Event()
-
-
 class Scorer:
-    """Prompt encoding (in the request threads) and one GPU thread scoring every pending request together."""
-
     def __init__(self, args):
         self.tokenizer = AutoTokenizer.from_pretrained(args.checkpoint)
         self.tokenizer.padding_side = "right"
         pad = self.tokenizer.pad_token_id
         self.pad_token_id = pad if pad is not None else self.tokenizer.eos_token_id
-        self.tokenizer_lock = threading.Lock()  # a fast tokenizer is not safe across threads
         self.max_length = args.max_length
         self.max_batch_tokens = args.max_batch_tokens
         self.device = torch.device(args.device)
+        self.lock = threading.Lock()  # one request at a time on the GPU (and the tokenizer)
 
         require_linear_attention_kernels()
         load_args = argparse.Namespace(attn_implementation=args.attn_implementation, gradient_checkpointing=0)
         self.model = load_classifier(args.checkpoint, answer_token_ids(self.tokenizer), load_args)
         self.model.to(self.device).eval()
-        self.queue = queue.Queue()
-        threading.Thread(target=self.run, daemon=True).start()
 
     def encode(self, profiles, behaviors):
         """Token ids of each pair, with the trainer's prompt and truncation."""
         data = (profiles, np.arange(len(profiles)), behaviors, np.zeros(len(profiles), dtype=np.int64))
         dataset = ProfileBehaviorDataset(data, self.tokenizer, self.max_length)
-        with self.tokenizer_lock:
-            return [dataset[i]["input_ids"] for i in range(len(dataset))]
-
-    def score(self, input_ids):
-        """[n, 3] softmax probabilities of LABELS; raises RuntimeError when the GPU round failed."""
-        job = Job(input_ids)
-        self.queue.put(job)
-        job.done.wait()
-        if job.error:
-            raise RuntimeError(job.error)
-        return job.probs
-
-    def run(self):
-        while True:
-            jobs = [self.queue.get()]
-            while True:
-                try:
-                    jobs.append(self.queue.get_nowait())
-                except queue.Empty:
-                    break
-            try:
-                self.score_jobs(jobs)
-            except Exception as error:  # e.g. CUDA OOM: fail this round's requests, keep serving
-                for job in jobs:
-                    job.error = f"{type(error).__name__}: {error}"
-                torch.cuda.empty_cache()
-            for job in jobs:
-                job.done.set()
+        return [dataset[i]["input_ids"] for i in range(len(dataset))]
 
     @torch.inference_mode()
-    def score_jobs(self, jobs):
-        rows = sorted(((job, i) for job in jobs for i in range(len(job.input_ids))),
-                      key=lambda row: len(row[0].input_ids[row[1]]))
-        lengths = [len(job.input_ids[i]) for job, i in rows]
+    def score(self, input_ids):
+        """[n, 3] softmax probabilities of LABELS, in input order."""
+        order = sorted(range(len(input_ids)), key=lambda i: len(input_ids[i]))
+        lengths = [len(input_ids[i]) for i in order]
+        probs = [None] * len(input_ids)
         for start, end in pack(lengths, self.max_batch_tokens):
+            rows = order[start:end]
             batch = FixedLengthCollator(self.pad_token_id, lengths[end - 1])(
-                [{"input_ids": job.input_ids[i], "class_label": 0} for job, i in rows[start:end]])
-            batch = {key: batch[key].to(self.device, non_blocking=True) for key in ("input_ids", "attention_mask")}
-            probs = F.softmax(class_logits(self.model, batch), dim=-1).cpu().tolist()
-            for (job, i), p in zip(rows[start:end], probs):
-                job.probs[i] = p
+                [{"input_ids": input_ids[i], "class_label": 0} for i in rows])
+            batch = {key: batch[key].to(self.device) for key in ("input_ids", "attention_mask")}
+            for i, p in zip(rows, F.softmax(class_logits(self.model, batch), dim=-1).cpu().tolist()):
+                probs[i] = p
+        return probs
+
+    def score_pairs(self, profiles, behaviors):
+        with self.lock:
+            try:
+                return self.score(self.encode(profiles, behaviors))
+            except Exception:
+                torch.cuda.empty_cache()  # e.g. after an OOM, so the retried request starts clean
+                raise
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -166,9 +137,9 @@ class Handler(BaseHTTPRequestHandler):
             self.reply(400, {"error": f'expected {{"pairs": [{{"profile": ..., "behavior": ...}}, ...]}}: {error!r}'})
             return
         try:
-            probs = self.scorer.score(self.scorer.encode(profiles, behaviors)) if pairs else []
-        except Exception as error:  # answer instead of dropping the connection, which the client would retry
-            print(f"[jev] {len(pairs)} pairs failed: {error}", flush=True)
+            probs = self.scorer.score_pairs(profiles, behaviors) if pairs else []
+        except Exception as error:
+            print(f"[jev] {len(pairs)} pairs failed: {type(error).__name__}: {error}", flush=True)
             self.reply(500, {"error": f"{type(error).__name__}: {error}"})
             return
         results = [{"pred_label": LABELS[int(np.argmax(p))],
@@ -189,7 +160,7 @@ def parse_args():
     parser.add_argument("--device", default="cuda", help="Pick the GPU with CUDA_VISIBLE_DEVICES")
     parser.add_argument("--max_length", type=int, default=16384,
                         help="Same as training: longer prompts have the end of the profile cut")
-    parser.add_argument("--max_batch_tokens", type=int, default=65536,
+    parser.add_argument("--max_batch_tokens", type=int, default=32768,
                         help="Padded tokens per forward (rows x longest row); at least --max_length")
     parser.add_argument("--attn_implementation", default="flash_attention_2",
                         help="Attention of the full-attention layers (flash_attention_2 or sdpa)")
@@ -208,7 +179,7 @@ def main():
     # Before the port opens, so /health answers only once scoring works: the largest batch a request can make
     # (rows of --max_length tokens filling --max_batch_tokens; an OOM shows up here, not mid-training), then one pair.
     scorer.score([[scorer.pad_token_id] * args.max_length] * (args.max_batch_tokens // args.max_length))
-    warmup = scorer.score(scorer.encode(['[{"Interest": "Smartphones"}]'], ['{"Query": "galaxy s25 price"}']))
+    warmup = scorer.score_pairs(['[{"Interest": "Smartphones"}]'], ['{"Query": "galaxy s25 price"}'])
     print(f"[jev] warmup probability {[round(p, 4) for p in warmup[0]]}", flush=True)
     Handler.scorer, Handler.checkpoint = scorer, args.checkpoint
     server = ThreadingHTTPServer((args.host, args.port), Handler)
