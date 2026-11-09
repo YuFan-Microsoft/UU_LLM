@@ -56,7 +56,8 @@ fi
 NUM_TRAIN=${NUM_TRAIN:-0}  # training rows to prepare (0 = all); a few for a smoke test
 TRAIN_SUFFIX=""
 [ "$NUM_TRAIN" = 0 ] || TRAIN_SUFFIX="_train$NUM_TRAIN"  # a partial set never takes the full set's directory
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}$TRAIN_SUFFIX}
+# _ref: profiles of the reference commercial interests (data without them is never reused)
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref$TRAIN_SUFFIX}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
 mkdir -p "$OUTPUT_DIR"
@@ -78,19 +79,24 @@ if [[ "$LOGGER" == *wandb* ]] && [ -z "${WANDB_API_KEY:-}" ]; then
   fi
 fi
 
+# The Layer-3 rows with the `commercial` column (the reference answers, code/inference/tag_commercial_interests.py): from
+# Hugging Face, or L3_SOURCE_DIR (that script's <output_dir>/User_Profile_Layer3_For_RL_V1_Processed) before an upload.
+L3_SOURCE_ARGS=()
+[ -z "${L3_SOURCE_DIR:-}" ] || L3_SOURCE_ARGS=(--data_dir "$L3_SOURCE_DIR")
 if [ ! -f "$DATA_DIR/train.parquet" ]; then
   python3 l3/training/prepare_rl_data.py --output_dir "$DATA_DIR" --tokenizer "$CHECKPOINT" --seed "$SEED" \
     --future_k "$FUTURE_K" --num_train "$NUM_TRAIN" --num_val "${NUM_VAL:-64}" \
-    --max_prompt_length "$MAX_PROMPT_LENGTH"
+    --max_prompt_length "$MAX_PROMPT_LENGTH" "${L3_SOURCE_ARGS[@]}"
 fi
 python3 - "$DATA_DIR/meta.json" "$SEED" "$FUTURE_K" "$MAX_PROMPT_LENGTH" <<'EOF'
 import json, sys
 sys.path.insert(0, "l3/training")
-from prepare_rl_data import DATASET
+from prepare_rl_data import DATASET, REFERENCE_SCORES
 
 meta = json.load(open(sys.argv[1]))
 if (meta.get("dataset") != DATASET or meta["seed"] != int(sys.argv[2]) or meta["future_k"] != int(sys.argv[3])
-        or meta["max_prompt_length"] > int(sys.argv[4])):
+        or meta["max_prompt_length"] > int(sys.argv[4])
+        or meta.get("commercial_reference_scores") != list(REFERENCE_SCORES)):
     sys.exit(f"{sys.argv[1]}: prepared with other settings ({meta}); use another DATA_DIR")
 EOF
 
@@ -98,12 +104,13 @@ SFT_ARGS=()
 if [ "$SFT_REPLAY" = 1 ]; then
   SFT_MAX_SEQ_LENGTH=${SFT_MAX_SEQ_LENGTH:-$MAX_MODEL_LEN}
   SFT_EVAL_MAX_RESPONSE_LENGTH=${SFT_EVAL_MAX_RESPONSE_LENGTH:-$MAX_RESPONSE_LENGTH}
-  SFT_EVAL_MAX_PROMPT_LENGTH=${SFT_EVAL_MAX_PROMPT_LENGTH:-$((MAX_MODEL_LEN - SFT_EVAL_MAX_RESPONSE_LENGTH))}
+  # The V3 test prompts reach 24297 tokens (Layer-4 CommercialPreference); each answer gets the response budget within
+  # the context left after its prompt (l1/sft_runtime.py), so the prompt only has to stay below the context.
+  SFT_EVAL_MAX_PROMPT_LENGTH=${SFT_EVAL_MAX_PROMPT_LENGTH:-$((MAX_MODEL_LEN - 1024))}
   if [ "$SFT_MAX_SEQ_LENGTH" -lt 2 ] || [ "$SFT_MAX_SEQ_LENGTH" -gt "$MAX_MODEL_LEN" ] \
       || [ "$SFT_EVAL_MAX_RESPONSE_LENGTH" -lt 1 ] || [ "$SFT_EVAL_MAX_RESPONSE_LENGTH" -gt 8192 ] \
-      || [ "$SFT_EVAL_MAX_PROMPT_LENGTH" -lt 1 ] \
-      || [ $((SFT_EVAL_MAX_PROMPT_LENGTH + SFT_EVAL_MAX_RESPONSE_LENGTH)) -gt "$MAX_MODEL_LEN" ]; then
-    echo "SFT requires sequence/prompt + response <= 25600 tokens and response <= 8192 tokens" >&2
+      || [ "$SFT_EVAL_MAX_PROMPT_LENGTH" -lt 1 ] || [ "$SFT_EVAL_MAX_PROMPT_LENGTH" -ge "$MAX_MODEL_LEN" ]; then
+    echo "SFT requires sequence <= 25600 tokens, prompt < 25600 tokens and response <= 8192 tokens" >&2
     exit 1
   fi
   SFT_EVAL_SAMPLES=${SFT_EVAL_SAMPLES:-200}
@@ -225,16 +232,16 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     reward.num_workers=8 \
     reward.custom_reward_function.path="$HERE/l3/training/l3_verl_reward.py" \
     reward.custom_reward_function.name=compute_score \
-    +reward.custom_reward_function.reward_kwargs.jev_urls="$JEV_URLS" \
+    +reward.custom_reward_function.reward_kwargs.jev_urls="'$JEV_URLS'" \
     trainer.critic_warmup=0 \
     +trainer.skip_on_policy_old_log_prob=True \
     trainer.logger="$LOGGER" \
     trainer.project_name="$PROJECT_NAME" \
     trainer.experiment_name="$EXPERIMENT_NAME" \
     +trainer.train_log="$OUTPUT_DIR/train.log" \
-    trainer.default_local_dir="$OUTPUT_DIR/checkpoints" \
+    trainer.default_local_dir="${CHECKPOINT_DIR:-$OUTPUT_DIR/checkpoints}" \
     trainer.n_gpus_per_node="$N_TRAIN_GPUS" \
-    trainer.nnodes=1 \
+    trainer.nnodes="${NNODES:-1}" \
     trainer.val_before_train=True \
     trainer.save_freq="${SAVE_FREQ:-50}" \
     trainer.test_freq="${TEST_FREQ:-50}" \

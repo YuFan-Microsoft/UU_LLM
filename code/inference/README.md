@@ -10,6 +10,7 @@
 | `task.py` | `Task` base class (prompt, answer key check, trimmed request, record) and `UserProfile` (one user's final snapshot and its Layer-3 / Layer-4 records) |
 | `utils.py` | Input loading and cleaning, weekly windows, signal dedupe / cap, query language, the answer key checks of every task, `generate()` with retries, MTP acceptance counters |
 | `user_profile_rules.py` | Copy of `code/trainer/SFT/user_profile_rules.py` (keep it identical): the V3 rollout checks that score every call's first sample for `rule_metrics`; it is reporting only (the answer key checks in `utils.py` decide retries) |
+| `tag_commercial_interests.py` | The `commercial` column of `RL_User_Profile_Layer3_V1_Processed`: Layer 3 Commercial on every row's prompt (as this folder answers it), `{interest_name: commercial_score}` of the interests marked commercial; the Layer-3 GRPO reward profiles these reference interests |
 | `merge_official_mtp.py` | Adds the official Qwen3.5 MTP head (`mtp.*`) to an SFT checkpoint saved without it (see [MTP speculative decoding](#mtp-speculative-decoding)) |
 | `prompts/` | The prompts (`prompt_l1.md` ... `prompt_l4_hyper.md`, plus `prompt_negative.md`, kept in sync but not used: the input has no negative feedback), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V3 SFT configs) |
 

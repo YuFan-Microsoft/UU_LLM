@@ -6,10 +6,12 @@
 #   - JEV_NODE set: when any JEV server there (JEV_GPUS: 0-7 for run_l3_grpo.sh, 1-7 for run_l1_l3_grpo.sh, from
 #     JEV_PORT 8200) does not answer /health,
 #     restart them all (serve_jev.sh stop, then serve_jev.sh);
-#   - when neither RUN_SCRIPT nor verl.trainer.main_ppo has been running for 2 checks in a row: `ray stop --force`
-#     (crashed Ray workers can still hold GPUs), then launch RUN_SCRIPT again with the same environment and
-#     arguments; it resumes from the run's latest checkpoint (trainer.resume_mode=auto). A run that is not running
-#     when the watchdog starts is launched the same way;
+#   - when neither RUN_SCRIPT nor verl.trainer.main_ppo has been running for 2 checks in a row, or neither its
+#     train.log nor launch.log changed for WATCHDOG_STALE_MINUTES (40; a hung run, stopped first): `ray stop
+#     --force` (crashed Ray workers can still hold GPUs), then launch RUN_SCRIPT again with the same environment and
+#     arguments; it resumes from the run's latest checkpoint (trainer.resume_mode=auto) into the same W&B run
+#     (WANDB_RUN_ID, picked once here unless given, with WANDB_RESUME=allow). A run that is not running when the
+#     watchdog starts is launched the same way;
 #   - when the run's train.log shows "Training Progress: 100%", exit.
 # It gives up after WATCHDOG_MAX_RESTARTS (20) launches. One watchdog per GRPO directory: a second one exits (a lock
 # on outputs/watchdog.lock, not a process-name match, which would also match the shell that runs the check).
@@ -48,11 +50,30 @@ OUTPUT_DIR=${OUTPUT_DIR:-$HERE/outputs/$EXPERIMENT_NAME}
 mkdir -p "$OUTPUT_DIR"
 INTERVAL=${WATCHDOG_INTERVAL:-60}
 MAX_RESTARTS=${WATCHDOG_MAX_RESTARTS:-20}
+STALE_MINUTES=${WATCHDOG_STALE_MINUTES:-40}
+# Every launch continues one W&B run: the launchers keep a given WANDB_RUN_ID (a letter first: Hydra keeps it a string).
+export WANDB_RUN_ID=${WANDB_RUN_ID:-r$(python3 -c "import secrets; print(secrets.token_hex(6))")}
+export WANDB_RESUME=${WANDB_RESUME:-allow}
 
 log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
 
 running() {
   pgrep -f "$RUN_SCRIPT" > /dev/null || pgrep -f "verl.trainer.main_ppo" > /dev/null
+}
+
+stale() {  # neither train.log nor launch.log (the data preparation before training) changed for STALE_MINUTES
+  local files=() file
+  for file in "$OUTPUT_DIR/train.log" "$OUTPUT_DIR/launch.log"; do [ -f "$file" ] && files+=("$file"); done
+  [ "${#files[@]}" -gt 0 ] && [ -z "$(find "${files[@]}" -mmin -"$STALE_MINUTES" 2>/dev/null)" ]
+}
+
+stop_run() {  # the launcher and the driver, by PID (TERM, then KILL after 30 s)
+  local pids
+  pids=$( (pgrep -f "$RUN_SCRIPT"; pgrep -f "verl.trainer.main_ppo") | sort -u | tr '\n' ' ')
+  [ -n "${pids// }" ] || return 0
+  kill -TERM $pids 2>/dev/null || true
+  for _ in $(seq 30); do running || return 0; sleep 1; done
+  kill -KILL $pids 2>/dev/null || true
 }
 
 jev_up() {  # every JEV server serve_jev.sh starts on JEV_NODE answers /health
@@ -63,7 +84,7 @@ jev_up() {  # every JEV server serve_jev.sh starts on JEV_NODE answers /health
   done
 }
 
-log "watchdog started for $RUN_SCRIPT, $OUTPUT_DIR (args: $*)"
+log "watchdog started for $RUN_SCRIPT, $OUTPUT_DIR, W&B run $WANDB_RUN_ID (args: $*)"
 MISSED=0
 LAUNCHES=0
 while true; do
@@ -79,6 +100,10 @@ while true; do
     log "a JEV server on $JEV_NODE down; restarting them all"
     bash "$HERE/serve_jev.sh" stop "$JEV_NODE" >> "$LOG" 2>&1 || true
     bash "$HERE/serve_jev.sh" "$JEV_NODE" >> "$LOG" 2>&1 || log "JEV server restart failed"
+  fi
+  if running && stale; then
+    log "train.log and launch.log unchanged for $STALE_MINUTES minutes: stopping the hung run"
+    stop_run
   fi
   if running; then
     MISSED=0

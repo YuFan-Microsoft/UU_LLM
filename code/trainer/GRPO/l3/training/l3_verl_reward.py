@@ -7,9 +7,11 @@ worker at once in threads. The reward itself is l3_reward.L3Reward; this file on
     ground_truth              the user's target future behaviors (prepare_rl_data.py: at most 20, fixed per user)
     extra_info["content"]     the Layer-3 Commercial user message
     extra_info["category"]    the row's category column, {interest_name: "/A/B"}
+    extra_info["commercial_interests"]  the reference commercial interest names (JSON list): the profiled interests
 One L3Reward per worker process; its rule checks take turns, its JEV requests run concurrently.
 """
 
+import json
 import sys
 import threading
 from pathlib import Path
@@ -32,7 +34,8 @@ def reward_fn(jev_urls: str) -> L3Reward:
 def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict, jev_urls: str, **kwargs) -> dict:
     """The reward ("score") of one answer and its SIGNALS, numbers or None when undefined (the core-metric means skip
     None)."""
+    reference = extra_info.get("commercial_interests")
     result = reward_fn(jev_urls)(extra_info["content"], extra_info["category"], solution_str,
-                                 [str(target) for target in ground_truth])
+                                 [str(target) for target in ground_truth], json.loads(reference) if reference else None)
     return {"score": float(result["reward"]),
             **{name: None if result[name] is None else float(result[name]) for name in SIGNALS}}

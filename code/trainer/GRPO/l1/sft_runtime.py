@@ -116,6 +116,9 @@ async def guardrail_evaluation(trainer, data: ReplayData, settings: dict) -> dic
     rules.language_tools()
     client = trainer.get_llm_client()
     semaphore = asyncio.Semaphore(64)
+    # Each answer may use the response budget, within the context left after its prompt: the longest V3 test prompts
+    # (Layer-3 Commercial, Layer-4 CommercialPreference) exceed 25600 - 8192, yet prompt + answer fits 25600.
+    context = int(trainer.config.actor_rollout_ref.rollout.max_model_len)
     records = []
     directory = Path(trainer.config.trainer.validation_data_dir).parent / "sft_validation"
     directory.mkdir(parents=True, exist_ok=True)
@@ -131,7 +134,8 @@ async def guardrail_evaluation(trainer, data: ReplayData, settings: dict) -> dic
                         request_id=f"sft-eval-{trainer.global_steps}-{config}-{index}",
                         prompt_ids=row["prompt_ids"],
                         sampling_params={"temperature": 0.6, "top_p": 0.8, "top_k": -1,
-                                         "max_tokens": int(settings["max_response_length"]),
+                                         "max_tokens": min(int(settings["max_response_length"]),
+                                                           context - len(row["prompt_ids"])),
                                          "seed": int(settings["seed"]) + index},
                     )
                 if output.stop_reason != "completed":
@@ -155,10 +159,10 @@ def evaluate_sft(trainer) -> dict[str, float]:
         response_length = int(settings["max_response_length"])
         if not 1 <= response_length <= MAX_RESPONSE_LENGTH:
             raise ValueError(f"SFT evaluation response length must be 1-{MAX_RESPONSE_LENGTH}")
-        required_context = data.meta["max_prompt_length"] + response_length
         context = trainer.config.actor_rollout_ref.rollout.max_model_len
-        if context > MAX_MODEL_LEN or required_context > context:
-            raise ValueError(f"SFT evaluation requires {required_context} <= rollout.max_model_len <= {MAX_MODEL_LEN}")
+        if context > MAX_MODEL_LEN or data.meta["max_prompt_length"] >= context:
+            raise ValueError(f"SFT evaluation requires its prompts ({data.meta['max_prompt_length']} tokens) < "
+                             f"rollout.max_model_len <= {MAX_MODEL_LEN}")
         metrics = asyncio.run(guardrail_evaluation(trainer, data, settings))
         # Actor evaluation must not coexist with awake colocated vLLM engines.
         trainer.checkpoint_manager.sleep_replicas()

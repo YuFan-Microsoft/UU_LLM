@@ -6,7 +6,9 @@ The launcher picks the run id (+trainer.wandb_run_id), starts this process in th
 /dev/null, then runs the training. The trainer (verl/utils/tracking.py) creates (or resumes) the run in W&B shared
 mode as the primary process, without console capture (its console is part of train.log); this process waits until
 the run is running, joins it as a non-primary process labelled --label (node-0) with console capture, and copies
-train.log, from its first line, to its own stdout, so every line reaches the Logs tab. When the launcher exits it
+train.log, from its first line, to its own stdout, so every line reaches the Logs tab. A line ends at "\n" only (the
+"\r" of a progress bar does not end it), and the capture is "wrap" (each write is uploaded at once; wandb 0.28's
+"redirect" writes the console records only at finish()). When the launcher exits it
 copies what is left and leaves (a non-primary process does not mark the run finished). Its stdout is never part of
 train.log, so no line comes back. Any W&B problem only ends this process (written to its stderr); the training is
 not affected.
@@ -60,13 +62,13 @@ def main() -> None:
     run = wandb.init(entity=entity, project=args.project, id=args.run_id,
                      dir=os.path.dirname(os.path.abspath(args.log)),  # the run's output directory, not the code
                      settings=wandb.Settings(mode="shared", x_primary=False, x_label=args.label,
-                                             x_update_finish_state=False, console="redirect"))
-    with open(args.log, encoding="utf-8", errors="replace", newline="") as log:
+                                             x_update_finish_state=False, console="wrap"))
+    with open(args.log, "rb") as log:  # bytes: only b"\n" ends a line (text mode would also end one at a lone "\r")
         while True:
             position = log.tell()
             line = log.readline()
-            if line.endswith("\n") or (line and not alive(args.parent_pid)):
-                sys.stdout.write(line)
+            if line.endswith(b"\n") or (line and not alive(args.parent_pid)):
+                sys.stdout.write(line.decode("utf-8", errors="replace"))
                 continue
             log.seek(position)  # nothing new, or a line still being written
             sys.stdout.flush()

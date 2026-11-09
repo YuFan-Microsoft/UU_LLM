@@ -2,7 +2,8 @@
 
 One RL_User_Profile_Layer3_V1_Processed row (prompt, category, future_behaviors) and one rollout answer of its prompt:
   1. the prompt's input interests in their order (the Layer-2 confidence order), each matched by exact interest_name
-     to the answer's first entry of that name; of those the answer marks "commercial": true, the first TOP_K (10)
+     to the answer's first entry of that name; of those the answer marks "commercial": true (or, with `reference`,
+     those named there, whatever the answer marks: the GRPO reward), the first TOP_K (10)
   2. each becomes {"Interest": name, "Category": category[name], "Brand" / "Product" / "Retailer": the answer's
      brands / products / retailers, "Query": its predicted_queries, "Topic": the prompt's topics of that interest}
   3. mai_profile() of ../../../../evaluation/e2e_ads_eval/classify.py turns them into the EVAL_Dataset string the
@@ -39,8 +40,11 @@ def prompt_interests(prompt: str) -> list[dict]:
     return json.loads(prompt[prompt.rindex(INPUT_MARKER) + len(INPUT_MARKER):])["interests"]
 
 
-def build_mai_profile(prompt: str, category: str, answer: str, top_k: int = TOP_K) -> str | None:
-    """The mai_profile string of one rollout answer (see the module docstring); None when the answer is invalid."""
+def build_mai_profile(prompt: str, category: str, answer: str, top_k: int = TOP_K,
+                      reference: list[str] | None = None) -> str | None:
+    """The mai_profile string of one rollout answer (see the module docstring); None when the answer is invalid.
+    `reference` (interest names) replaces the answer's commercial flags: those input interests are profiled, with the
+    answer's entities and queries, whatever the answer marks (GRPO: flagging interests commercial earns nothing)."""
     output = parse_json_object(answer)
     if output is None or not l3_commercial_keys_valid(output):
         return None
@@ -52,7 +56,7 @@ def build_mai_profile(prompt: str, category: str, answer: str, top_k: int = TOP_
     for interest in prompt_interests(prompt):
         name = interest["interest_name"]
         entry = entries.get(name)
-        if entry is None or entry["commercial"] is not True:
+        if entry is None or (name not in reference if reference is not None else entry["commercial"] is not True):
             continue
         interests.append({"Interest": name, "Category": categories.get(name, ""),
                           "Brand": entry["brands"], "Product": entry["products"], "Retailer": entry["retailers"],

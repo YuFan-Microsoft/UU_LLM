@@ -60,8 +60,9 @@ fi
 STEPS_SUFFIX=""
 [ "$NUM_STEPS" = 0 ] || STEPS_SUFFIX="_steps$NUM_STEPS"
 L1_DATA_DIR=${L1_DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${L1_BATCH}_prompt${MAX_PROMPT_LENGTH}_pools_v4$STEPS_SUFFIX}
-L3_DATA_DIR=${L3_DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}$STEPS_SUFFIX}
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1l3_seed${SEED}_b${L1_BATCH}x${L3_BATCH}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}$STEPS_SUFFIX}
+# _ref: Layer-3 profiles of the reference commercial interests (data without them is never reused)
+L3_DATA_DIR=${L3_DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref$STEPS_SUFFIX}
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1l3_seed${SEED}_b${L1_BATCH}x${L3_BATCH}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref$STEPS_SUFFIX}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
@@ -90,16 +91,20 @@ if [ ! -f "$L1_DATA_DIR/train.parquet" ]; then
     --batch_size "$L1_BATCH" --num_train_batches "$NUM_STEPS" --num_val "${NUM_VAL:-64}" \
     --max_prompt_length "$MAX_PROMPT_LENGTH"
 fi
+# The Layer-3 rows with the `commercial` column (the reference answers, code/inference/tag_commercial_interests.py): from
+# Hugging Face, or L3_SOURCE_DIR (that script's <output_dir>/User_Profile_Layer3_For_RL_V1_Processed) before an upload.
+L3_SOURCE_ARGS=()
+[ -z "${L3_SOURCE_DIR:-}" ] || L3_SOURCE_ARGS=(--data_dir "$L3_SOURCE_DIR")
 if [ ! -f "$L3_DATA_DIR/train.parquet" ]; then
   python3 l3/training/prepare_rl_data.py --output_dir "$L3_DATA_DIR" --tokenizer "$CHECKPOINT" --seed "$SEED" \
     --future_k "$FUTURE_K" --num_train $((NUM_STEPS * L3_BATCH)) --num_val "${NUM_VAL:-64}" \
-    --max_prompt_length "$MAX_PROMPT_LENGTH"
+    --max_prompt_length "$MAX_PROMPT_LENGTH" "${L3_SOURCE_ARGS[@]}"
 fi
 python3 - "$L1_DATA_DIR/meta.json" "$L3_DATA_DIR/meta.json" "$L1_BATCH" "$SEED" "$FUTURE_K" "$MAX_PROMPT_LENGTH" <<'EOF'
 import json, sys
 sys.path.insert(0, "l3/training")
 from l1.prepare_data import DATASET as L1_DATASET, POOL_FORMAT_VERSION
-from prepare_rl_data import DATASET as L3_DATASET
+from prepare_rl_data import DATASET as L3_DATASET, REFERENCE_SCORES
 
 l1_file, l3_file, l1_batch, seed, future_k, max_prompt = sys.argv[1:]
 l1, l3 = json.load(open(l1_file)), json.load(open(l3_file))
@@ -107,7 +112,8 @@ if (l1.get("dataset") != L1_DATASET or l1.get("pool_format_version") != POOL_FOR
         or l1["batch_size"] != int(l1_batch) or l1["max_prompt_length"] > int(max_prompt)):
     sys.exit(f"{l1_file}: prepared with other settings; use another L1_DATA_DIR")
 if (l3.get("dataset") != L3_DATASET or l3["seed"] != int(seed) or l3["future_k"] != int(future_k)
-        or l3["max_prompt_length"] > int(max_prompt)):
+        or l3["max_prompt_length"] > int(max_prompt)
+        or l3.get("commercial_reference_scores") != list(REFERENCE_SCORES)):
     sys.exit(f"{l3_file}: prepared with other settings; use another L3_DATA_DIR")
 EOF
 if [ ! -f "$DATA_DIR/train.parquet" ]; then
@@ -128,12 +134,13 @@ SFT_ARGS=()
 if [ "$SFT_REPLAY" = 1 ]; then
   SFT_MAX_SEQ_LENGTH=${SFT_MAX_SEQ_LENGTH:-$MAX_MODEL_LEN}
   SFT_EVAL_MAX_RESPONSE_LENGTH=${SFT_EVAL_MAX_RESPONSE_LENGTH:-$MAX_RESPONSE_LENGTH}
-  SFT_EVAL_MAX_PROMPT_LENGTH=${SFT_EVAL_MAX_PROMPT_LENGTH:-$((MAX_MODEL_LEN - SFT_EVAL_MAX_RESPONSE_LENGTH))}
+  # The V3 test prompts reach 24297 tokens (Layer-4 CommercialPreference); each answer gets the response budget within
+  # the context left after its prompt (l1/sft_runtime.py), so the prompt only has to stay below the context.
+  SFT_EVAL_MAX_PROMPT_LENGTH=${SFT_EVAL_MAX_PROMPT_LENGTH:-$((MAX_MODEL_LEN - 1024))}
   if [ "$SFT_MAX_SEQ_LENGTH" -lt 2 ] || [ "$SFT_MAX_SEQ_LENGTH" -gt "$MAX_MODEL_LEN" ] \
       || [ "$SFT_EVAL_MAX_RESPONSE_LENGTH" -lt 1 ] || [ "$SFT_EVAL_MAX_RESPONSE_LENGTH" -gt 8192 ] \
-      || [ "$SFT_EVAL_MAX_PROMPT_LENGTH" -lt 1 ] \
-      || [ $((SFT_EVAL_MAX_PROMPT_LENGTH + SFT_EVAL_MAX_RESPONSE_LENGTH)) -gt "$MAX_MODEL_LEN" ]; then
-    echo "SFT requires sequence/prompt + response <= 25600 tokens and response <= 8192 tokens" >&2
+      || [ "$SFT_EVAL_MAX_PROMPT_LENGTH" -lt 1 ] || [ "$SFT_EVAL_MAX_PROMPT_LENGTH" -ge "$MAX_MODEL_LEN" ]; then
+    echo "SFT requires sequence <= 25600 tokens, prompt < 25600 tokens and response <= 8192 tokens" >&2
     exit 1
   fi
   SFT_EVAL_SAMPLES=${SFT_EVAL_SAMPLES:-200}
@@ -279,16 +286,16 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     +reward.custom_reward_function.reward_kwargs.pool_file="$POOL_FILE" \
     +reward.custom_reward_function.reward_kwargs.embedding_url="$EMBEDDING_URL" \
     +reward.custom_reward_function.reward_kwargs.embedding_model="$EMBEDDING_MODEL" \
-    +reward.custom_reward_function.reward_kwargs.jev_urls="$JEV_URLS" \
+    +reward.custom_reward_function.reward_kwargs.jev_urls="'$JEV_URLS'" \
     trainer.critic_warmup=0 \
     +trainer.skip_on_policy_old_log_prob=True \
     trainer.logger="$LOGGER" \
     trainer.project_name="$PROJECT_NAME" \
     trainer.experiment_name="$EXPERIMENT_NAME" \
     +trainer.train_log="$OUTPUT_DIR/train.log" \
-    trainer.default_local_dir="$OUTPUT_DIR/checkpoints" \
+    trainer.default_local_dir="${CHECKPOINT_DIR:-$OUTPUT_DIR/checkpoints}" \
     trainer.n_gpus_per_node="$N_TRAIN_GPUS" \
-    trainer.nnodes=1 \
+    trainer.nnodes="${NNODES:-1}" \
     trainer.val_before_train=True \
     trainer.save_freq="${SAVE_FREQ:-50}" \
     trainer.test_freq="${TEST_FREQ:-50}" \

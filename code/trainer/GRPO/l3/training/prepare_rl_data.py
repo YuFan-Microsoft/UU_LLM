@@ -6,7 +6,11 @@ Each user row becomes one prompt: its `prompt` column as is (the Layer-3 Commerc
 reward's targets (ground_truth) are at most --future_k (20) of the user's future behaviors: the distinct ones (the
 same behavior on another day counts once: TimeStamp is ignored), sampled with a seed fixed per user and kept in
 their original order, so every answer of a GRPO group, and every run with this seed, is scored on the same ones.
-extra_info carries the prompt (content) and the category column for the reward.
+extra_info carries the prompt (content), the category column and commercial_interests for the reward: the input
+interests the reference answer (the `commercial` column, code/inference/tag_commercial_interests.py) marks
+commercial with a REFERENCE_SCORES (medium or high) commercial_score, in input order. The reward builds the
+mai_profile from these, not from the rollout's own commercial flags. Users without a valid reference answer or
+without such an interest are skipped: every answer of theirs would get the same reward.
 
 Rows are taken in the seeded random order of rl_data.row_key over the user_id (as the Layer-1 data). Training rows
 come from the train split (all, or the first --num_train), validation rows are the first --num_val of the test split
@@ -26,6 +30,8 @@ Only the <split>-*.parquet shards of User_Profile_Layer3_For_RL_V1_Processed are
 import argparse
 from contextlib import contextmanager
 import json
+import multiprocessing as mp
+import os
 from pathlib import Path
 import random
 import sys
@@ -41,7 +47,8 @@ from utils import build_prompt_ids  # noqa: E402
 HF_CONFIG_NAME = "RL_User_Profile_Layer3_V1_Processed"
 HF_CONFIG = "User_Profile_Layer3_For_RL_V1_Processed"  # the folder of HF_CONFIG_NAME in the repository
 DATASET = f"{HF_REPO}/{HF_CONFIG_NAME}"  # recorded in meta.json; the launcher checks it
-COLUMNS = ["user_id", "prompt", "category", "future_behaviors", "language"]
+COLUMNS = ["user_id", "prompt", "category", "commercial", "future_behaviors", "language"]
+REFERENCE_SCORES = ("medium", "high")  # the reference commercial interests the reward profiles
 DATA_SOURCE = "user_profile_l3"  # the W&B prefix: val-core/user_profile_l3/<metric>
 MAX_PROMPT_LENGTH = 25600 - 8192
 
@@ -87,7 +94,8 @@ def targets(user_id: str, behaviors: list[str], k: int, seed: int) -> tuple[list
 def build_example(row: dict, tokenizer, args: argparse.Namespace) -> dict | None:
     """The verl row of one user, or None when it is skipped."""
     ground_truth, n_future = targets(row["user_id"], list(row["future_behaviors"] or []), args.future_k, args.seed)
-    if not ground_truth:
+    reference = [name for name, score in json.loads(row["commercial"] or "{}").items() if score in REFERENCE_SCORES]
+    if not ground_truth or not reference:
         return None
     messages = [{"role": "user", "content": row["prompt"]}]
     prompt_tokens = len(build_prompt_ids(tokenizer, messages))
@@ -99,16 +107,33 @@ def build_example(row: dict, tokenizer, args: argparse.Namespace) -> dict | None
         "ability": "user_profile",
         "reward_model": {"style": "rule", "ground_truth": ground_truth},
         "extra_info": {"user_id": row["user_id"], "language": row.get("language") or "und", "content": row["prompt"],
-                       "category": row["category"], "prompt_tokens": prompt_tokens, "n_future_distinct": n_future},
+                       "category": row["category"], "commercial_interests": json.dumps(reference, ensure_ascii=False),
+                       "prompt_tokens": prompt_tokens, "n_future_distinct": n_future},
     }
 
 
-def accepted(paths: list[Path], tokenizer, args: argparse.Namespace, wanted: int) -> tuple[list[dict], int]:
-    """The first `wanted` (0: all) accepted rows in the seeded order, and the number of rows skipped on the way.
-    Every file is read once; only the first wanted + 1000 users of the order are built (prompts were already length-
-    filtered upstream, so almost none is skipped)."""
+_worker: dict = {}  # the tokenizer and args, set before the pool forks
+
+
+def build_file(task: tuple[str, list[int]]) -> tuple[str, list[tuple[int, dict | None]]]:
+    """(path, [(row number, verl row or None)]) of these rows of one file (a pool task)."""
     import pyarrow.parquet as pq
 
+    path, numbers = task
+    rows = pq.read_table(path, columns=COLUMNS).take(numbers).to_pylist()
+    return path, [(number, build_example(row, _worker["tokenizer"], _worker["args"]))
+                  for number, row in zip(numbers, rows)]
+
+
+def accepted(paths: list[Path], args: argparse.Namespace, wanted: int) -> tuple[list[dict], int]:
+    """The first `wanted` (0: all) accepted rows in the seeded order, and the number of rows skipped on the way.
+    Every file is read once, the files by --num_workers forked processes; only the first 1.5 * wanted + 1000 users of
+    the order are built (users without a reference commercial interest are skipped)."""
+    import pyarrow.parquet as pq
+
+    if any("commercial" not in pq.read_schema(path).names for path in paths):
+        raise SystemExit(f"No `commercial` column in {paths[0].parent}: run code/inference/tag_commercial_interests.py "
+                         "first (--upload it, or pass its output folder as --data_dir)")
     keyed = []
     for path in paths:
         for number, user_id in enumerate(pq.read_table(path, columns=["user_id"]).column(0).to_pylist()):
@@ -116,20 +141,20 @@ def accepted(paths: list[Path], tokenizer, args: argparse.Namespace, wanted: int
     keyed.sort()
     if len({key for key, _, _ in keyed}) != len(keyed):
         raise SystemExit("Expected one row per user_id")
-    candidates = keyed[:wanted + 1000] if wanted else keyed
+    candidates = keyed[:int(1.5 * wanted) + 1000] if wanted else keyed
     rank = {(path, number): position for position, (_, path, number) in enumerate(candidates)}
+    tasks = [(str(path), numbers) for path in paths
+             if (numbers := sorted(number for (p, number) in rank if p == str(path)))]
     built, skipped, started = {}, 0, time.time()
-    for path in paths:
-        numbers = sorted(number for (p, number) in rank if p == str(path))
-        if not numbers:
-            continue
-        for number, row in zip(numbers, pq.read_table(path, columns=COLUMNS).take(numbers).to_pylist()):
-            example = build_example(row, tokenizer, args)
-            if example is None:
-                skipped += 1
-                continue
-            built[rank[(str(path), number)]] = example
-        print(f"  {path.name}: {len(built)} rows built, {skipped} skipped ({time.time() - started:.0f}s)", flush=True)
+    with mp.get_context("fork").Pool(max(1, min(args.num_workers, len(tasks)))) as pool:
+        for path, results in pool.imap_unordered(build_file, tasks):
+            for number, example in results:
+                if example is None:
+                    skipped += 1
+                else:
+                    built[rank[(path, number)]] = example
+            print(f"  {Path(path).name}: {len(built)} rows built, {skipped} skipped ({time.time() - started:.0f}s)",
+                  flush=True)
     rows = [built[position] for position in sorted(built)]
     if wanted and len(rows) < wanted:
         raise SystemExit(f"Only {len(rows)} accepted rows of the first {len(candidates)} users, wanted {wanted}")
@@ -146,23 +171,29 @@ def main() -> None:
     parser.add_argument("--num_train", type=int, default=0, help="Training rows (0 = all)")
     parser.add_argument("--num_val", type=int, default=64)
     parser.add_argument("--max_prompt_length", type=int, default=MAX_PROMPT_LENGTH)
+    parser.add_argument("--num_workers", type=int, default=min(40, os.cpu_count() or 1),
+                        help="Processes building the rows, one input file each at a time")
     args = parser.parse_args()
+    os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")  # the pool forks after the tokenizer is loaded
 
     import pyarrow as pa
     import pyarrow.parquet as pq
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True)
+    _worker.update(tokenizer=AutoTokenizer.from_pretrained(args.tokenizer, trust_remote_code=True), args=args)
     with split_files(args.data_dir, "test") as paths:
-        val, val_skipped = accepted(paths, tokenizer, args, args.num_val)
+        val, val_skipped = accepted(paths, args, args.num_val)
     with split_files(args.data_dir, "train") as paths:
-        train, train_skipped = accepted(paths, tokenizer, args, args.num_train)
+        train, train_skipped = accepted(paths, args, args.num_train)
 
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    pq.write_table(pa.Table.from_pylist(train), args.output_dir / "train.parquet")
-    pq.write_table(pa.Table.from_pylist(val), args.output_dir / "val.parquet")
+    # Small row groups: one group of all ~190k long prompts holds a nested column over 2 GB, which pyarrow and
+    # datasets cannot read back ("Nested data conversions not implemented for chunked array outputs").
+    pq.write_table(pa.Table.from_pylist(train), args.output_dir / "train.parquet", row_group_size=1024)
+    pq.write_table(pa.Table.from_pylist(val), args.output_dir / "val.parquet", row_group_size=1024)
     n_targets = [len(row["reward_model"]["ground_truth"]) for row in train]
     meta = {"dataset": DATASET, "seed": args.seed, "future_k": args.future_k, "tokenizer": args.tokenizer,
+            "commercial_reference_scores": list(REFERENCE_SCORES),
             "max_prompt_length": args.max_prompt_length, "train_rows": len(train), "val_rows": len(val),
             "train_skipped": train_skipped, "val_skipped": val_skipped,
             "mean_targets_per_user": sum(n_targets) / len(n_targets) if n_targets else 0,

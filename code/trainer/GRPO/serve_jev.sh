@@ -50,11 +50,19 @@ on_node() {
 }
 
 if [ "$STOP" = 1 ]; then
+  # TERM each server's process group, wait up to 30 s for it to exit, then KILL it: a server left running keeps its
+  # GPU memory and a new one on that GPU fails to start.
   on_node <<EOF
-for pid in "$LOG_DIR"/jev_server*.log.pid; do
-  [ -f "\$pid" ] || continue
-  kill -- -"\$(cat "\$pid")" 2>/dev/null || kill "\$(cat "\$pid")" 2>/dev/null || true
-  rm -f "\$pid"
+for file in "$LOG_DIR"/jev_server*.log.pid; do
+  [ -f "\$file" ] || continue
+  pid=\$(cat "\$file")
+  kill -TERM -- -"\$pid" 2>/dev/null || kill -TERM "\$pid" 2>/dev/null || true
+  for _ in \$(seq 30); do kill -0 "\$pid" 2>/dev/null || break; sleep 1; done
+  if kill -0 "\$pid" 2>/dev/null; then
+    kill -KILL -- -"\$pid" 2>/dev/null || kill -KILL "\$pid" 2>/dev/null || true
+    echo "JEV server \$pid did not exit on TERM: killed" >&2
+  fi
+  rm -f "\$file"
 done
 EOF
   exit 0
