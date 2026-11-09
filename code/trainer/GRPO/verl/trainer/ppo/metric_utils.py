@@ -906,8 +906,7 @@ def selected_metric_means(
 ) -> dict[str, float]:
     """trainer.val_core_metrics / train_core_metrics: <section>/<data_source>/<name>, the mean of each named reward
     signal over the answers of each data source (missing values skipped), e.g. instead of process_validation_metrics'
-    full mean / std / best / worst set. A name without a value for a data source (another task's signal) is not
-    logged for it. A name that is no reward signal raises."""
+    full mean / std / best / worst set. A name that is no reward signal raises."""
     data_sources = list(data_sources)
     metrics = {}
     for data_source in dict.fromkeys(data_sources):
@@ -916,8 +915,7 @@ def selected_metric_means(
                 raise KeyError(f"trainer.{section.replace('-', '_')}_metrics: no reward signal {name!r}")
             values = [float(value) for source, value in zip(data_sources, infos_dict[name], strict=True)
                       if source == data_source and value is not None]
-            if values:
-                metrics[f"{section}/{data_source}/{name}"] = float(np.mean(values))
+            metrics[f"{section}/{data_source}/{name}"] = float(np.mean(values)) if values else float("nan")
     return metrics
 
 

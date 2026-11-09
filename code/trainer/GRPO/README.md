@@ -7,12 +7,9 @@ used for training and for the case study, so a case-study report shows what the 
 ```
 GRPO/
 ├── run_l1_grpo.sh            launcher: data (once), embedding server, preflight, then python -m verl.trainer.main_ppo
-├── run_l3_grpo.sh            Layer-3 Commercial alone: the same setup with the JEV reward (JEV on 8 GPUs of a node)
-├── run_l1_l3_grpo.sh         Layer 1 + Layer 3 in one run: 32 + 32 prompts per step, each answer scored by its task
 ├── serve_embedding.sh        the reward's Qwen3-Embedding-8B on vLLM, on this node or another one (ssh)
-├── serve_jev.sh              the Layer-3 reward's JEV classifier, one server per GPU (jev/), on another node (ssh)
 ├── log_to_wandb.py           node-0's whole train.log into the W&B Logs tab (W&B shared mode, started by launchers)
-├── watchdog.sh               restarts a crashed run (RUN_SCRIPT) and its embedding / JEV servers until it finishes
+├── watchdog.sh               restarts a crashed or hung run (and the embedding server) until training finishes
 ├── DISTRIBUTED_TRAINING_GUIDE.md  distributed RL/replay setup, data, checkpoints and monitoring
 ├── GRPO_TRAINING_NOTES.md    record of the first 2-node run: deployment, the problems hit and their fixes (Chinese)
 ├── l1/                       Layer-1 RL code
@@ -22,9 +19,6 @@ GRPO/
 │   ├── sft_replay.py         V3 replay preparation, fixed test subsets and deterministic weighted sampling
 │   ├── sft_runtime.py        joint actor updates, held-out PPL and SFT guardrail evaluation
 │   └── verl_reward.py        verl entry point (compute_score): the batch's pool, then L1Reward
-├── l3/                       Layer-3 Commercial: prepare_data/ (the RL inputs), training/ (data, reward, see its README)
-├── joint/                    Layer 1 + 3: joint batches (prepare_joint_data.py), reward by data_source
-├── jev/                      the JEV server and its client (standard library only)
 ├── case_study/               read answers and their reward: checkpoint rollouts, a run's validation steps, trend
 └── verl/                     upstream verl v0.9.1 with local training/replay patches (Apache-2.0: verl/LICENSE, verl/Notice.txt)
 ```
