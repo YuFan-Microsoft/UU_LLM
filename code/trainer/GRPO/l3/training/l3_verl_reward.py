@@ -8,6 +8,7 @@ worker at once in threads. The reward itself is l3_reward.L3Reward; this file on
     extra_info["content"]     the Layer-3 Commercial user message
     extra_info["category"]    the row's category column, {interest_name: "/A/B"}
     extra_info["commercial_interests"]  the reference commercial interest names (JSON list): the profiled interests
+    extra_info["future_freq"]  the action_freq of each ground_truth target: the reward's target weights
 One L3Reward per worker process; its rule checks take turns, its JEV requests run concurrently.
 """
 
@@ -36,6 +37,7 @@ def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict
     None)."""
     reference = extra_info.get("commercial_interests")
     result = reward_fn(jev_urls)(extra_info["content"], extra_info["category"], solution_str,
-                                 [str(target) for target in ground_truth], json.loads(reference) if reference else None)
+                                 [str(target) for target in ground_truth], json.loads(reference) if reference else None,
+                                 extra_info.get("future_freq"))
     return {"score": float(result["reward"]),
             **{name: None if result[name] is None else float(result[name]) for name in SIGNALS}}

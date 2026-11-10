@@ -9,7 +9,8 @@ One RL_User_Profile_Layer3_V1_Processed row (prompt, category, future_behaviors)
   3. mai_profile() of ../../../../evaluation/e2e_ads_eval/classify.py turns them into the EVAL_Dataset string the
      JEV classifier was trained on (same items, same order)
 The input order, not the answer's, picks the top TOP_K, so reordering the answer changes nothing; answer entries
-whose name is not an input interest are ignored. An answer that is not valid Layer-3 Commercial JSON has no profile
+whose name is not an input interest are ignored. Every future behavior goes to JEV as jev_behavior() makes it: the
+EVAL_Dataset future_behavior string the classifier was trained on, without the RL data's action_idx / action_freq. An answer that is not valid Layer-3 Commercial JSON has no profile
 (None); one without a commercial interest has the empty profile "[]", which is scored like any other.
 
     from jev_profile import JEVClient, build_mai_profile, score_profiles
@@ -33,6 +34,21 @@ from utils import l3_commercial_keys_valid, parse_json_object  # noqa: E402
 
 TOP_K = 10
 INPUT_MARKER = "\nInput:\n"  # prompt = prompt_l3_commercial.md + INPUT_MARKER + the minimized interest payload
+# Fields the RL data adds to each future behavior (the reward's action weights), absent from the JEV training data.
+RL_ONLY_KEYS = ("action_idx", "action_freq")
+
+
+def jev_behavior(text: str) -> str:
+    """One future behavior as JEV was trained on it (an EVAL_Dataset future_behavior): the JSON string without
+    RL_ONLY_KEYS, the other fields in their order, json.dumps with ensure_ascii=False as stored on HF. A behavior
+    without those keys (or not a JSON object) is returned as is."""
+    try:
+        behavior = json.loads(text)
+    except ValueError:
+        return text
+    if not isinstance(behavior, dict) or not any(key in behavior for key in RL_ONLY_KEYS):
+        return text
+    return json.dumps({key: value for key, value in behavior.items() if key not in RL_ONLY_KEYS}, ensure_ascii=False)
 
 
 def prompt_interests(prompt: str) -> list[dict]:
@@ -69,7 +85,9 @@ def build_mai_profile(prompt: str, category: str, answer: str, top_k: int = TOP_
 def score_profiles(client: JEVClient, profiles: list[str | None],
                    future_behaviors: list[list[str]]) -> list[list[dict] | None]:
     """Per rollout: None when its profile is None, else the JEV probabilities of each of its future behaviors, in
-    order. Every distinct (profile, behavior) pair of the batch is scored once, all in one request."""
+    order (each sent as jev_behavior()). Every distinct (profile, behavior) pair of the batch is scored once, all in
+    one request."""
+    future_behaviors = [[jev_behavior(behavior) for behavior in behaviors] for behaviors in future_behaviors]
     pairs = list(dict.fromkeys((profile, behavior) for profile, behaviors in zip(profiles, future_behaviors)
                                if profile is not None for behavior in behaviors))
     scores = dict(zip(pairs, client.score(pairs))) if pairs else {}

@@ -9,16 +9,20 @@ GRPO (no KL) of the Layer-3 Commercial task with the [Layer-1 SFT replay](../../
   per shard; `--upload` writes it back to Hugging Face.
 - `prepare_rl_data.py`: `RL_User_Profile_Layer3_V1_Processed` -> verl `train.parquet` / `val.parquet`. The prompt is
   the row's `prompt` as is; the reward's targets are at most 20 distinct future behaviors per user (TimeStamp
-  ignored), sampled with a per-user seed, so every answer of a GRPO group is scored on the same ones. The profiled
+  ignored), sampled with a per-user seed, so every answer of a GRPO group is scored on the same ones. Each target is
+  stored as JEV was trained on it (`jev_profile.jev_behavior`: the data's `action_idx` / `action_freq` removed), its
+  `action_freq` in `extra_info` `future_freq`. The profiled
   interests are the reference commercial interests with a medium or high score; users without one are skipped.
 - `jev_profile.py`: an answer -> the EVAL_Dataset `mai_profile`: the reference commercial interests (in GRPO; the
   answer's own commercial flags otherwise), the first 10 in input order (the Layer-2 confidence order), each with its
   `category`, the answer's brands / products / retailers / predicted queries and the input topics. Marking more
   interests commercial cannot raise the reward (left alone, GRPO drove `commercial_share` to about 100%).
 - `l3_reward.py`: 0 when the answer breaks the Layer-3 Commercial rules (`user_profile_rules.score_example`, the SFT
-  checks), else the mean over the targets of the JEV expected match `(P(partial) + 2 * P(perfect)) / 2`.
-  W&B logs only `val-core/` and `train-core/user_profile_l3/`: `reward`, `rule_pass`, and two reward-hacking
-  watches, `commercial_share` and `entities_per_interest`.
+  checks), else the weighted mean over the targets of the JEV expected match `(P(partial) + 2 * P(perfect)) / 2`,
+  each target weighing `1 / (1 + action_freq / 100)` as in the Layer-1 reward (`l1_reward.action_weight`; 1 when
+  unknown), so ubiquitous behaviors (a messenger, a start page) count about 0.
+  W&B logs only `val-core/` and `train-core/user_profile_l3/`: `reward`, `rule_pass`, `reward_unweighted` (every
+  weight 1, diagnostic), and two reward-hacking watches, `commercial_share` and `entities_per_interest`.
 - `l3_verl_reward.py`: the verl entry point (`compute_score`).
 
 The JEV classifier runs on its own node, one server per GPU ([serve_jev.sh](../../serve_jev.sh)): all 8 GPUs when

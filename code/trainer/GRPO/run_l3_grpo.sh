@@ -7,9 +7,10 @@
 # steps: 64 users x VAL_N 4 answers, and the SFT guardrail on 200 test rows per task (as run_l1_l3_grpo.sh).
 # Limits: context 25600 tokens, response 8192 tokens.
 # SFT_REPLAY=0 disables replay and extra SFT evaluation.
-# Reward (l3/training/l3_reward.py): 0 when the answer breaks the Layer-3 Commercial rules, else the mean over the
-# user's FUTURE_K (20) target future behaviors of the JEV expected match (0 no / 1 partial / 2 perfect, over 2) of the
-# answer's mai_profile (its commercial interests, the first 10 in input order, joined with their category).
+# Reward (l3/training/l3_reward.py): 0 when the answer breaks the Layer-3 Commercial rules, else the weighted mean
+# over the user's FUTURE_K (20) target future behaviors (each 1 / (1 + action_freq / 100), as the Layer-1 reward) of
+# the JEV expected match (0 no / 1 partial / 2 perfect, over 2) of the answer's mai_profile (its commercial interests,
+# the first 10 in input order, joined with their category).
 # Every visible GPU trains; the JEV servers run elsewhere (serve_jev.sh): with JEV_NODE, one on each of its 8 GPUs
 # (JEV_GPUS, default 0-7), as this run needs no embedding server.
 set -euo pipefail
@@ -56,8 +57,9 @@ fi
 NUM_TRAIN=${NUM_TRAIN:-0}  # training rows to prepare (0 = all); a few for a smoke test
 TRAIN_SUFFIX=""
 [ "$NUM_TRAIN" = 0 ] || TRAIN_SUFFIX="_train$NUM_TRAIN"  # a partial set never takes the full set's directory
-# _ref: profiles of the reference commercial interests (data without them is never reused)
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref$TRAIN_SUFFIX}
+# _ref: profiles of the reference commercial interests; _freq: targets as JEV takes them, with their action_freq
+# (data without them is never reused)
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref_freq$TRAIN_SUFFIX}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
 mkdir -p "$OUTPUT_DIR"
@@ -91,12 +93,13 @@ fi
 python3 - "$DATA_DIR/meta.json" "$SEED" "$FUTURE_K" "$MAX_PROMPT_LENGTH" <<'EOF'
 import json, sys
 sys.path.insert(0, "l3/training")
-from prepare_rl_data import DATASET, REFERENCE_SCORES
+from prepare_rl_data import DATASET, REFERENCE_SCORES, TARGET_FORMAT_VERSION
 
 meta = json.load(open(sys.argv[1]))
 if (meta.get("dataset") != DATASET or meta["seed"] != int(sys.argv[2]) or meta["future_k"] != int(sys.argv[3])
         or meta["max_prompt_length"] > int(sys.argv[4])
-        or meta.get("commercial_reference_scores") != list(REFERENCE_SCORES)):
+        or meta.get("commercial_reference_scores") != list(REFERENCE_SCORES)
+        or meta.get("target_format_version") != TARGET_FORMAT_VERSION):
     sys.exit(f"{sys.argv[1]}: prepared with other settings ({meta}); use another DATA_DIR")
 EOF
 
@@ -175,7 +178,7 @@ result = compute_score(row["data_source"], "not json", row["reward_model"]["grou
 print(f"Preflight reward of 'not json': {result}", flush=True)
 EOF
 
-CORE_METRICS="['reward','rule_pass','commercial_share','entities_per_interest']"  # val-core/ and train-core/user_profile_l3/<metric>
+CORE_METRICS="['reward','rule_pass','reward_unweighted','commercial_share','entities_per_interest']"  # val-core/ and train-core/user_profile_l3/<metric>
 # W&B Logs tab: node-0's whole train.log, streamed into the run by log_to_wandb.py (the trainer creates the run in
 # shared mode, verl/utils/tracking.py); it stops by itself once this launcher exits.
 WANDB_ARGS=()

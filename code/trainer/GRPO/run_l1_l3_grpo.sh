@@ -10,7 +10,7 @@
 #             weighted by 1 / (1 + action_freq / 100)), within the
 #             step's L1_BATCH (32) Layer-1 users (one single-language pool)
 #   Layer 3   l3/training/l3_reward.py: the JEV expected match of the answer's mai_profile over the user's FUTURE_K
-#             (20) target future behaviors
+#             (20) target future behaviors, weighted as Layer 1's actions (1 / (1 + action_freq / 100))
 # Both are 0 when the answer breaks its task's rules. Every visible GPU trains; the embedding server (serve_embedding.sh,
 # GPU 0) and the JEV servers (serve_jev.sh, GPUs 1-7) run on another node.
 set -euo pipefail
@@ -61,9 +61,10 @@ fi
 STEPS_SUFFIX=""
 [ "$NUM_STEPS" = 0 ] || STEPS_SUFFIX="_steps$NUM_STEPS"
 L1_DATA_DIR=${L1_DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${L1_BATCH}_prompt${MAX_PROMPT_LENGTH}_pools_v5$STEPS_SUFFIX}
-# _ref: Layer-3 profiles of the reference commercial interests (data without them is never reused)
-L3_DATA_DIR=${L3_DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref$STEPS_SUFFIX}
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1l3_seed${SEED}_b${L1_BATCH}x${L3_BATCH}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref_pools_v5$STEPS_SUFFIX}
+# _ref: Layer-3 profiles of the reference commercial interests; _freq: targets as JEV takes them, with their
+# action_freq (data without them is never reused)
+L3_DATA_DIR=${L3_DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref_freq$STEPS_SUFFIX}
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1l3_seed${SEED}_b${L1_BATCH}x${L3_BATCH}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref_freq_pools_v5$STEPS_SUFFIX}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
@@ -105,7 +106,7 @@ python3 - "$L1_DATA_DIR/meta.json" "$L3_DATA_DIR/meta.json" "$L1_BATCH" "$SEED" 
 import json, sys
 sys.path.insert(0, "l3/training")
 from l1.prepare_data import DATASET as L1_DATASET, POOL_FORMAT_VERSION
-from prepare_rl_data import DATASET as L3_DATASET, REFERENCE_SCORES
+from prepare_rl_data import DATASET as L3_DATASET, REFERENCE_SCORES, TARGET_FORMAT_VERSION
 
 l1_file, l3_file, l1_batch, seed, future_k, max_prompt = sys.argv[1:]
 l1, l3 = json.load(open(l1_file)), json.load(open(l3_file))
@@ -114,17 +115,19 @@ if (l1.get("dataset") != L1_DATASET or l1.get("pool_format_version") != POOL_FOR
     sys.exit(f"{l1_file}: prepared with other settings; use another L1_DATA_DIR")
 if (l3.get("dataset") != L3_DATASET or l3["seed"] != int(seed) or l3["future_k"] != int(future_k)
         or l3["max_prompt_length"] > int(max_prompt)
-        or l3.get("commercial_reference_scores") != list(REFERENCE_SCORES)):
+        or l3.get("commercial_reference_scores") != list(REFERENCE_SCORES)
+        or l3.get("target_format_version") != TARGET_FORMAT_VERSION):
     sys.exit(f"{l3_file}: prepared with other settings; use another L3_DATA_DIR")
 EOF
 if [ ! -f "$DATA_DIR/train.parquet" ]; then
   python3 joint/prepare_joint_data.py --l1_dir "$L1_DATA_DIR" --l3_dir "$L3_DATA_DIR" --output_dir "$DATA_DIR" \
     --l1_batch "$L1_BATCH" --l3_batch "$L3_BATCH" --num_steps "$NUM_STEPS"
 fi
-POOL_FILE=$(python3 - "$DATA_DIR/meta.json" "$L1_DATA_DIR" "$L1_BATCH" "$L3_BATCH" <<'EOF'
+POOL_FILE=$(python3 - "$DATA_DIR/meta.json" "$L1_DATA_DIR" "$L1_BATCH" "$L3_BATCH" "$L3_DATA_DIR" <<'EOF'
 import json, os, sys
 meta = json.load(open(sys.argv[1]))
-if (meta["l1_dir"] != os.path.realpath(sys.argv[2]) or meta["l1_batch"] != int(sys.argv[3])
+if (meta["l1_dir"] != os.path.realpath(sys.argv[2]) or meta["l3_dir"] != os.path.realpath(sys.argv[5])
+        or meta["l1_batch"] != int(sys.argv[3])
         or meta["l3_batch"] != int(sys.argv[4])):
     sys.exit(f"{sys.argv[1]}: built from other data or batch sizes; use another DATA_DIR")
 print(meta["pool_file"])
@@ -226,7 +229,7 @@ EOF
 
 # val-core/ and train-core/<data_source>/<metric>: each task logs only its own (the others are None for it).
 L1_METRICS="'n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens'"
-L3_METRICS="'commercial_share','entities_per_interest'"
+L3_METRICS="'reward_unweighted','commercial_share','entities_per_interest'"
 CORE_METRICS="['reward','rule_pass',$L1_METRICS,$L3_METRICS]"
 # W&B Logs tab: node-0's whole train.log, streamed into the run by log_to_wandb.py (the trainer creates the run in
 # shared mode, verl/utils/tracking.py); it stops by itself once this launcher exits.
