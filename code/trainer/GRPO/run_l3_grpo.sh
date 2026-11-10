@@ -8,7 +8,7 @@
 # Limits: context 25600 tokens, response 8192 tokens.
 # SFT_REPLAY=0 disables replay and extra SFT evaluation.
 # Reward (l3/training/l3_reward.py): 0 when the answer breaks the Layer-3 Commercial rules, else the weighted mean
-# over the user's FUTURE_K (20) target future behaviors (each 1 / (1 + action_freq / 100), as the Layer-1 reward) of
+# over the user's first 25 distinct future behaviors in time order (each 1 / (1 + action_freq / 100), as Layer 1) of
 # the JEV expected match (0 no / 1 partial / 2 perfect, over 2) of the answer's mai_profile (its commercial interests,
 # the first 10 in input order, joined with their category).
 # Every visible GPU trains; the JEV servers run elsewhere (serve_jev.sh): with JEV_NODE, one on each of its 8 GPUs
@@ -37,7 +37,6 @@ OUTPUT_DIR=${OUTPUT_DIR:-$HERE/outputs/$EXPERIMENT_NAME}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
 N=${N:-16}
 SEED=${SEED:-0}
-FUTURE_K=${FUTURE_K:-20}
 MAX_MODEL_LEN=25600
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((MAX_MODEL_LEN - MAX_RESPONSE_LENGTH))}
@@ -59,7 +58,7 @@ TRAIN_SUFFIX=""
 [ "$NUM_TRAIN" = 0 ] || TRAIN_SUFFIX="_train$NUM_TRAIN"  # a partial set never takes the full set's directory
 # _ref: profiles of the reference commercial interests; _freq: targets as JEV takes them, with their action_freq
 # (data without them is never reused)
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref_freq$TRAIN_SUFFIX}
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_prompt${MAX_PROMPT_LENGTH}_ref_freq_first25$TRAIN_SUFFIX}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
 mkdir -p "$OUTPUT_DIR"
@@ -87,19 +86,19 @@ L3_SOURCE_ARGS=()
 [ -z "${L3_SOURCE_DIR:-}" ] || L3_SOURCE_ARGS=(--data_dir "$L3_SOURCE_DIR")
 if [ ! -f "$DATA_DIR/train.parquet" ]; then
   python3 l3/training/prepare_rl_data.py --output_dir "$DATA_DIR" --tokenizer "$CHECKPOINT" --seed "$SEED" \
-    --future_k "$FUTURE_K" --num_train "$NUM_TRAIN" --num_val "${NUM_VAL:-64}" \
+    --num_train "$NUM_TRAIN" --num_val "${NUM_VAL:-64}" \
     --max_prompt_length "$MAX_PROMPT_LENGTH" "${L3_SOURCE_ARGS[@]}"
 fi
-python3 - "$DATA_DIR/meta.json" "$SEED" "$FUTURE_K" "$MAX_PROMPT_LENGTH" <<'EOF'
+python3 - "$DATA_DIR/meta.json" "$SEED" "$MAX_PROMPT_LENGTH" <<'EOF'
 import json, sys
 sys.path.insert(0, "l3/training")
-from prepare_rl_data import DATASET, REFERENCE_SCORES, TARGET_FORMAT_VERSION
+from prepare_rl_data import DATASET, NUM_TARGETS, REFERENCE_SCORES, TARGET_FORMAT_VERSION
 
 meta = json.load(open(sys.argv[1]))
-if (meta.get("dataset") != DATASET or meta["seed"] != int(sys.argv[2]) or meta["future_k"] != int(sys.argv[3])
-        or meta["max_prompt_length"] > int(sys.argv[4])
+if (meta.get("dataset") != DATASET or meta["seed"] != int(sys.argv[2])
+        or meta["max_prompt_length"] > int(sys.argv[3])
         or meta.get("commercial_reference_scores") != list(REFERENCE_SCORES)
-        or meta.get("target_format_version") != TARGET_FORMAT_VERSION):
+        or meta.get("target_format_version") != TARGET_FORMAT_VERSION or meta.get("num_targets") != NUM_TARGETS):
     sys.exit(f"{sys.argv[1]}: prepared with other settings ({meta}); use another DATA_DIR")
 EOF
 

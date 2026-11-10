@@ -8,8 +8,9 @@ GRPO (no KL) of the Layer-3 Commercial task with the [Layer-1 SFT replay](../../
   `{interest_name: commercial_score}` of the input interests it marks commercial. One vLLM engine per GPU, resumable
   per shard; `--upload` writes it back to Hugging Face.
 - `prepare_rl_data.py`: `RL_User_Profile_Layer3_V1_Processed` -> verl `train.parquet` / `val.parquet`. The prompt is
-  the row's `prompt` as is; the reward's targets are at most 20 distinct future behaviors per user (TimeStamp
-  ignored), sampled with a per-user seed, so every answer of a GRPO group is scored on the same ones. Each target is
+  the row's `prompt` as is; the reward's targets are the user's first 25 distinct future behaviors in time order
+  (TimeStamp ignored for distinctness), the ones right after the profiled history, so every answer of a GRPO group is
+  scored on the same ones. Each target is
   stored as JEV was trained on it (`jev_profile.jev_behavior`: the data's `action_idx` / `action_freq` removed), its
   `action_freq` in `extra_info` `future_freq`. The profiled
   interests are the reference commercial interests with a medium or high score; users without one are skipped.

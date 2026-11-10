@@ -9,8 +9,8 @@
 #   Layer 1   l1/l1_reward.py: the mean of past_assignment and future_retrieval (Qwen3-Embedding-8B, every action
 #             weighted by 1 / (1 + action_freq / 100)), within the
 #             step's L1_BATCH (32) Layer-1 users (one single-language pool)
-#   Layer 3   l3/training/l3_reward.py: the JEV expected match of the answer's mai_profile over the user's FUTURE_K
-#             (20) target future behaviors, weighted as Layer 1's actions (1 / (1 + action_freq / 100))
+#   Layer 3   l3/training/l3_reward.py: the JEV expected match of the answer's mai_profile over the user's first 25
+#             distinct future behaviors in time order, weighted as Layer 1's actions (1 / (1 + action_freq / 100))
 # Both are 0 when the answer breaks its task's rules. Every visible GPU trains; the embedding server (serve_embedding.sh,
 # GPU 0) and the JEV servers (serve_jev.sh, GPUs 1-7) run on another node.
 set -euo pipefail
@@ -41,7 +41,6 @@ TRAIN_BATCH_SIZE=$((L1_BATCH + L3_BATCH))
 NUM_STEPS=${NUM_STEPS:-0}  # training batches to prepare (0 = until a task runs out); a few for a smoke test
 N=${N:-16}
 SEED=${SEED:-0}
-FUTURE_K=${FUTURE_K:-20}
 MAX_MODEL_LEN=25600
 MAX_RESPONSE_LENGTH=${MAX_RESPONSE_LENGTH:-8192}
 MAX_PROMPT_LENGTH=${MAX_PROMPT_LENGTH:-$((MAX_MODEL_LEN - MAX_RESPONSE_LENGTH))}
@@ -63,8 +62,8 @@ STEPS_SUFFIX=""
 L1_DATA_DIR=${L1_DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${L1_BATCH}_prompt${MAX_PROMPT_LENGTH}_pools_v5$STEPS_SUFFIX}
 # _ref: Layer-3 profiles of the reference commercial interests; _freq: targets as JEV takes them, with their
 # action_freq (data without them is never reused)
-L3_DATA_DIR=${L3_DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref_freq$STEPS_SUFFIX}
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1l3_seed${SEED}_b${L1_BATCH}x${L3_BATCH}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref_freq_pools_v5$STEPS_SUFFIX}
+L3_DATA_DIR=${L3_DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_prompt${MAX_PROMPT_LENGTH}_ref_freq_first25$STEPS_SUFFIX}
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1l3_seed${SEED}_b${L1_BATCH}x${L3_BATCH}_prompt${MAX_PROMPT_LENGTH}_ref_freq_first25_pools_v5$STEPS_SUFFIX}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
@@ -99,24 +98,24 @@ L3_SOURCE_ARGS=()
 [ -z "${L3_SOURCE_DIR:-}" ] || L3_SOURCE_ARGS=(--data_dir "$L3_SOURCE_DIR")
 if [ ! -f "$L3_DATA_DIR/train.parquet" ]; then
   python3 l3/training/prepare_rl_data.py --output_dir "$L3_DATA_DIR" --tokenizer "$CHECKPOINT" --seed "$SEED" \
-    --future_k "$FUTURE_K" --num_train $((NUM_STEPS * L3_BATCH)) --num_val "${NUM_VAL:-64}" \
+    --num_train $((NUM_STEPS * L3_BATCH)) --num_val "${NUM_VAL:-64}" \
     --max_prompt_length "$MAX_PROMPT_LENGTH" "${L3_SOURCE_ARGS[@]}"
 fi
-python3 - "$L1_DATA_DIR/meta.json" "$L3_DATA_DIR/meta.json" "$L1_BATCH" "$SEED" "$FUTURE_K" "$MAX_PROMPT_LENGTH" <<'EOF'
+python3 - "$L1_DATA_DIR/meta.json" "$L3_DATA_DIR/meta.json" "$L1_BATCH" "$SEED" "$MAX_PROMPT_LENGTH" <<'EOF'
 import json, sys
 sys.path.insert(0, "l3/training")
 from l1.prepare_data import DATASET as L1_DATASET, POOL_FORMAT_VERSION
-from prepare_rl_data import DATASET as L3_DATASET, REFERENCE_SCORES, TARGET_FORMAT_VERSION
+from prepare_rl_data import DATASET as L3_DATASET, NUM_TARGETS, REFERENCE_SCORES, TARGET_FORMAT_VERSION
 
-l1_file, l3_file, l1_batch, seed, future_k, max_prompt = sys.argv[1:]
+l1_file, l3_file, l1_batch, seed, max_prompt = sys.argv[1:]
 l1, l3 = json.load(open(l1_file)), json.load(open(l3_file))
 if (l1.get("dataset") != L1_DATASET or l1.get("pool_format_version") != POOL_FORMAT_VERSION
         or l1["batch_size"] != int(l1_batch) or l1["max_prompt_length"] > int(max_prompt)):
     sys.exit(f"{l1_file}: prepared with other settings; use another L1_DATA_DIR")
-if (l3.get("dataset") != L3_DATASET or l3["seed"] != int(seed) or l3["future_k"] != int(future_k)
+if (l3.get("dataset") != L3_DATASET or l3["seed"] != int(seed)
         or l3["max_prompt_length"] > int(max_prompt)
         or l3.get("commercial_reference_scores") != list(REFERENCE_SCORES)
-        or l3.get("target_format_version") != TARGET_FORMAT_VERSION):
+        or l3.get("target_format_version") != TARGET_FORMAT_VERSION or l3.get("num_targets") != NUM_TARGETS):
     sys.exit(f"{l3_file}: prepared with other settings; use another L3_DATA_DIR")
 EOF
 if [ ! -f "$DATA_DIR/train.parquet" ]; then

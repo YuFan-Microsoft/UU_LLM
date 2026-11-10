@@ -3,9 +3,9 @@
 
 Each user row becomes one prompt: its `prompt` column as is (the Layer-3 Commercial user message, built by
 ../prepare_data/build_l3_commercial_inputs.py exactly as inference builds it), wrapped as one user message. The
-reward's targets (ground_truth) are at most --future_k (20) of the user's future behaviors: the distinct ones (the
-same behavior on another day counts once: TimeStamp is ignored), sampled with a seed fixed per user and kept in
-their original order, so every answer of a GRPO group, and every run with this seed, is scored on the same ones.
+reward's targets (ground_truth) are the user's first NUM_TARGETS (25) distinct future behaviors in time order (the
+same behavior on another day counts once, at its first day: TimeStamp is ignored), the ones right after the history
+the profile is built from, so every answer of a GRPO group is scored on the same ones.
 Each target is the behavior as JEV was trained on it (jev_profile.jev_behavior: without the data's action_idx /
 action_freq); extra_info future_freq holds the action_freq of each target, in the same order (None when the data has
 none), for the reward's action weights.
@@ -36,7 +36,6 @@ import json
 import multiprocessing as mp
 import os
 from pathlib import Path
-import random
 import sys
 import tempfile
 import time
@@ -56,7 +55,9 @@ COLUMNS = ["user_id", "prompt", "category", "commercial", "future_behaviors", "l
 REFERENCE_SCORES = ("medium", "high")  # the reference commercial interests the reward profiles
 DATA_SOURCE = "user_profile_l3"  # the W&B prefix: val-core/user_profile_l3/<metric>
 MAX_PROMPT_LENGTH = 25600 - 8192
-TARGET_FORMAT_VERSION = 2  # 2: targets without action_idx / action_freq, their frequencies in extra_info future_freq
+NUM_TARGETS = 25  # the first distinct future behaviors in time order the reward scores
+TARGET_FORMAT_VERSION = 3  # 2: targets without action_idx / action_freq, their frequencies in extra_info future_freq;
+#                            3: the first NUM_TARGETS distinct future behaviors in time order (no random sample)
 
 
 @contextmanager
@@ -81,28 +82,24 @@ def split_files(data_dir: Path | None, split: str):
                for name in names]
 
 
-def targets(user_id: str, behaviors: list[str], k: int, seed: int) -> tuple[list[str], list[int | None], int]:
-    """(at most k of the distinct future behaviors as JEV takes them (jev_behavior), sampled with a per-user seed, in
-    their order; the action_freq of each; the number of distinct ones). Two behaviors are the same when they differ
-    only in TimeStamp."""
+def targets(behaviors: list[str]) -> tuple[list[str], list[int | None]]:
+    """(the first NUM_TARGETS distinct future behaviors in time order, as JEV takes them (jev_behavior); the action_freq
+    of each). Two behaviors are the same when they differ only in TimeStamp; the earliest one is kept. TimeStamp is a
+    date, so behaviors of one day keep their order in the data (a stable sort)."""
     distinct = {}
-    for text in behaviors:
+    for text in sorted(behaviors, key=lambda text: json.loads(text).get("TimeStamp") or ""):
         target = jev_behavior(text)
         key = json.dumps({name: value for name, value in json.loads(target).items() if name != "TimeStamp"},
                          ensure_ascii=False, sort_keys=True)
         freq = json.loads(text).get("action_freq")
         distinct.setdefault(key, (target, None if freq is None else int(freq)))
-    items = list(distinct.values())
-    if k and len(items) > k:
-        keep = sorted(random.Random(row_key(seed, user_id.encode())).sample(range(len(items)), k))
-        items = [items[i] for i in keep]
-    return [target for target, _ in items], [freq for _, freq in items], len(distinct)
+    items = list(distinct.values())[:NUM_TARGETS]
+    return [target for target, _ in items], [freq for _, freq in items]
 
 
 def build_example(row: dict, tokenizer, args: argparse.Namespace) -> dict | None:
     """The verl row of one user, or None when it is skipped."""
-    ground_truth, future_freq, n_future = targets(row["user_id"], list(row["future_behaviors"] or []), args.future_k,
-                                                  args.seed)
+    ground_truth, future_freq = targets(list(row["future_behaviors"] or []))
     reference = [name for name, score in json.loads(row["commercial"] or "{}").items() if score in REFERENCE_SCORES]
     if not ground_truth or not reference:
         return None
@@ -117,7 +114,7 @@ def build_example(row: dict, tokenizer, args: argparse.Namespace) -> dict | None
         "reward_model": {"style": "rule", "ground_truth": ground_truth},
         "extra_info": {"user_id": row["user_id"], "language": row.get("language") or "und", "content": row["prompt"],
                        "category": row["category"], "commercial_interests": json.dumps(reference, ensure_ascii=False),
-                       "prompt_tokens": prompt_tokens, "n_future_distinct": n_future,
+                       "prompt_tokens": prompt_tokens,
                        "future_freq": future_freq},
     }
 
@@ -177,7 +174,6 @@ def main() -> None:
     parser.add_argument("--tokenizer", default=DEFAULT_CHECKPOINT, help="The policy checkpoint (prompt token counts)")
     parser.add_argument("--data_dir", type=Path, help="Local train-*.parquet / test-*.parquet instead of HF")
     parser.add_argument("--seed", type=int, default=0)
-    parser.add_argument("--future_k", type=int, default=20, help="Target future behaviors per user (0 = all)")
     parser.add_argument("--num_train", type=int, default=0, help="Training rows (0 = all)")
     parser.add_argument("--num_val", type=int, default=64)
     parser.add_argument("--max_prompt_length", type=int, default=MAX_PROMPT_LENGTH)
@@ -202,8 +198,9 @@ def main() -> None:
     pq.write_table(pa.Table.from_pylist(train), args.output_dir / "train.parquet", row_group_size=1024)
     pq.write_table(pa.Table.from_pylist(val), args.output_dir / "val.parquet", row_group_size=1024)
     n_targets = [len(row["reward_model"]["ground_truth"]) for row in train]
-    meta = {"dataset": DATASET, "seed": args.seed, "future_k": args.future_k, "tokenizer": args.tokenizer,
+    meta = {"dataset": DATASET, "seed": args.seed, "tokenizer": args.tokenizer,
             "commercial_reference_scores": list(REFERENCE_SCORES), "target_format_version": TARGET_FORMAT_VERSION,
+            "num_targets": NUM_TARGETS,
             "max_prompt_length": args.max_prompt_length, "train_rows": len(train), "val_rows": len(val),
             "train_skipped": train_skipped, "val_skipped": val_skipped,
             "mean_targets_per_user": sum(n_targets) / len(n_targets) if n_targets else 0,
