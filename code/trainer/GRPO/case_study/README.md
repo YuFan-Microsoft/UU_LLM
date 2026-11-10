@@ -17,27 +17,34 @@ data, or takes the answers a GRPO run generated at one validation step, and scor
 ## Reward (`../l1/l1_reward.py`)
 
 The reward of one answer is 0 when it breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation,
-any `interest_name` or `topic` with 7 or more generation-tokenizer tokens, or cut at max_tokens), else the mean of
-two signals, each in [0, 1]. Token counts exclude special tokens and apply to every name and topic;
+any `interest_name` or `topic` over its label token limit in generation-tokenizer tokens: 6 when the interest's cited
+actions are English, else 10; or cut at max_tokens), else the mean of two signals, each in [0, 1]. Token counts
+exclude special tokens and apply to every name and topic;
 `actual_activity` has no such limit. Both signals use the same queries, one per topic written:
-`<interest name>: <topic>`, embedded with Qwen3-Embedding.
+`<interest name>: <topic>`, embedded with Qwen3-Embedding, and weigh every action by
+1 / (1 + action_freq / 100) (`action_freq`: the corpus occurrences of its normalized text, from the RL data), so a
+long-tail action counts about 1 and a ubiquitous one (a messenger, an AI assistant, a start page) about 0.
 
-- `past_assignment`: the user's visible input actions owned by a topic that cites them, divided by the larger of
-  the number of actions cited and 0.7 of the visible actions; each visible action is owned by its most similar
-  topic (a tie counts if a citing topic is among the tied). Only the user's own topics compete, never other users'
-  actions.
+- `past_assignment`: the weight of the user's visible input actions owned by a topic that cites them, divided by the
+  larger of the weight of the actions cited and 0.7 of the weight of the visible actions; each visible action is
+  owned by its most similar topic (a tie counts if a citing topic is among the tied). Only the user's own topics
+  compete, never other users' actions.
 - `future_retrieval`: every next-week action in the pool is scored by its most similar topic of the answer; of the
-  top B, B being the number of this user's distinct next-week actions, the share that are this user's.
+  top B, B being the number of this user's distinct next-week actions, the weight of this user's actions over the
+  weight of all of them.
 
-`coverage` is still reported as the share of input indices cited by the answer, but is not in the reward.
+`past_assignment_unweighted` / `future_retrieval_unweighted` (every weight 1) are reported next to them, and
+`coverage` as the share of input indices cited by the answer; none of them is in the reward.
 `score` builds one pool per `--pool_users` consecutive prompts (64, the GRPO batch size, since `future_retrieval`
 depends on the pool size): their actual visible actions, embedded once and read back for each answer's
-`past_assignment` (never ranked), and their next-week actions, ranked for `future_retrieval`.
+`past_assignment` (never ranked), and their next-week actions, ranked for `future_retrieval`. The action frequencies
+come with the prompts (`rl_data.clean_behaviors` keeps each behavior's `action_freq`; `from_val` takes them from the
+run's `val.parquet`); `score` stops on a `prompts.jsonl` or `val.parquet` prepared before them.
 
 ```python
 reward_fn = L1Reward(tokenizer=tokenizer)   # tokenizer from the generation checkpoint, not the embedding model
 reward_fn.set_pools(past_actions, future_actions)  # all prompts' visible actions (embedded once) / next-week pool
-reward_fn(content, text, finish_reason, next_week_actions)["reward"]
+reward_fn(content, text, finish_reason, next_week_actions, past_freqs, future_freqs)["reward"]
 ```
 
 ## Requirements
@@ -146,11 +153,12 @@ summary and, for the first `--report_prompts` prompts, the input signals and eve
 | --- | --- |
 | `reward` | The GRPO reward of `../l1/l1_reward.py` (above) |
 | `json_valid` | Exactly the V3 Layer-1 schema `{"interests":[{"topics":[{"evidence","topic"}],"interest_name","actual_activity"}]}` with the right value types (no topic source, intent or content locale) |
-| `rule_pass` | The shared GRPO judgement: JSON-valid and no violation (`user_profile_rules.score_example`, `truncated`, `interest_name_too_long` / `topic_too_long` for any name or topic with 7+ generation-tokenizer tokens) |
+| `rule_pass` | The shared GRPO judgement: JSON-valid and no violation (`user_profile_rules.score_example`, `truncated`, `interest_name_too_long` / `topic_too_long` for any name or topic over its limit: 6 generation-tokenizer tokens for an English interest, else 10) |
 | `n_interests` | Number of interests written |
 | `coverage` | Share of the input indices cited by the answer (diagnostic only, not in the reward) |
-| `past_assignment` | This user's visible input actions owned (most similar topic, `<interest name>: <topic>`, among the answer's topics) by a topic citing them, over the larger of the actions cited and 0.7 of the visible actions (reward signal) |
-| `future_retrieval` | Of the pool's next-week actions ranked by their most similar topic, the share of the top B (B = this user's distinct next-week actions) that are this user's (reward signal) |
+| `past_assignment` | The weight of this user's visible input actions owned (most similar topic, `<interest name>: <topic>`, among the answer's topics) by a topic citing them, over the larger of the weight of the actions cited and 0.7 of the weight of the visible actions; weight 1 / (1 + action_freq / 100) (reward signal) |
+| `future_retrieval` | Of the pool's next-week actions ranked by their most similar topic, the weight of this user's actions in the top B (B = this user's distinct next-week actions) over the weight of all of them (reward signal) |
+| `past_assignment_unweighted` / `future_retrieval_unweighted` | The same with every action weighing 1 (diagnostic only) |
 
 Content signals are 0 for an answer that is not JSON-valid; a JSON-valid answer that breaks a rule still gets them,
 but its reward is 0. For GRPO only the variation within a group matters, so the summary reports each signal's mean,

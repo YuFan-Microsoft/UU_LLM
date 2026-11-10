@@ -33,7 +33,8 @@ sys.path.insert(0, str(UU_LLM / "code" / "inference"))
 sys.path.insert(0, str(HERE.parent / "l1"))
 
 import layer1  # noqa: E402
-from l1_reward import DEFAULT_EMBEDDING_MODEL, REWARD_SIGNALS, SIGNALS, L1Reward, input_signals  # noqa: E402
+from l1_reward import (DEFAULT_EMBEDDING_MODEL, REWARD_SIGNALS, SIGNALS, UNWEIGHTED_SIGNALS, L1Reward,  # noqa: E402
+                       input_signals)
 from rl_data import (DEFAULT_CHECKPOINT, HF_CONFIG_NAME, HF_REPO, clean_behaviors, index_rows, read_rows,  # noqa: E402
                      rl_data_files)
 import user_profile_rules  # noqa: E402
@@ -216,7 +217,16 @@ def sample_metrics(sample: dict) -> dict:
     """The reward of one sample and the signals it is computed from (l1_reward.L1Reward), with the judgement."""
     return {"reward": sample["reward"], "json_valid": int(sample["json_valid"]), "rule_pass": int(sample["rule_pass"]),
             "n_interests": sample["n_interests"], "coverage": sample["coverage"],
-            **{name: sample[name] for name in REWARD_SIGNALS}}
+            **{name: sample[name] for name in REWARD_SIGNALS}, **{name: sample[name] for name in UNWEIGHTED_SIGNALS}}
+
+
+def action_freqs(row: dict) -> tuple[list[int], list[int]]:
+    """The action_freq of the row's input signals (prompt order) and next-week actions: the reward's action weights."""
+    past, future = [s.get("action_freq") for s in row["signals"]], [b.get("action_freq") for b in row["future"]]
+    if None in past or None in future:
+        raise SystemExit(f"prompt {row['prompt_id']} has no action_freq: its prompts.jsonl (or the run's val.parquet) "
+                         "predates the reward's action weights; prepare a new output directory")
+    return past, future
 
 
 def centered_correlation(groups: list[list[dict]], a: str, b: str) -> float | None:
@@ -320,8 +330,10 @@ def score(args: argparse.Namespace) -> None:
             for row in group:
                 samples = []
                 future = [behavior["action"] for behavior in row["future"]]
+                past_freqs, future_freqs = action_freqs(row)
                 for index, raw in enumerate(row["samples"]):
-                    sample = reward_fn(row["content"], raw["text"], raw["finish_reason"], future)
+                    sample = reward_fn(row["content"], raw["text"], raw["finish_reason"], future,
+                                       past_freqs, future_freqs)
                     result = {"metrics": sample_metrics(sample), "violations": sample["violations"],
                               "output": sample["output"], "queries": sample["queries"],
                               "past_owners": sample["past_owners"], "future_hits": sample["hits"]}
@@ -379,9 +391,13 @@ def from_val(args: argparse.Namespace) -> None:
         _, payload = user_profile_rules.read_input([{"role": "user", "content": extra["content"]}])
         future = extra.get("future") or [{"date": "", "source": "", "action": action}
                                          for action in extra["ground_truth"]]
+        signals = payload["activities"]
+        if extra.get("past_freq") is not None and extra.get("future_freq") is not None:
+            signals = [{**signal, "action_freq": freq} for signal, freq in zip(signals, extra["past_freq"])]
+            future = [{**behavior, "action_freq": freq} for behavior, freq in zip(future, extra["future_freq"])]
         rows.append({
             "prompt_id": extra["index"], "user_id": extra["user_id"], "content": extra["content"],
-            "signals": payload["activities"], "model_input": model_input,
+            "signals": signals, "model_input": model_input,
             "signals_dropped": extra.get("signals_dropped", 0), "future": future,
             "prompt_tokens": extra["prompt_tokens"],
             "samples": [{"text": entry["output"], "finish_reason": None} for entry in entries],

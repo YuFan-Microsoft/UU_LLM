@@ -5,6 +5,8 @@ The reward itself is l1_reward.L1Reward; this file only feeds it what verl passe
     solution_str                  the decoded answer
     ground_truth                  the user's next-week actions
     extra_info["content"]         the Layer-1 user message (the rule checks need the input signals)
+    extra_info["past_freq"]       action_freq of each input signal and of each ground_truth action: the reward's
+    extra_info["future_freq"]     action weights (prepare_data.py)
     extra_info["batch_id"]        the pool of the row: its fixed single-language training batch, or "val-<language>"
                                   (prepare_data.py)
     tokenizer                    this reward worker's already-localized generation tokenizer
@@ -76,7 +78,8 @@ def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict
         if batch_id != _state["batch_id"]:
             scorer.set_pools(**load_pools(pool_file, batch_id))
             _state["batch_id"] = batch_id
-        result = scorer(extra_info["content"], solution_str, None, [str(action) for action in ground_truth])
+        result = scorer(extra_info["content"], solution_str, None, [str(action) for action in ground_truth],
+                        extra_info["past_freq"], extra_info["future_freq"])
     return {"score": float(result["reward"]), "json_valid": float(result["json_valid"]),
             "rule_pass": float(result["rule_pass"]), "n_interests": float(result["n_interests"]),
             **{name: float(result[name]) for name in SIGNALS},

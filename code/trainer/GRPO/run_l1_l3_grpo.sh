@@ -6,7 +6,8 @@
 # and a validation every 50 steps: 64 users per task x VAL_N 4 answers, and the SFT guardrail on 200 test rows per task.
 # Limits: context 25600 tokens, response 8192 tokens. SFT_REPLAY=0 disables replay and extra SFT evaluation.
 # Each answer gets its own task's reward (joint/joint_verl_reward.py, by data_source); nothing is averaged:
-#   Layer 1   l1/l1_reward.py: the mean of past_assignment and future_retrieval (Qwen3-Embedding-8B), within the
+#   Layer 1   l1/l1_reward.py: the mean of past_assignment and future_retrieval (Qwen3-Embedding-8B, every action
+#             weighted by 1 / (1 + action_freq / 100)), within the
 #             step's L1_BATCH (32) Layer-1 users (one single-language pool)
 #   Layer 3   l3/training/l3_reward.py: the JEV expected match of the answer's mai_profile over the user's FUTURE_K
 #             (20) target future behaviors
@@ -59,10 +60,10 @@ if [ "$PPO_MAX_TOKEN_LEN_PER_GPU" -lt $((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH
 fi
 STEPS_SUFFIX=""
 [ "$NUM_STEPS" = 0 ] || STEPS_SUFFIX="_steps$NUM_STEPS"
-L1_DATA_DIR=${L1_DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${L1_BATCH}_prompt${MAX_PROMPT_LENGTH}_pools_v4$STEPS_SUFFIX}
+L1_DATA_DIR=${L1_DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${L1_BATCH}_prompt${MAX_PROMPT_LENGTH}_pools_v5$STEPS_SUFFIX}
 # _ref: Layer-3 profiles of the reference commercial interests (data without them is never reused)
 L3_DATA_DIR=${L3_DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref$STEPS_SUFFIX}
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1l3_seed${SEED}_b${L1_BATCH}x${L3_BATCH}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref$STEPS_SUFFIX}
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1l3_seed${SEED}_b${L1_BATCH}x${L3_BATCH}_k${FUTURE_K}_prompt${MAX_PROMPT_LENGTH}_ref_pools_v5$STEPS_SUFFIX}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
@@ -224,7 +225,7 @@ for source, text in ((L1_SOURCE, "not json"), (L1_SOURCE, l1_answer), (L3_SOURCE
 EOF
 
 # val-core/ and train-core/<data_source>/<metric>: each task logs only its own (the others are None for it).
-L1_METRICS="'n_interests','coverage','past_assignment','future_retrieval','json_valid','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens'"
+L1_METRICS="'n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens'"
 L3_METRICS="'commercial_share','entities_per_interest'"
 CORE_METRICS="['reward','rule_pass',$L1_METRICS,$L3_METRICS]"
 # W&B Logs tab: node-0's whole train.log, streamed into the run by log_to_wandb.py (the trainer creates the run in
