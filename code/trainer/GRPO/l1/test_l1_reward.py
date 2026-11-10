@@ -4,6 +4,7 @@ import argparse
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import importlib.util
+import io
 import json
 import os
 from pathlib import Path
@@ -246,6 +247,54 @@ class DualPoolRewardTest(unittest.TestCase):
                                                                     for index in range(5)]
         self.assertAlmostEqual(past(shifted)["past_assignment"], 20 / 25)
 
+    def test_action_weight(self):
+        self.assertEqual(reward.action_weight(None), 1)
+        self.assertEqual(reward.action_weight(0), 1)
+        self.assertEqual(reward.action_weight(reward.ACTION_FREQ_HALF_WEIGHT), 0.5)
+        self.assertAlmostEqual(reward.action_weight(110703), 1 / (1 + 110703 / 100))
+
+    def test_ubiquitous_actions_earn_nothing_in_either_signal(self):
+        hot, w = 10000, reward.action_weight(10000)
+        past_freqs = [hot] * 5 + [0] * 20  # P0..P4 are ubiquitous
+
+        def past(cited):
+            # I<n> owns P<n>; interests that cite nothing still exist (they own their action, uncited).
+            interests = [[("topic", [index] if index in cited else [])] for index in range(max(cited) + 1)]
+            return self.scorer(content(self.past), topics_answer(interests), None, self.future, past_freqs, None)
+
+        # 18 correct citations pass the unweighted target either way, but ubiquitous ones fill no coverage now.
+        with_hot = past(set(range(18)))
+        target = 0.7 * (5 * w + 20)
+        self.assertEqual(with_hot["past_assignment_unweighted"], 1)
+        self.assertAlmostEqual(with_hot["past_assignment"], (5 * w + 13) / target)
+        tail_only = past(set(range(5, 23)))
+        self.assertEqual(tail_only["past_assignment"], 1)
+        self.assertGreater(tail_only["past_assignment"], with_hot["past_assignment"])
+        # Future: I0..I4 retrieve F0..F4 and other users' actions fill the rest of the top 20.
+        hot_future = [hot] * 5 + [0] * 15
+        retrieved = self.scorer(content(self.past), answer(5), None, self.future, None, hot_future)
+        self.assertAlmostEqual(retrieved["future_retrieval_unweighted"], 5 / 20)
+        self.assertAlmostEqual(retrieved["future_retrieval"], 5 * w / (5 * w + 15))
+        tail_future = self.scorer(content(self.past), answer(5), None, self.future, None, [0] * 5 + [hot] * 15)
+        self.assertAlmostEqual(tail_future["future_retrieval"], 5 / (5 + 15 * w))
+        # Without frequencies every action weighs 1, and the scale of the weights does not matter.
+        plain = self.scorer(content(self.past), answer(5), None, self.future)
+        self.assertEqual(plain["past_assignment"], plain["past_assignment_unweighted"])
+        self.assertEqual(plain["future_retrieval"], plain["future_retrieval_unweighted"])
+        uniform = self.scorer(content(self.past), answer(5), None, self.future, [500] * 25, [500] * 20)
+        self.assertAlmostEqual(uniform["past_assignment"], plain["past_assignment"])
+        self.assertAlmostEqual(uniform["future_retrieval"], plain["future_retrieval"])
+
+    def test_duplicate_future_targets_keep_their_first_frequency(self):
+        result = self.scorer(content(self.past), answer(1), None, ["F0", "F0", "F1"], None, [0, 10000, 10000])
+        self.assertAlmostEqual(result["future_retrieval"], 1 / (1 + reward.action_weight(10000)))
+
+    def test_frequency_counts_must_match(self):
+        with self.assertRaisesRegex(ValueError, "past_freqs has 1 values for 25 input signals"):
+            self.scorer(content(self.past), answer(1), None, self.future, [1], None)
+        with self.assertRaisesRegex(ValueError, "future_freqs has 1 values for 20 next-week actions"):
+            self.scorer(content(self.past), answer(1), None, self.future, None, [1])
+
     def test_past_assignment_is_exact_to_the_topic(self):
         def past(topics):
             return self.scorer(content(self.past), topics_answer([topics]), None, self.future)
@@ -325,15 +374,20 @@ class DualPoolRewardTest(unittest.TestCase):
                 patch.object(verl_reward, "load_pools", return_value=pools) as loader:
             for _ in range(2):
                 result = verl_reward.compute_score("user_profile_l1", answer(1), self.future,
-                                                  {"batch_id": "train-000000", "content": content(self.past)},
+                                                  {"batch_id": "train-000000", "content": content(self.past),
+                                                   "past_freq": [10000] + [1] * 24, "future_freq": [1] * 20},
                                                   "pools.parquet", tokenizer=self.scorer.tokenizer)
             loader.assert_called_once_with("pools.parquet", "train-000000")
         self.assertEqual(set(result), {"score", "json_valid", "rule_pass", "n_interests", *reward.SIGNALS,
                                        *reward.STRUCTURE_SIGNALS})
         self.assertTrue(all(isinstance(value, float) for value in result.values()))
+        # The frequencies reach the reward: I0 cites and owns only P0, which is ubiquitous.
+        self.assertAlmostEqual(result["past_assignment_unweighted"], 1 / self.target)
+        self.assertLess(result["past_assignment"], 0.001)
         with patch.object(verl_reward, "_state", {"reward_fn": self.scorer, "batch_id": "train-000000"}):
             invalid = verl_reward.compute_score("user_profile_l1", "not JSON", self.future,
-                                                {"batch_id": "train-000000", "content": content(self.past)},
+                                                {"batch_id": "train-000000", "content": content(self.past),
+                                                 "past_freq": [1] * 25, "future_freq": [1] * 20},
                                                 "pools.parquet", tokenizer=self.scorer.tokenizer)
         self.assertTrue(all(invalid[name] is None for name in reward.STRUCTURE_SIGNALS))
 
@@ -364,12 +418,37 @@ class TokenLimitRewardTest(unittest.TestCase):
         language_check.start()
         self.addCleanup(language.stop)
         self.addCleanup(language_check.stop)
+        self.detect = patch.object(reward.user_profile_rules, "detect_language", return_value="en").start()
+        self.addCleanup(patch.stopall)
         self.scorer = reward.L1Reward(embedder=FakeEmbedder(), tokenizer=fake_tokenizer())
         self.scorer.set_pools(["P0", "DP"], ["F0", "DF"])
 
     def score(self, output=None, finish_reason=None):
         text = answer(1) if output is None else json.dumps(output)
         return self.scorer(content(["P0"]), text, finish_reason, ["F0"])
+
+    def test_non_english_or_untagged_interests_allow_ten_tokens(self):
+        for language in ("zh-Hans", "es", "mix", None):
+            for label, violation in (("I0", "interest_name_too_long"), ("topic", "topic_too_long")):
+                for count in (7, 10, 11):
+                    with self.subTest(language=language, label=label, tokens=count):
+                        self.detect.return_value = language
+                        self.scorer.tokenizer = fake_tokenizer({label: count})
+                        result = self.score()
+                        self.assertEqual(result["rule_pass"], count <= 10)
+                        self.assertEqual(result["violations"], [] if count <= 10 else [violation])
+
+    def test_limit_is_per_interest_by_its_cited_actions(self):
+        self.detect.side_effect = lambda actions: "en" if actions == ["P0"] else "ja"
+        output = json.loads(topics_answer([[("english", [0])], [("japanese", [1])]]))
+        text = json.dumps(output)
+        self.scorer.tokenizer = fake_tokenizer({"english": 6, "japanese": 10})
+        self.assertTrue(self.scorer(content(["P0", "DP"]), text, None, ["F0"])["rule_pass"])
+        self.scorer.tokenizer = fake_tokenizer({"english": 7, "japanese": 10})
+        result = self.scorer(content(["P0", "DP"]), text, None, ["F0"])
+        self.assertEqual(result["violations"], ["topic_too_long"])
+        self.detect.assert_any_call(["P0"])
+        self.detect.assert_any_call(["DP"])
 
     def test_six_tokens_pass_and_seven_or_more_fail_for_each_field(self):
         for label, violation in (("I0", "interest_name_too_long"), ("topic", "topic_too_long")):
@@ -453,7 +532,8 @@ class TokenLimitRewardTest(unittest.TestCase):
         with patch.object(verl_reward, "_state", {"reward_fn": self.scorer, "batch_id": None}), \
                 patch.object(verl_reward, "load_pools", return_value=pools):
             result = verl_reward.compute_score("user_profile_l1", answer(1), ["F0"],
-                                              {"batch_id": "test", "content": content(["P0"])},
+                                              {"batch_id": "test", "content": content(["P0"]),
+                                               "past_freq": [1], "future_freq": [1]},
                                               "pools.parquet", tokenizer=self.scorer.tokenizer)
         self.assertEqual(result["score"], 0.0)
         self.assertEqual(result["rule_pass"], 0.0)
@@ -481,7 +561,8 @@ class TokenLimitRewardTest(unittest.TestCase):
 
         def score(_):
             return verl_reward.compute_score("user_profile_l1", answer(1), ["F0"],
-                                             {"batch_id": "test", "content": content(["P0"])},
+                                             {"batch_id": "test", "content": content(["P0"]),
+                                              "past_freq": [1], "future_freq": [1]},
                                              "pools.parquet", tokenizer=tokenizer)
 
         with patch.dict(sys.modules, {"torch": SimpleNamespace(set_num_threads=Mock()), "transformers": None}), \
@@ -658,16 +739,36 @@ class PoolPreparationTest(unittest.TestCase):
                 prepare_data.index_rows([root / name for name in files], 0)
 
     def test_past_pool_uses_only_visible_signals(self):
-        past = [{"date": "2026-10-03", "source": "Bing", "action": action} for action in ("P0", "P1")]
+        past = [{"date": "2026-10-03", "source": "Bing", "action": action, "action_freq": freq}
+                for action, freq in (("P0", 7), ("P1", 9))]
         row = {"user_id": "synthetic-user", "past_behaviors": past,
-               "future_behaviors": [{"date": "2026-10-10", "source": "Bing", "action": "F0"}]}
-        with patch.object(prepare_data.layer1, "fit_prompt", return_value=(past[:1], [1, 2])):
+               "future_behaviors": [{"date": "2026-10-10", "source": "Bing", "action": "F0", "action_freq": 3}]}
+        with patch.object(prepare_data.layer1, "fit_prompt", side_effect=lambda signals, encode: (signals[:1], [1, 2])):
             example = prepare_data.build_example(row, lambda text: [1], 10000)
         if example is None:
             raise AssertionError("The synthetic row should survive prompt preparation")
         self.assertEqual(example["extra_info"]["language"], "und")
+        # The reward's action weights: one frequency per visible signal (prompt order) and per ground-truth action.
+        self.assertEqual(example["extra_info"]["past_freq"], [7])
+        self.assertEqual(example["extra_info"]["future_freq"], [3])
+        self.assertNotIn("action_freq", example["extra_info"]["content"])
         pool = prepare_data.assign_batches([example], "train", 1)["train-000000"]
         self.assertEqual(pool, {"past_actions": ["P0"], "future_actions": ["F0"], "users": 1})
+        stale = {**row, "future_behaviors": [{"date": "2026-10-10", "source": "Bing", "action": "F0"}]}
+        with patch.object(prepare_data.layer1, "fit_prompt", side_effect=lambda signals, encode: (signals, [1])), \
+                self.assertRaisesRegex(ValueError, "no action_freq"):
+            prepare_data.build_example(stale, lambda text: [1], 10000)
+
+    def test_clean_behaviors_keeps_the_action_frequency(self):
+        long_action = "x" * 200
+        behaviors = [{"date": "2026-10-03", "source": "Bing", "action": "A", "action_freq": 5},
+                     {"date": "2026-10-04", "source": "Bing", "action": "A", "action_freq": 5},
+                     {"date": "2026-10-03", "source": "Bing", "action": long_action, "action_freq": 2},
+                     {"date": "2026-10-03", "source": "Bing", "action": long_action + "y", "action_freq": 9},
+                     {"date": "2026-10-03", "source": "Bing", "action": "B"}]
+        cleaned = {b["action"]: b["action_freq"] for b in rl_data.clean_behaviors("u", behaviors)}
+        # Raw actions truncated to the same text share the highest frequency; a missing one stays None.
+        self.assertEqual(cleaned, {"A": 5, "x" * 128: 9, "B": None})
 
     def test_batches_and_validation_pools(self):
         def row(past, future, language="en"):
@@ -721,6 +822,121 @@ class PoolPreparationTest(unittest.TestCase):
         self.assertEqual(pq.write_table.call_args_list[2].kwargs, {"row_group_size": 1})
 
 
+class EmbeddingClientTest(unittest.TestCase):
+    """Several embedding servers (one per GPU): requests split across them, rotate, and fail over. No torch: a stand-in
+    module whose tensors are lists."""
+
+    def setUp(self):
+        torch = ModuleType("torch")
+
+        class Rows(list):
+            def float(self):
+                return self
+
+        torch.tensor = Rows
+        torch.stack = list
+        nn, functional = ModuleType("torch.nn"), ModuleType("torch.nn.functional")
+        functional.normalize = lambda vectors, p, dim: [list(map(float, row)) for row in vectors]
+        torch.nn, nn.functional = nn, functional
+        modules = patch.dict(sys.modules, {"torch": torch, "torch.nn": nn, "torch.nn.functional": functional})
+        modules.start()
+        self.addCleanup(modules.stop)
+        self.requests = []  # (endpoint, number of texts)
+        self.down = set()
+
+        def urlopen(request, timeout):
+            texts = json.loads(request.data)["input"]
+            self.requests.append((request.full_url, len(texts)))
+            if request.full_url in self.down:
+                raise reward.urllib.error.URLError("down")
+            data = [{"index": i, "embedding": [len(text)]} for i, text in enumerate(texts)]
+            return io.BytesIO(json.dumps({"data": data}).encode())
+
+        opener = patch.object(reward.urllib.request, "urlopen", side_effect=urlopen)
+        opener.start()
+        self.addCleanup(opener.stop)
+        sleep = patch.object(reward.time, "sleep")
+        self.sleep = sleep.start()
+        self.addCleanup(sleep.stop)
+
+    def client(self, servers=4, batch_size=3):
+        client = reward.EmbeddingClient(",".join(f"http://node-4:{8100 + i}" for i in range(servers)), batch_size)
+        client.next_endpoint = 0
+        return client
+
+    def test_urls_are_comma_separated(self):
+        client = reward.EmbeddingClient(" http://a:1/ , http://b:2,", 8)
+        self.assertEqual(client.endpoints, ["http://a:1/v1/embeddings", "http://b:2/v1/embeddings"])
+        with self.assertRaisesRegex(ValueError, "No embedding server URL"):
+            reward.EmbeddingClient(" , ", 8)
+
+    def test_a_large_encode_is_split_across_every_server(self):
+        client = self.client()
+        texts = [f"text {'x' * index}" for index in range(10)]
+        vectors = client.encode(texts, query=False)
+        # ceil(10 / 4) = 3 texts per request (batch_size 3): 4 requests, one per server, answers in input order.
+        self.assertEqual(sorted(self.requests), sorted((f"http://node-4:{8100 + i}/v1/embeddings", n)
+                                                       for i, n in enumerate((3, 3, 3, 1))))
+        self.assertEqual(vectors, [[float(len(text))] for text in texts])
+        self.assertEqual(client.next_endpoint, 0)  # 4 requests: the next encode starts where the rotation left off
+        # Cached texts are not sent again.
+        client.encode(texts[:2], query=False)
+        self.assertEqual(len(self.requests), 4)
+
+    def test_small_encodes_rotate_over_the_servers(self):
+        client = self.client()
+        for index in range(5):
+            client.encode([f"query {index}"], query=True)
+        self.assertEqual([url for url, _ in self.requests],
+                         [f"http://node-4:{8100 + i % 4}/v1/embeddings" for i in range(5)])
+        # More texts than servers x batch_size: the requests keep cycling.
+        self.requests.clear()
+        client.encode([f"t{index}" for index in range(30)], query=False)
+        self.assertEqual(len(self.requests), 10)
+        self.assertTrue(all(n == 3 for _, n in self.requests))
+        self.assertEqual({url for url, _ in self.requests}, {f"http://node-4:{8100 + i}/v1/embeddings" for i in range(4)})
+
+    def test_a_failed_request_moves_to_the_next_server(self):
+        client = self.client()
+        self.down = {"http://node-4:8100/v1/embeddings"}
+        self.assertEqual(client.encode(["abc"], query=False), [[3.0]])
+        self.assertEqual([url for url, _ in self.requests],
+                         ["http://node-4:8100/v1/embeddings", "http://node-4:8101/v1/embeddings"])
+        self.sleep.assert_not_called()  # another server was live: no back-off
+        # The failed server is skipped while it cools down: the next encode spreads over the 3 others.
+        self.requests.clear()
+        client.encode([f"t{index}" for index in range(9)], query=False)
+        self.assertEqual(sorted(self.requests), [(f"http://node-4:{port}/v1/embeddings", 3) for port in (8101, 8102, 8103)])
+        # After the cool-down it takes its share again.
+        client.down_until[0] = 0.0
+        self.requests.clear()
+        self.down = set()
+        client.encode([f"u{index}" for index in range(8)], query=False)
+        self.assertEqual(len({url for url, _ in self.requests}), 4)
+
+    def test_every_server_down_backs_off_then_fails(self):
+        self.down = {f"http://node-4:{8100 + i}/v1/embeddings" for i in range(4)}
+        client = self.client()
+        with self.assertRaises(reward.urllib.error.URLError):
+            client.encode(["never"], query=False)
+        # A back-off only after each round over the 4 servers: 9 rounds, 8 back-offs (1, 2, 4, ..., 60 s).
+        self.assertEqual(len(self.requests), 4 + 8)
+        self.assertEqual([c.args[0] for c in self.sleep.call_args_list], [1, 2, 4, 8, 16, 32, 60, 60])
+
+    def test_one_server_retries_as_before(self):
+        self.down = {"http://node-4:8100/v1/embeddings"}
+        client = self.client(servers=1)
+        with self.assertRaises(reward.urllib.error.URLError):
+            client.encode(["never"], query=False)
+        self.assertEqual(len(self.requests), 9)
+        self.assertEqual(self.sleep.call_count, 8)
+
+    def test_one_server_still_works(self):
+        client = reward.EmbeddingClient("http://node-4:8100", 2)
+        self.assertEqual(client.encode(["a", "bb", "ccc"], query=False), [[1.0], [2.0], [3.0]])
+        self.assertEqual(self.requests, [("http://node-4:8100/v1/embeddings", 2), ("http://node-4:8100/v1/embeddings", 1)])
+
+
 class CaseStudyTest(unittest.TestCase):
     def test_score_requires_generation_checkpoint(self):
         from case_study import layer1_sampling
@@ -738,9 +954,9 @@ class CaseStudyTest(unittest.TestCase):
 
         with TemporaryDirectory() as directory:
             root = Path(directory)
-            signals = [{"date": "2026-10-03", "source": "Bing", "action": "P0"}]
+            signals = [{"date": "2026-10-03", "source": "Bing", "action": "P0", "action_freq": 1}]
             row = {"prompt_id": 0, "user_id": "synthetic", "content": content(["P0"]), "signals": signals,
-                   "future": [{"date": "2026-10-10", "source": "Bing", "action": "F0"}],
+                   "future": [{"date": "2026-10-10", "source": "Bing", "action": "F0", "action_freq": 1}],
                    "prompt_tokens": 2, "signals_dropped": 0,
                    "samples": [{"text": answer(1), "finish_reason": "stop"},
                                {"text": "not JSON", "finish_reason": "stop"}]}
@@ -765,6 +981,31 @@ class CaseStudyTest(unittest.TestCase):
             self.assertEqual(summary["metrics"]["future_retrieval"]["mean"], 0.5)
             self.assertNotIn("future_recall@1", summary["metrics"])
             self.assertIn("past_owners", (root / "report.html").read_text())
+
+    def test_from_val_attaches_action_frequencies(self):
+        import pyarrow as pa
+        import pyarrow.parquet as pq
+
+        from case_study import layer1_sampling
+
+        extra = {"index": 0, "user_id": "u0", "content": content(["P0", "P1"]), "prompt_tokens": 2,
+                 "signals_dropped": 0, "future": [{"date": "2026-10-10", "source": "Bing", "action": "F0"}],
+                 "past_freq": [7, 9], "future_freq": [3]}
+        with TemporaryDirectory() as directory:
+            root = Path(directory)
+            pq.write_table(pa.Table.from_pylist([{"extra_info": extra, "reward_model": {"ground_truth": ["F0"]}}]),
+                           root / "val.parquet")
+            (root / "0.jsonl").write_text(json.dumps({"input": "chat " + extra["content"], "output": answer(1),
+                                                      "step": 0}) + "\n")
+            args = argparse.Namespace(val_data=root / "val.parquet", dump=root / "0.jsonl", output_dir=root / "out",
+                                      temperature=1.0, top_p=1.0)
+            with patch("builtins.print"):
+                layer1_sampling.from_val(args)
+            row = json.loads((root / "out" / "rollouts.jsonl").read_text())
+        self.assertEqual(layer1_sampling.action_freqs(row), ([7, 9], [3]))
+        self.assertEqual([s["action"] for s in row["signals"]], ["P0", "P1"])
+        with self.assertRaisesRegex(SystemExit, "predates the reward's action weights"):
+            layer1_sampling.action_freqs({**row, "future": [{"action": "F0"}]})
 
     def test_trend_reads_old_and_new_dumps(self):
         from case_study import layer1_sampling

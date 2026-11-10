@@ -26,8 +26,10 @@ GRPO/
 ## Reward
 
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, any `interest_name` or
-`topic` with **7 or more tokens**, cut at the response length), else the mean of two signals, each in [0, 1].
-The label-length rule uses the **generation checkpoint's tokenizer**, with `add_special_tokens=False`, not the
+`topic` over its label token limit, cut at the response length), else the mean of two signals, each in [0, 1].
+The limit is per interest, by the language of the actions its topics cite (`user_profile_rules.detect_language`, the
+language rule's anchor): **at most 6 tokens** when English, **at most 10 tokens** otherwise (including mixed or
+untagged). It uses the **generation checkpoint's tokenizer**, with `add_special_tokens=False`, not the
 embedding tokenizer. Every name and every topic is checked. A violation sets `rule_pass=False` and the entire
 rollout's reward to 0 (`interest_name_too_long` / `topic_too_long`); retrieval diagnostics remain available for
 JSON-valid answers. `actual_activity` is not subject to this token limit. The vendored reward loader passes each
@@ -36,20 +38,30 @@ resolution). The scorer keeps one private copy per process, isolated from concur
 reload the checkpoint or multimodal processor. Sync `verl/trainer/ppo/reward.py` together with the L1 reward code on
 every Ray node.
 
-Both signals use the same Qwen3-Embedding-8B queries, one per topic written: `<interest name>: <topic>`.
+Both signals use the same Qwen3-Embedding-8B queries, one per topic written: `<interest name>: <topic>`, and weigh
+every action by how informative it is, from its global frequency (`action_freq` of the RL data, the occurrences of
+the normalized action text over the corpus): **weight = 1 / (1 + action_freq / 100)** (`ACTION_FREQ_HALF_WEIGHT`).
+A long-tail action weighs about 1, an action seen 100 times 0.5, 1,000 times 0.09, and `whatsapp web` (110,703)
+0.001. 100 is where the corpus turns from tools, portals and login pages to actual interests. Without the weights,
+ubiquitous actions were free credit: the next-week pool holds each text once, so a topic named after a messenger
+retrieves the user's next-week messenger action at rank 1, and citing such actions filled the coverage target.
 
 - `past_assignment` (within the user): each visible input action is owned by its most similar topic (a tie counts if
-  a citing topic is among the tied); the actions owned by a topic citing them, divided by the larger of the number
-  of actions cited and 0.7 of the visible actions (`PAST_COVERAGE_TARGET`). It compares the user's own topics only,
+  a citing topic is among the tied); the weight of the actions owned by a topic citing them, divided by the larger
+  of the weight of the actions cited and 0.7 of the weight of the visible actions (`PAST_COVERAGE_TARGET`). It
+  compares the user's own topics only,
   never other users' actions, so a word shared by every label (a place, a language) does not help; an action left
   uncited, cited by a topic that does not own it, or owned by a more similar sibling topic earns nothing. Ownership
-  is exact to the topic, not just the interest. Below 0.7 of the actions, citing fewer costs; above it only
+  is exact to the topic, not just the interest. Below 0.7 of the weight, citing less costs; above it only
   correctness counts, so skipping noise is free and a wrong citation always costs (the V35 GPT-5.6 labels cite 0.78
-  of the input actions on average, 0.67 at P25).
+  of the input actions on average, 0.67 at P25, unweighted).
 - `future_retrieval` (across the batch): every next-week action of every batch user (64 by default) is scored by its
   most similar topic of this answer; other users' answers play no part, their next-week actions are the
-  distractors. Of the top B, B being the number of this user's distinct next-week actions, the share that are this
-  user's (retrieving B actions for B targets, recall equals precision).
+  distractors. Of the top B, B being the number of this user's distinct next-week actions, the weight of this
+  user's actions over the weight of all of this user's next-week actions.
+
+`past_assignment_unweighted` and `future_retrieval_unweighted` (every weight 1) are logged next to them as
+diagnostics, to tell how much of a change comes from ubiquitous actions.
 
 The two check each other. One topic citing everything owns every visible action (`past_assignment` 1), but ranks
 next week in one direction only, so it misses a user whose interests vary (and rightly keeps a user with one stable
@@ -89,13 +101,24 @@ of its own:
 | --- | --- | --- |
 | One 8-GPU node (default) | `bash run_l1_grpo.sh` | GPUs 0-6 (GPU 7 serves the embeddings; stopped when the launcher exits) |
 | Two nodes | `EMBEDDING_NODE=node-1 bash run_l1_grpo.sh` | all 8 of this node (GPU 0 of node-1 serves, left running) |
-| A server already running | `EMBEDDING_URL=http://<host>:8100 bash run_l1_grpo.sh` | all |
+| A whole embedding node | `EMBEDDING_NODE=node-4 EMBEDDING_GPUS=0,1,2,3,4,5,6,7 bash run_l1_grpo.sh` | all (8 servers on node-4, ports 8100-8107) |
+| Servers already running | `EMBEDDING_URL=http://<host>:8100[,http://<host>:8101,...] bash run_l1_grpo.sh` | all |
 
-`serve_embedding.sh [node]` starts the server (detached: `setsid nohup`, so it survives the shell or ssh session;
-bound to `0.0.0.0` on another node, `127.0.0.1` here), or reuses one already answering, and waits for `/health`
-(loading and CUDA-graph capture take 1-3 minutes); `serve_embedding.sh stop [node]` stops it. Another node needs
-passwordless ssh, `vllm`, and the model path (the `/yufan` blob) mounted, not this code; its log is
-`/tmp/l1_embedding/embedding_server.log` there.
+`serve_embedding.sh [node]` starts one server per GPU of `EMBEDDING_GPUS` (default one GPU: `EMBEDDING_GPU`, 0 on
+another node, the last visible GPU here), the i-th on port 8100 + i (detached: `setsid nohup`, so they survive the
+shell or ssh session; bound to `0.0.0.0` on another node, `127.0.0.1` here), reuses the ones already answering and
+restarts the others, waits for every `/health` (loading and CUDA-graph capture take 1-3 minutes, in parallel), and
+prints the URLs comma-separated; `serve_embedding.sh stop [node]` stops them all. Another node needs
+passwordless ssh, `vllm`, and the model path (the `/yufan` blob) mounted, not this code; the logs are
+`/tmp/l1_embedding/embedding_server_<port>.log` there.
+
+The reward spreads its embedding requests over every URL of `EMBEDDING_URL`: the texts of one encode (a batch's
+candidate pools, tens of thousands of actions, re-embedded by each reward worker when the batch changes) go out as one
+request per server at once, small encodes (an answer's topic queries) rotate over the servers, and a server that
+fails a request is skipped for 30 s (`ENDPOINT_COOLDOWN`) while the others take its share. The reward workers are
+spread over the Ray nodes (node-0..3), so every node's workers use every server. `REWARD_NUM_WORKERS` (8) sets their
+number; each one re-embeds the batch pools, so more workers add embedding work and only pay off when the CPU part of
+the reward (rules, fastText, ranking) is the bottleneck.
 
 Credentials (key files hold the key on their first line, are git-ignored, and may sit in `UU_LLM/` or in the
 directory above it, e.g. the job directory `UU_LLM` was copied into):
@@ -116,11 +139,11 @@ nohup bash run_l1_grpo.sh > l1_grpo_launch.out 2>&1 &
 NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_grpo_smoke bash run_l1_grpo.sh trainer.total_training_steps=5
 ```
 
-The launcher builds the data once per `DATA_DIR` (default `outputs/data/l1v1_seed<SEED>_batch<TRAIN_BATCH_SIZE>_prompt<MAX_PROMPT_LENGTH>_pools_v4`;
+The launcher builds the data once per `DATA_DIR` (default `outputs/data/l1v1_seed<SEED>_batch<TRAIN_BATCH_SIZE>_prompt<MAX_PROMPT_LENGTH>_pools_v5`;
 all 197,269 training rows take minutes with one process per CPU core, up to 32, and print their progress;
 `NUM_TRAIN_BATCHES=2` takes seconds) and refuses a `DATA_DIR` prepared from another dataset (`meta.json`
 `dataset` must be `yufan/user_profile_dataset/RL_User_Profile_Layer1_V1`), cut for another batch size or using an
-older pool format (mixed-language batches). Explicit old cache paths must be replaced with a new directory and regenerated.
+older pool format (mixed-language batches, or no `past_freq` / `future_freq` for the action weights). Explicit old cache paths must be replaced with a new directory and regenerated.
 Use a new `EXPERIMENT_NAME` when starting this objective from SFT; the same output directory would resume
 its previous checkpoint automatically.
 With replay enabled, its separate preparation downloads the seven V3 SFT training sets once and tokenizes
@@ -142,7 +165,7 @@ script.
 | Update | one PPO epoch over one mini-batch; add 0.1 times SFT replay NLL before the same optimizer step |
 | Actor | FSDP2, packed sequences, dynamic batch (49152 tokens per GPU), fused log-prob kernels, gradient checkpointing |
 | Rollout | vLLM, TP 1, colocated (asleep while the actor trains; 0.75 of GPU memory), prefix caching with the 16 answers of a prompt on one replica, the inference chat template without thinking |
-| Reward embeddings | Qwen3-Embedding-8B, vLLM server on a GPU of its own (this node's last, or `EMBEDDING_NODE`'s GPU 0) |
+| Reward embeddings | Qwen3-Embedding-8B, vLLM servers on GPUs of their own (this node's last, or `EMBEDDING_NODE`'s `EMBEDDING_GPUS`, one server per GPU) |
 | Validation | before training and every 100 steps: 64 held-out users x 16 answers at temperature 1.0 |
 | Checkpoints | every 100 steps, with a Hugging Face copy |
 
@@ -228,14 +251,15 @@ NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_r
 
 ## Following the reward
 
-Every validation logs only the mean over all validation answers of eleven signals (W&B / console, set by
+Every validation logs only the mean over all validation answers of thirteen signals (W&B / console, set by
 `trainer.val_core_metrics` in the launcher): `val-core/user_profile_l1/<signal>` for `reward`, `n_interests`,
-`coverage` (diagnostic only), `past_assignment`, `future_retrieval`, `json_valid`,
+`coverage` (diagnostic only), `past_assignment`, `future_retrieval`, their diagnostic
+`past_assignment_unweighted` / `future_retrieval_unweighted`, `json_valid`,
 `rule_pass`, and the diagnostic answer shape: `topics_per_interest`, `evidence_per_topic` (distinct idx),
-`interest_name_tokens` and `topic_tokens` (generation-tokenizer tokens, as the 6-token label limit counts them),
+`interest_name_tokens` and `topic_tokens` (generation-tokenizer tokens, as the label token limit counts them),
 each first averaged within an answer, over every interest and topic written, and skipped for answers without any.
 Step 0 is the starting checkpoint, scored like `case_study/` scores it.
-Each training step logs the same eleven means over its rollouts
+Each training step logs the same thirteen means over its rollouts
 (`trainer.train_core_metrics`): `train-core/user_profile_l1/<signal>`,
 `reward` being `critic/score/mean`;
 the `training/`, `num_turns/`, `timing_s/`, `timing_per_token_ms/` and `prompt_length/` metrics are not logged
@@ -263,7 +287,8 @@ current reward (`score` needs Qwen3-Embedding-8B: `--embedding_url` of a running
 
 A run launched again resumes from its latest `global_step_<N>` (`trainer.resume_mode=auto`). Crashed Ray workers can
 keep GPU memory, so run `ray stop --force` first (`nvidia-smi` should then show the GPUs empty). `watchdog.sh` does
-this unattended: every minute it restarts the embedding server on `EMBEDDING_NODE` when `/health` fails, relaunches
+this unattended: every minute it restarts the embedding servers on `EMBEDDING_NODE` (each GPU of `EMBEDDING_GPUS`)
+when a `/health` fails, relaunches
 `run_l1_grpo.sh` (after `ray stop --force`) when neither it nor `verl.trainer.main_ppo` has run for two checks, and
 exits when `train.log` shows `Training Progress: 100%`. It takes the launcher's environment and arguments, launches
 the run itself if it is not running, and is single-instance (a lock on `outputs/watchdog.lock`).
@@ -292,7 +317,9 @@ shows progress.
 `RL_User_Profile_Layer1_V1` (folder `User_Profile_Layer1_For_RL_V1`, Parquet) of `yufan/user_profile_dataset` has
 two splits with disjoint users, one row per user: `train` (197,269 rows in 40 shards) and `test` (1,976 rows).
 A row is `{"user_id", "past_behaviors", "future_behaviors", "language"}`, behaviors `{"date", "source", "action",
-"action_idx", "action_freq"}` (`action_idx` / `action_freq` are not used; `language` sets the batches): one history window of the
+"action_idx", "action_freq"}` (`action_idx` is not used; `action_freq`, the corpus occurrences of the normalized
+action text, weighs the action in the reward and goes to `extra_info` `past_freq` / `future_freq`; `language` sets
+the batches): one history window of the
 user and the actions after it (at least 10).
 `l1/prepare_data.py` builds one prompt per user exactly as the inference and the case study do
 (`load_users` + `dedupe`, `layer1.fit_prompt` / `build_message`) and takes the rows in the seeded random order of

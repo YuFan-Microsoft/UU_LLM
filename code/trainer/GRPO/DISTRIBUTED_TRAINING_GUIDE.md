@@ -469,6 +469,23 @@ curl -f http://node-2:8100/v1/embeddings \
 
 实际向量维度为 2560。`/health` 成功不代表 model 名称正确，因此还要实际请求 `/v1/embeddings`。跨节点必须绑定 `0.0.0.0`，不能只监听 `127.0.0.1`。
 
+### 9.1 整个节点做 embedding：每张卡一个服务
+
+如果有一个专门做 embedding 的 8 卡节点（例如 node-0..3 跑 RL、node-4 只做 embedding），在每张卡上各起一个服务，reward 会把请求分摊到全部服务上：
+
+```bash
+# 在训练启动节点执行：通过 ssh 在 node-4 上起 8 个服务（GPU i -> 端口 8100+i），最后一行打印逗号分隔的 URL
+EMBEDDING_GPUS=0,1,2,3,4,5,6,7 bash serve_embedding.sh node-4
+# 训练时把全部 URL 传给 reward（或直接 EMBEDDING_NODE=node-4 EMBEDDING_GPUS=0,...,7，由 launcher 自动起）
+export EMBEDDING_URL=$(printf 'http://node-4:%s,' $(seq 8100 8107)); export EMBEDDING_URL=${EMBEDDING_URL%,}
+for p in $(seq 8100 8107); do curl -sf http://node-4:$p/health > /dev/null || echo "port $p down"; done
+```
+
+- 一次 encode 的文本（例如批次切换时的候选池）会切成每个服务一份，同时发出；小请求（每条回答的 topic query）在服务之间轮转；某个服务失败后 30 秒内会被跳过，由其余服务分担。reward worker 由 Ray 平均分布在 node-0..3 上，每个 worker 都会用到全部 8 个服务。
+- 启动时先起第一个服务（编译并写入该节点的 vLLM 编译缓存），健康后再同时起其余 7 个。
+- 日志在 node-4 的 `/tmp/l1_embedding/embedding_server_<port>.log`；`bash serve_embedding.sh stop node-4` 全部停止；重新执行启动命令会复用健康的服务、只重启挂掉的。
+- `REWARD_NUM_WORKERS`（默认 8）控制 verl 的 reward worker 数。每个 worker 都会重新 embed 整个批次的候选池，所以加 worker 会增加 embedding 总量，只有 reward 的 CPU 部分（规则、fastText、排序）成为瓶颈时才值得调大。
+
 若旧服务占用 node-1 GPU 0，必须先确认新服务可用，再精确停止属于本任务的旧服务，验证 node-1 八卡均释放。不要杀不明进程。
 
 ## 10. 两节点 Ray 与通信环境
@@ -544,7 +561,7 @@ PY
 cd "$GRPO_DIR"
 export NNODES=2
 export TRAIN_GPUS=0,1,2,3,4,5,6,7
-export EMBEDDING_URL=http://node-2:8100
+export EMBEDDING_URL=http://node-2:8100   # 多个服务用逗号分隔，见 9.1
 export SFT_REPLAY=1 SFT_REPLAY_COEF=0.1
 export TRAIN_BATCH_SIZE=64 N=16 VAL_N=16 NUM_VAL=64 NUM_TRAIN_BATCHES=0
 export SFT_EVAL_SAMPLES=500 SFT_MAX_SEQ_LENGTH=25600

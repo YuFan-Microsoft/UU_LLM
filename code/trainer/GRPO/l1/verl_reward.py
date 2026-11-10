@@ -5,6 +5,8 @@ The reward itself is l1_reward.L1Reward; this file only feeds it what verl passe
     solution_str                  the decoded answer
     ground_truth                  the user's next-week actions
     extra_info["content"]         the Layer-1 user message (the rule checks need the input signals)
+    extra_info["past_freq"]       action_freq of each input signal and of each ground_truth action: the reward's
+    extra_info["future_freq"]     action weights (prepare_data.py)
     extra_info["batch_id"]        the pool of the row: its fixed single-language training batch, or "val-<language>"
                                   (prepare_data.py)
     tokenizer                    this reward worker's already-localized generation tokenizer
@@ -17,8 +19,9 @@ the validation rows are grouped by language, so a worker switches pools once per
 One L1Reward per worker process. The vendored reward loader injects the generation tokenizer already loaded by
 that worker (respecting model.tokenizer_path and copy_to_local). A private copy avoids sharing mutable tokenizer
 state with the reward manager's concurrent response decoding; no checkpoint/processor is loaded again.
-Its embeddings come from the vLLM embedding server at reward_kwargs.embedding_url
-(Qwen3-Embedding-8B on a GPU of its own, started by run_l1_grpo.sh), else from reward_kwargs.embedding_model in the
+Its embeddings come from the vLLM embedding servers at reward_kwargs.embedding_url (comma-separated; Qwen3-Embedding-8B,
+one per GPU of its own, started by run_l1_grpo.sh / serve_embedding.sh; the requests spread over them), else from
+reward_kwargs.embedding_model in the
 worker on the CPU; L1_REWARD_NUM_THREADS (default 8) torch threads rank them (Ray starts actors with a single OpenMP
 thread). verl may score several answers of a worker at once in threads, so they take turns. A cut answer is judged on its text only (verl does not pass the finish reason): it is not valid JSON.
 """
@@ -76,7 +79,8 @@ def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict
         if batch_id != _state["batch_id"]:
             scorer.set_pools(**load_pools(pool_file, batch_id))
             _state["batch_id"] = batch_id
-        result = scorer(extra_info["content"], solution_str, None, [str(action) for action in ground_truth])
+        result = scorer(extra_info["content"], solution_str, None, [str(action) for action in ground_truth],
+                        extra_info["past_freq"], extra_info["future_freq"])
     return {"score": float(result["reward"]), "json_valid": float(result["json_valid"]),
             "rule_pass": float(result["rule_pass"]), "n_interests": float(result["n_interests"]),
             **{name: float(result[name]) for name in SIGNALS},

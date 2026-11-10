@@ -1,7 +1,8 @@
 #!/bin/bash
 # ============================================================================
 # Watchdog of a Layer-1 GRPO run (run_l1_grpo.sh). Every WATCHDOG_INTERVAL (60) seconds:
-#   - EMBEDDING_NODE set: when the embedding server there does not answer /health, restart it (serve_embedding.sh);
+#   - EMBEDDING_NODE set: when an embedding server there (one per GPU of EMBEDDING_GPUS) does not answer /health,
+#     restart it (serve_embedding.sh, which reuses the ones that answer);
 #   - when neither run_l1_grpo.sh nor verl.trainer.main_ppo has been running for 2 checks in a row, or neither its
 #     train.log nor launch.log changed for WATCHDOG_STALE_MINUTES (40; a hung run, stopped first): `ray stop
 #     --force` (crashed Ray workers can still hold GPUs), then launch run_l1_grpo.sh again with the same environment and
@@ -14,6 +15,7 @@
 #
 # Usage: the environment and arguments of run_l1_grpo.sh, e.g.
 #   EMBEDDING_NODE=node-1 TEST_FREQ=50 SAVE_FREQ=50 setsid nohup bash watchdog.sh > /dev/null 2>&1 < /dev/null &
+#   EMBEDDING_NODE=node-4 EMBEDDING_GPUS=0,1,2,3,4,5,6,7 ... bash watchdog.sh ...   # 8 servers on node-4
 #   tail -f outputs/watchdog.log          # launches append to outputs/<EXPERIMENT_NAME>/launch.log
 # ============================================================================
 set -uo pipefail
@@ -72,9 +74,18 @@ while true; do
     log "training finished; watchdog exits"
     exit 0
   fi
-  if [ -n "${EMBEDDING_NODE:-}" ] && ! curl -sf "http://$EMBEDDING_NODE:${EMBEDDING_PORT:-8100}/health" > /dev/null; then
-    log "embedding server on $EMBEDDING_NODE down; restarting it"
-    bash "$HERE/serve_embedding.sh" "$EMBEDDING_NODE" >> "$LOG" 2>&1 || log "embedding server restart failed"
+  if [ -n "${EMBEDDING_NODE:-}" ]; then
+    # One server per GPU of EMBEDDING_GPUS (default one), on consecutive ports from EMBEDDING_PORT.
+    IFS=, read -r -a EMBEDDING_GPU_LIST <<< "${EMBEDDING_GPUS:-${EMBEDDING_GPU:-0}}"
+    DOWN=""
+    for i in "${!EMBEDDING_GPU_LIST[@]}"; do
+      port=$((${EMBEDDING_PORT:-8100} + i))
+      curl -sf "http://$EMBEDDING_NODE:$port/health" > /dev/null || DOWN="$DOWN $port"
+    done
+    if [ -n "$DOWN" ]; then
+      log "embedding server(s) on $EMBEDDING_NODE down (port(s)$DOWN); restarting them"
+      bash "$HERE/serve_embedding.sh" "$EMBEDDING_NODE" >> "$LOG" 2>&1 || log "embedding server restart failed"
+    fi
   fi
   if running && stale; then
     log "train.log and launch.log unchanged for $STALE_MINUTES minutes: stopping the hung run"

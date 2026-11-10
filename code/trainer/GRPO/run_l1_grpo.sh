@@ -7,8 +7,10 @@
 # SFT_REPLAY=0 disables replay and extra SFT evaluation.
 # Reward: mean of past_assignment (visible actions owned by the topic citing them, within the user, over the
 # larger of the actions cited and 0.7 of them) and future_retrieval (of the batch next-week actions, the top B by
-# the most similar topic, B = the user's next-week actions: the share that are the user's); coverage is diagnostic.
-# Embeddings: EMBEDDING_URL / EMBEDDING_NODE; otherwise the last local GPU.
+# the most similar topic, B = the user's next-week actions: the share that are the user's), every action weighted by
+# 1 / (1 + action_freq / 100) so ubiquitous actions count ~0; coverage and the unweighted signals are diagnostic.
+# Embeddings: EMBEDDING_URL (one server or several, comma-separated) / EMBEDDING_NODE (+ EMBEDDING_GPUS for one server
+# per GPU there); otherwise the last local GPU.
 # See README.md for configuration, metrics and resume behavior.
 set -euo pipefail
 
@@ -51,7 +53,7 @@ if [ "$PPO_MAX_TOKEN_LEN_PER_GPU" -lt $((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH
        "($((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH)))" >&2
   exit 1
 fi
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${TRAIN_BATCH_SIZE}_prompt${MAX_PROMPT_LENGTH}_pools_v4}
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${TRAIN_BATCH_SIZE}_prompt${MAX_PROMPT_LENGTH}_pools_v5}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
@@ -89,8 +91,8 @@ if meta.get("dataset") != DATASET:
     sys.exit(f"{sys.argv[1]}: prepared from {meta.get('dataset', 'an older RL dataset')}, not {DATASET}; "
              "use another DATA_DIR and regenerate the data")
 if meta.get("pool_format_version") != POOL_FORMAT_VERSION:
-    sys.exit(f"{sys.argv[1]}: expected single-language dual past/future pools (format {POOL_FORMAT_VERSION}); "
-             "use another DATA_DIR and regenerate the data")
+    sys.exit(f"{sys.argv[1]}: expected single-language dual past/future pools with action frequencies "
+             f"(format {POOL_FORMAT_VERSION}); use another DATA_DIR and regenerate the data")
 if meta["batch_size"] != int(sys.argv[2]) or meta["max_prompt_length"] > int(sys.argv[3]):
     sys.exit(f"{sys.argv[1]}: batch_size {meta['batch_size']} / max_prompt_length {meta['max_prompt_length']} do not "
              f"match TRAIN_BATCH_SIZE {sys.argv[2]} / MAX_PROMPT_LENGTH {sys.argv[3]}; use another DATA_DIR")
@@ -144,9 +146,9 @@ elif [ -n "${EMBEDDING_NODE:-}" ]; then
   EMBEDDING_URL=$(EMBEDDING_MODEL="$EMBEDDING_MODEL" EMBEDDING_GPU="${EMBEDDING_GPU:-0}" \
                   bash "$HERE/serve_embedding.sh" "$EMBEDDING_NODE" | tail -n 1)
 else
-  EMBEDDING_GPU=${EMBEDDING_GPU:-${ALL_GPUS##*,}}
-  TRAIN_GPUS=${TRAIN_GPUS:-$(echo "$ALL_GPUS" | tr ',' '\n' | grep -vx "$EMBEDDING_GPU" | paste -sd, -)}
-  export EMBEDDING_MODEL EMBEDDING_GPU EMBEDDING_LOG="$OUTPUT_DIR/embedding_server.log"
+  EMBEDDING_GPUS=${EMBEDDING_GPUS:-${EMBEDDING_GPU:-${ALL_GPUS##*,}}}
+  TRAIN_GPUS=${TRAIN_GPUS:-$(echo "$ALL_GPUS" | tr ',' '\n' | grep -vxF -f <(echo "$EMBEDDING_GPUS" | tr ',' '\n') | paste -sd, -)}
+  export EMBEDDING_MODEL EMBEDDING_GPUS EMBEDDING_LOG="$OUTPUT_DIR/embedding_server.log"
   trap 'bash "$HERE/serve_embedding.sh" stop || true' EXIT
   EMBEDDING_URL=$(bash "$HERE/serve_embedding.sh" | tail -n 1)
 fi
@@ -235,11 +237,11 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     actor_rollout_ref.rollout.val_kwargs.do_sample=True \
     actor_rollout_ref.rollout.val_kwargs.temperature=1.0 \
     actor_rollout_ref.rollout.val_kwargs.top_p=1.0 \
-    reward.num_workers=8 \
+    reward.num_workers="${REWARD_NUM_WORKERS:-8}" \
     reward.custom_reward_function.path="$HERE/l1/verl_reward.py" \
     reward.custom_reward_function.name=compute_score \
     +reward.custom_reward_function.reward_kwargs.pool_file="$DATA_DIR/pools.parquet" \
-    +reward.custom_reward_function.reward_kwargs.embedding_url="$EMBEDDING_URL" \
+    +reward.custom_reward_function.reward_kwargs.embedding_url="'$EMBEDDING_URL'" \
     +reward.custom_reward_function.reward_kwargs.embedding_model="$EMBEDDING_MODEL" \
     trainer.critic_warmup=0 \
     +trainer.skip_on_policy_old_log_prob=True \
@@ -254,8 +256,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.save_freq="${SAVE_FREQ:-100}" \
     trainer.test_freq="${TEST_FREQ:-100}" \
     trainer.validation_data_dir="$OUTPUT_DIR/validation" \
-    +trainer.val_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','json_valid','rule_pass','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens']" \
-    +trainer.train_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','json_valid','rule_pass','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens']" \
+    +trainer.val_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens']" \
+    +trainer.train_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens']" \
     +trainer.drop_metric_prefixes="['training/','num_turns/','timing_s/','timing_per_token_ms/','prompt_length/']" \
     trainer.total_epochs=1 \
     "${SFT_ARGS[@]}" \

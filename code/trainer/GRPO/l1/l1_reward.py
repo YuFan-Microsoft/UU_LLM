@@ -1,16 +1,26 @@
 """Layer-1 GRPO reward: the single definition, used by the GRPO trainer (verl_reward.py) and the case study.
 
 The reward of one answer: 0 if it breaks the Layer-1 rules (not V3 JSON, a user_profile_rules violation such as a
-duplicate interest / topic, bad evidence or the wrong language, any interest_name or topic with 7 or more generation
-tokenizer tokens (no special tokens), or cut at max_tokens), else the mean of two signals, each in [0, 1]. Both use
-the same queries, one per topic written: "<interest name>: <topic>" (topic_query).
+duplicate interest / topic, bad evidence or the wrong language, any interest_name or topic over its label token limit
+in generation tokenizer tokens (no special tokens): 6 when the interest's cited actions are English, else 10; or cut
+at max_tokens), else the mean of two signals, each in [0, 1]. Both use
+the same queries, one per topic written: "<interest name>: <topic>" (topic_query), and both weigh every action by
+how informative it is, from its global frequency (action_freq of the RL data, the occurrences of its normalized text
+over the whole corpus): action_weight = 1 / (1 + action_freq / ACTION_FREQ_HALF_WEIGHT), so a long-tail action counts
+about 1 and a ubiquitous one (a messenger, an AI assistant, a browser start page) about 0; a known action_freq of 100
+counts half. Without frequencies every action weighs 1.
     past_assignment     within the user: each visible input action is owned by its most similar topic (a tie counts
-                        if a citing topic is among the tied); the actions owned by a topic citing them, divided by
-                        the larger of the number of actions cited and PAST_COVERAGE_TARGET (0.7) of the visible
-                        actions
+                        if a citing topic is among the tied); the weight of the actions owned by a topic citing them,
+                        divided by the larger of the weight of the actions cited and PAST_COVERAGE_TARGET (0.7) of the
+                        weight of the visible actions
     future_retrieval    across the batch: every next-week action of every batch user is scored by its most similar
                         topic of this answer (other users' answers play no part); of the top B, B being the number of
-                        this user's distinct next-week actions, the share that are this user's (recall = precision)
+                        this user's distinct next-week actions, the weight of this user's actions over the weight of
+                        all of them
+The weights take away what ubiquitous actions gave for free: the next-week pool holds each text once, so a topic
+named after a messenger retrieves the user's next-week messenger action at rank 1, and citing such actions filled the
+coverage target. They earn and cost (almost) nothing now; past_assignment_unweighted and future_retrieval_unweighted
+(every weight 1) are logged as diagnostics.
 past_assignment compares the user's own topics only, never other users' actions: a word shared by every label (a
 place, a language) does not help, and only correct citations earn: an action left uncited, cited by a topic that
 does not own it, or owned by a more similar sibling topic earns nothing. Below the coverage target, citing fewer
@@ -25,14 +35,16 @@ So is the answer's shape (STRUCTURE_SIGNALS, every interest and topic written): 
 evidence per topic, and generation-tokenizer tokens per interest_name and per topic.
 This batch's visible past actions are embedded once per batch (set_pools), so past_assignment reuses them, and its
 next-week actions are the future pool. Query embeddings and repeated action embeddings are shared.
-The embeddings are Qwen3-Embedding-8B's, computed in process (Embedder) or by a vLLM
-embedding server (EmbeddingClient, `vllm serve <model> --runner pooling`; GRPO runs it on a GPU of its own) on the
-same texts.
+The embeddings are Qwen3-Embedding-8B's, computed in process (Embedder) or by vLLM
+embedding servers (EmbeddingClient, `vllm serve <model> --runner pooling`; GRPO runs one per GPU of its own, the
+requests spread over them) on the same texts.
 
     reward_fn = L1Reward(tokenizer=tokenizer)  # generation checkpoint's tokenizer, not the embedding tokenizer
     reward_fn = L1Reward(tokenizer=tokenizer, embedding_url="http://127.0.0.1:8100")  # or: a vLLM embedding server
+    reward_fn = L1Reward(tokenizer=tokenizer, embedding_url="http://node-4:8100,http://node-4:8101")  # or several
     reward_fn.set_pools(past_actions, future_actions)  # batch visible actions (embedded once) and next-week pool
-    reward_fn(content, text, finish_reason, next_week_actions)["reward"]
+    reward_fn(content, text, finish_reason, next_week_actions, past_freqs, future_freqs)["reward"]
+    # past_freqs: action_freq of each input signal in prompt order; future_freqs: of each next-week action
 """
 
 import json
@@ -54,16 +66,26 @@ if str(INFERENCE_DIR) not in sys.path:
 import user_profile_rules  # noqa: E402
 from utils import parse_json_object  # noqa: E402
 
-MAX_LABEL_TOKENS = 6
+# Label token limit per interest, by the language of the actions its topics cite (user_profile_rules.detect_language,
+# the language rule's anchor): English interests keep the tight limit, any other (or mixed / untagged) a looser one.
+MAX_LABEL_TOKENS_EN = 6
+MAX_LABEL_TOKENS_OTHER = 10
 INVALID_REWARD = 0.0
 REWARD_SIGNALS = ("past_assignment", "future_retrieval")
 # past_assignment's denominator is at least this share of the visible actions: skipping beyond it is not penalized.
 PAST_COVERAGE_TARGET = 0.7
-SIGNALS = ("coverage", *REWARD_SIGNALS)  # All logged content metrics; coverage is diagnostic only.
+# The action_freq at which an action weighs half (action_weight): where the corpus turns from tools, portals and login
+# pages to actual interests.
+ACTION_FREQ_HALF_WEIGHT = 100
+# The two reward signals with every action weighing 1, logged for comparison only.
+UNWEIGHTED_SIGNALS = ("past_assignment_unweighted", "future_retrieval_unweighted")
+SIGNALS = ("coverage", *REWARD_SIGNALS, *UNWEIGHTED_SIGNALS)  # All logged content metrics; only REWARD_SIGNALS count.
 # Diagnostic answer-shape metrics; None when the answer has no interest (or, for the topic ones, no topic).
 STRUCTURE_SIGNALS = ("topics_per_interest", "evidence_per_topic", "interest_name_tokens", "topic_tokens")
 DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B"
 SERVED_EMBEDDING_MODEL = "l1-embedding"  # --served-model-name of the vLLM embedding server
+# Seconds an embedding server that failed a request is skipped (the others take its share).
+ENDPOINT_COOLDOWN = 30
 # Same query instruction as code/evaluation/evaluate_behavior_retrieval.py; documents (actions) have none.
 EMBEDDING_INSTRUCTION = "Given a web search query, retrieve relevant documents that answer the query"
 EMBEDDING_MAX_LENGTH = 512
@@ -74,11 +96,17 @@ def embedding_text(text: str, query: bool) -> str:
     return f"Instruct: {EMBEDDING_INSTRUCTION}\nQuery:{text}" if query else text
 
 
+def label_token_limit(interest: dict, action_by_idx: dict[int, str]) -> int:
+    """MAX_LABEL_TOKENS_EN when the actions the interest's topics cite are English, else MAX_LABEL_TOKENS_OTHER."""
+    actions = [action_by_idx[idx] for topic in interest["topics"] for idx in topic["evidence"] if idx in action_by_idx]
+    return MAX_LABEL_TOKENS_EN if user_profile_rules.detect_language(actions) == "en" else MAX_LABEL_TOKENS_OTHER
+
+
 def judge(content: str, text: str, finish_reason: str | None,
           tokenizer: "PreTrainedTokenizerBase") -> tuple[dict, dict | None]:
     """user_profile_rules.score_example of one Layer-1 answer to the user message `content` (json_valid, violations,
     rule_pass, ...) and the parsed answer when it is JSON-valid. A generation cut at max_tokens gets the violation
-    "truncated" and fails rule_pass. Every interest_name and topic must have at most MAX_LABEL_TOKENS generation
+    "truncated" and fails rule_pass. Every interest_name and topic must have at most label_token_limit generation
     tokens, without special tokens, including interests and topics that earn no retrieval credit."""
     rules = user_profile_rules.score_example([{"role": "user", "content": content}], text)
     if finish_reason == "length":
@@ -86,10 +114,12 @@ def judge(content: str, text: str, finish_reason: str | None,
     output = parse_json_object(text) if rules["json_valid"] else None
     if output is not None:
         violations = set(rules["violations"])
+        action_by_idx = {signal["idx"]: signal["action"] for signal in input_signals(content)}
         for interest in output["interests"]:
-            if len(tokenizer.encode(interest["interest_name"], add_special_tokens=False)) > MAX_LABEL_TOKENS:
+            limit = label_token_limit(interest, action_by_idx)
+            if len(tokenizer.encode(interest["interest_name"], add_special_tokens=False)) > limit:
                 violations.add("interest_name_too_long")
-            if any(len(tokenizer.encode(topic["topic"], add_special_tokens=False)) > MAX_LABEL_TOKENS
+            if any(len(tokenizer.encode(topic["topic"], add_special_tokens=False)) > limit
                    for topic in interest["topics"]):
                 violations.add("topic_too_long")
         rules = {**rules, "violations": sorted(violations), "rule_pass": rules["rule_pass"] and not violations}
@@ -128,17 +158,31 @@ def topic_query(interest: dict, topic: dict) -> str:
     return f"{interest['interest_name']}: {label}" if label else interest["interest_name"]
 
 
-def assign_owners(similarity: list[list[float]], citations: list[set[int]], indices: list[int]) -> tuple[int, list[int]]:
+def action_weight(freq: int | None) -> float:
+    """How much one action counts in both reward signals, from its global frequency (1 when unknown)."""
+    return 1.0 / (1.0 + max(freq or 0, 0) / ACTION_FREQ_HALF_WEIGHT)
+
+
+def assign_owners(similarity: list[list[float]], citations: list[set[int]],
+                  indices: list[int]) -> tuple[list[bool], list[int]]:
     """past_assignment's ownership: similarity[t][c] is topic t's similarity to the visible action of column c, whose
     input idx is indices[c]. Each action is owned by its most similar topic; it counts when a topic citing it is among
-    the most similar. Returns the number of actions that count and each column's owner (the first on ties)."""
-    correct, owners = 0, []
+    the most similar. Returns per column whether it counts and its owner (the first on ties)."""
+    counted, owners = [], []
     for column, idx in enumerate(indices):
         scores = [row[column] for row in similarity]
         best = max(scores)
         owners.append(scores.index(best))
-        correct += any(scores[t] == best for t, cited in enumerate(citations) if idx in cited)
-    return correct, owners
+        counted.append(any(scores[t] == best for t, cited in enumerate(citations) if idx in cited))
+    return counted, owners
+
+
+def past_score(counted: list[bool], cited: set[int], indices: list[int], weights: list[float]) -> float:
+    """past_assignment: the weight of the counted actions over the larger of the weight of the cited ones and
+    PAST_COVERAGE_TARGET of the weight of all visible actions (columns of `indices`)."""
+    weight_of = dict(zip(indices, weights))
+    return (sum(weight for count, weight in zip(counted, weights) if count)
+            / max(sum(weight_of[idx] for idx in cited), PAST_COVERAGE_TARGET * sum(weights)))
 
 
 class Embedder:
@@ -182,48 +226,87 @@ class Embedder:
 
 
 class EmbeddingClient:
-    """The same embeddings from a vLLM embedding server (`vllm serve <Qwen3-Embedding> --runner pooling
+    """The same embeddings from vLLM embedding servers (`vllm serve <Qwen3-Embedding> --runner pooling
     --served-model-name l1-embedding`): its /v1/embeddings pools the last token and normalizes, as Embedder does, and
-    truncates to EMBEDDING_MAX_LENGTH tokens. Same interface as Embedder; texts are cached until clear(). A request
-    is retried for about 3 minutes (backoff up to 60 s), the time a restarted server takes to come back."""
+    truncates to EMBEDDING_MAX_LENGTH tokens. Same interface as Embedder; texts are cached until clear().
+    `url` is one server or several, comma-separated (serve_embedding.sh with EMBEDDING_GPUS: one per GPU). The texts
+    of one encode are split into one request per live server (at most batch_size texts each) sent at once, starting at
+    the next server in turn (from a random one, so reward workers spread out). A server that fails a request is
+    skipped for ENDPOINT_COOLDOWN seconds and the request goes to the next live server at once; only when every
+    server has failed does it back off (up to 60 s), for about 3 minutes in all, the time a restarted server takes."""
 
     def __init__(self, url: str, batch_size: int = 256, timeout: float = 600, retries: int = 9):
+        import random
+
         import torch
 
         self.torch = torch
-        self.endpoint = url.rstrip("/") + "/v1/embeddings"
+        self.endpoints = [part.strip().rstrip("/") + "/v1/embeddings" for part in url.split(",") if part.strip()]
+        if not self.endpoints:
+            raise ValueError(f"No embedding server URL in {url!r}")
         self.batch_size = batch_size
         self.timeout = timeout
-        self.retries = retries
+        self.retries = retries  # back-offs after every server failed
         self.cache = {}
+        self.next_endpoint = random.randrange(len(self.endpoints))
+        self.down_until = [0.0] * len(self.endpoints)  # time.monotonic() until which a failed server is skipped
+        self.pool = None  # thread pool for concurrent requests, created on first use
 
     def clear(self) -> None:
         self.cache.clear()
 
-    def post(self, texts: list[str]) -> list[list[float]]:
+    def live(self) -> list[int]:
+        """The servers not skipped after a failure, or all of them when every one failed."""
+        now = time.monotonic()
+        return [i for i, until in enumerate(self.down_until) if until <= now] or list(range(len(self.endpoints)))
+
+    def post(self, texts: list[str], endpoint: int = 0) -> list[list[float]]:
         body = json.dumps({"model": SERVED_EMBEDDING_MODEL, "input": texts,
                            "truncate_prompt_tokens": EMBEDDING_MAX_LENGTH}).encode()
-        request = urllib.request.Request(self.endpoint, data=body, headers={"Content-Type": "application/json"})
-        for attempt in range(self.retries):
+        backoffs = 0
+        while True:
+            live = self.live()
+            index = next((i % len(self.endpoints) for i in range(endpoint, endpoint + len(self.endpoints))
+                          if i % len(self.endpoints) in live), endpoint % len(self.endpoints))
+            request = urllib.request.Request(self.endpoints[index], data=body,
+                                             headers={"Content-Type": "application/json"})
             try:
                 with urllib.request.urlopen(request, timeout=self.timeout) as response:
                     data = json.load(response)["data"]
                 return [item["embedding"] for item in sorted(data, key=lambda item: item["index"])]
             except (urllib.error.URLError, TimeoutError, ConnectionError):
-                if attempt == self.retries - 1:
-                    raise
-                time.sleep(min(2 ** attempt, 60))
+                self.down_until[index] = time.monotonic() + ENDPOINT_COOLDOWN
+                endpoint = index + 1
+                if all(until > time.monotonic() for until in self.down_until):  # every server failed: back off
+                    if backoffs == self.retries - 1:
+                        raise
+                    time.sleep(min(2 ** backoffs, 60))
+                    backoffs += 1
 
     def encode(self, texts: list[str], query: bool):
         import torch.nn.functional as functional
 
         keys = [(query, text) for text in texts]
         missing = list(dict.fromkeys(key for key in keys if key not in self.cache))
-        for start in range(0, len(missing), self.batch_size):
-            batch = missing[start:start + self.batch_size]
-            vectors = self.torch.tensor(self.post([embedding_text(text, is_query) for is_query, text in batch]))
-            for key, vector in zip(batch, functional.normalize(vectors.float(), p=2, dim=1)):
-                self.cache[key] = vector
+        if missing:
+            live = self.live()
+            size = min(self.batch_size, -(-len(missing) // len(live)))
+            batches = [missing[start:start + size] for start in range(0, len(missing), size)]
+            first, self.next_endpoint = self.next_endpoint, (self.next_endpoint + len(batches)) % len(self.endpoints)
+            jobs = [([embedding_text(text, is_query) for is_query, text in batch], live[(first + number) % len(live)])
+                    for number, batch in enumerate(batches)]
+            if len(jobs) == 1:
+                results = [self.post(*jobs[0])]
+            else:
+                if self.pool is None:
+                    from concurrent.futures import ThreadPoolExecutor
+
+                    self.pool = ThreadPoolExecutor(max_workers=len(self.endpoints))
+                results = list(self.pool.map(lambda job: self.post(*job), jobs))
+            for batch, embeddings in zip(batches, results):
+                vectors = functional.normalize(self.torch.tensor(embeddings).float(), p=2, dim=1)
+                for key, vector in zip(batch, vectors):
+                    self.cache[key] = vector
         return self.torch.stack([self.cache[key] for key in keys]) if keys else None
 
 
@@ -270,15 +353,17 @@ class L1Reward:
         top = best.values.topk(len(targets)).indices.tolist()
         return [[position[column], rank, owners[column]] for rank, column in enumerate(top, 1) if column in position]
 
-    def __call__(self, content: str, text: str, finish_reason: str | None, future: list[str]) -> dict:
+    def __call__(self, content: str, text: str, finish_reason: str | None, future: list[str],
+                 past_freqs: list[int | None] | None = None, future_freqs: list[int | None] | None = None) -> dict:
         """The reward of one answer `text` to the Layer-1 user message `content`, whose user does the actions `future`
-        next week, with what it is computed from:
+        next week, with what it is computed from; past_freqs is the action_freq of each input signal in prompt order,
+        future_freqs of each action of `future` (None: every action weighs 1):
             reward, json_valid, rule_pass, violations, output (the parsed answer, None unless JSON-valid), n_interests,
-            coverage and the two REWARD_SIGNALS (0 unless JSON-valid), STRUCTURE_SIGNALS (None unless JSON-valid
-            with interests / topics), and, None unless JSON-valid: queries (per interest, its topics' queries),
-            past_owners (per visible input action, in prompt order, [interest, topic] of the topic owning it; None
-            without topics) and hits (per interest, [position in the distinct next-week actions, rank from 1] of the
-            user's next-week actions in the top B whose most similar topic is one of the interest's).
+            coverage, the two REWARD_SIGNALS and their UNWEIGHTED_SIGNALS (0 unless JSON-valid), STRUCTURE_SIGNALS
+            (None unless JSON-valid with interests / topics), and, None unless JSON-valid: queries (per interest, its
+            topics' queries), past_owners (per visible input action, in prompt order, [interest, topic] of the topic
+            owning it; None without topics) and hits (per interest, [position in the distinct next-week actions, rank
+            from 1] of the user's next-week actions in the top B whose most similar topic is one of the interest's).
         A JSON-valid answer that breaks a rule gets its signals too, for diagnostics, but INVALID_REWARD."""
         rules, output = judge(content, text, finish_reason, self.tokenizer)
         result = {"reward": INVALID_REWARD, "json_valid": rules["json_valid"], "rule_pass": rules["rule_pass"],
@@ -289,6 +374,10 @@ class L1Reward:
             return result
         result.update(structure_signals(output, self.tokenizer))
         signals = input_signals(content)
+        if past_freqs is not None and len(past_freqs) != len(signals):
+            raise ValueError(f"past_freqs has {len(past_freqs)} values for {len(signals)} input signals")
+        if future_freqs is not None and len(future_freqs) != len(future):
+            raise ValueError(f"future_freqs has {len(future_freqs)} values for {len(future)} next-week actions")
         indices = {signal["idx"] for signal in signals}
         past = list(dict.fromkeys(signal["action"] for signal in signals))
         if past and not self.past_pool:
@@ -302,21 +391,30 @@ class L1Reward:
         query_vectors = self.embedder.encode(queries, query=True) if queries else None
         citations = [set(topic["evidence"]) for *_, topic in topics]
         # Past: every topic of the answer competes for each of the user's own visible actions.
-        past_assignment, past_owners = 0.0, None
+        past_assignment = past_unweighted = 0.0
+        past_owners = None
         if topics and signals:
             similarity = (query_vectors
                           @ self.embedder.encode([signal["action"] for signal in signals], query=False).T).tolist()
             visible = [signal["idx"] for signal in signals]
-            correct, owners = assign_owners(similarity, citations, visible)
+            counted, owners = assign_owners(similarity, citations, visible)
             cited = set().union(*citations) & set(visible)
-            past_assignment = correct / max(len(cited), PAST_COVERAGE_TARGET * len(visible))
+            weights = [1.0] * len(visible) if past_freqs is None else [action_weight(freq) for freq in past_freqs]
+            past_assignment = past_score(counted, cited, visible, weights)
+            past_unweighted = past_score(counted, cited, visible, [1.0] * len(visible))
             past_owners = [list(topics[owner][:2]) for owner in owners]
         # Future: the same topics pick this user's next-week actions out of every batch user's.
-        future = list(dict.fromkeys(future))
-        future_retrieval, hits = 0.0, [[] for _ in interests]
+        freq_of: dict[str, int | None] = {}
+        for action, freq in zip(future, future_freqs if future_freqs is not None else [None] * len(future)):
+            freq_of.setdefault(action, freq)
+        future = list(freq_of)
+        future_retrieval = future_unweighted = 0.0
+        hits = [[] for _ in interests]
         if topics and future:
             ranked = self._rank_future(query_vectors, future)
-            future_retrieval = len(ranked) / len(future)
+            target_weights = [action_weight(freq_of[action]) for action in future]
+            future_retrieval = sum(target_weights[target] for target, *_ in ranked) / sum(target_weights)
+            future_unweighted = len(ranked) / len(future)
             for target, rank, row in ranked:
                 hits[topics[row][0]].append([target, rank])
         by_interest = [[] for _ in interests]
@@ -327,6 +425,8 @@ class L1Reward:
             "coverage": len(set().union(*citations) & indices) / len(indices) if indices else 0.0,
             "past_assignment": past_assignment,
             "future_retrieval": future_retrieval,
+            "past_assignment_unweighted": past_unweighted,
+            "future_retrieval_unweighted": future_unweighted,
             "queries": by_interest, "past_owners": past_owners, "hits": hits,
         })
         if rules["rule_pass"]:

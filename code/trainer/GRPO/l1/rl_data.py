@@ -20,7 +20,7 @@ import tempfile
 UU_LLM = Path(__file__).resolve().parents[4]
 sys.path.insert(0, str(UU_LLM / "code" / "inference"))
 
-from utils import dedupe, load_users  # noqa: E402
+from utils import MAX_ACTION_CHARS, dedupe, load_users  # noqa: E402
 
 # The Layer-1 GRPO starting point: the VFinal F16A unified SFT model, Qwen3.5-4B.
 DEFAULT_CHECKPOINT = "/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT"
@@ -101,6 +101,13 @@ def read_rows(path: str | Path, numbers: list[int]) -> list[dict]:
 
 def clean_behaviors(user_id: str, behaviors: list[dict]) -> list[dict]:
     """The inference cleaning of one weekly window: load_users (128-char actions, dates >= 2025-01-01, sorted by
-    date) then dedupe (allowed sources only, one signal per action)."""
+    date) then dedupe (allowed sources only, one signal per action). Each kept behavior gets back the action_freq of
+    its raw behaviors (the reward's action weight; None when the data has none), which the Layer-1 message omits."""
+    freqs: dict[str, int] = {}
+    for behavior in behaviors:
+        action = (behavior.get("action") or "")[:MAX_ACTION_CHARS]
+        if behavior.get("action_freq") is not None:
+            freqs[action] = max(freqs.get(action, 0), int(behavior["action_freq"]))
     users = load_users([{"user_id": user_id, "past_behaviors": behaviors}])
-    return dedupe(users[user_id]) if users else []
+    return [{**behavior, "action_freq": freqs.get(behavior["action"])}
+            for behavior in dedupe(users[user_id])] if users else []

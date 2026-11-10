@@ -44,7 +44,8 @@ from utils import build_prompt_ids  # noqa: E402
 
 DATA_SOURCE = "user_profile_l1"
 VAL_BATCH_ID = "val"
-POOL_FORMAT_VERSION = 4  # 2: separate past / future pools; 4: single-language batches and pools
+POOL_FORMAT_VERSION = 5  # 2: separate past / future pools; 4: single-language batches and pools; 5: action_freq
+#                          (extra_info past_freq / future_freq) for the reward's action weights
 DATASET = f"{HF_REPO}/{HF_CONFIG_NAME}"  # recorded in meta.json; the launcher checks it
 CHUNK_ROWS = 256  # candidate rows of one file per worker task
 
@@ -59,6 +60,9 @@ def build_example(row: dict, encode, max_prompt_length: int) -> dict | None:
     if len(prompt_ids) > max_prompt_length:
         return None
     content = layer1.build_message(kept)
+    if any(b["action_freq"] is None for b in kept + future):
+        raise ValueError(f"user {row['user_id']}: a behavior has no action_freq; the reward weights need it "
+                         f"(regenerate {DATASET} with action_freq)")
     return {
         "data_source": DATA_SOURCE,
         "prompt": [{"role": "user", "content": content}],
@@ -67,6 +71,9 @@ def build_example(row: dict, encode, max_prompt_length: int) -> dict | None:
         "extra_info": {"user_id": row["user_id"], "language": row.get("language") or "und", "content": content,
                        "prompt_tokens": len(prompt_ids),
                        "signals": len(kept), "signals_dropped": len(signals) - len(kept),
+                       # action_freq per input signal (prompt idx order) and per ground_truth action: reward weights
+                       "past_freq": [s["action_freq"] for s in kept],
+                       "future_freq": [b["action_freq"] for b in future],
                        "future": [{"date": b["date"], "source": b["source"], "action": b["action"]} for b in future]},
     }
 
