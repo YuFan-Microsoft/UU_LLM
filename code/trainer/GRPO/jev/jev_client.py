@@ -6,9 +6,10 @@
 
 profile / behavior: the EVAL_Dataset JSON strings, or a list / dict the server serializes the same way.
 score() splits the pairs into chunks of at least MIN_CHUNK (64) pairs, at most one per server, sent at the same time;
-a smaller call goes whole to one random server. One rule for every failure of a chunk (connection, HTTP error,
-timeout): wait (1, 2, 4, ... up to 60 s) and send it again to the next server, at most RETRIES times (about 4
-minutes); only then score() raises.
+a smaller call goes whole to one random server. Text is sent without lone UTF-16 surrogates (clean_text: half an emoji
+cut from its pair, which UTF-8 cannot encode). A 4xx answer is the input's fault: ValueError at once. Every other
+failure of a chunk (connection, HTTP 5xx, timeout): wait (1, 2, 4, ... up to 60 s) and send it again to the next
+server, at most RETRIES times (about 4 minutes); only then score() raises JEVUnavailable.
 
 Smoke test from any node:  python3 jev_client.py http://node-2:8200,http://node-2:8201
 """
@@ -16,11 +17,21 @@ import json
 import random
 import sys
 import time
+import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 RETRIES = 10
 MIN_CHUNK = 64
+
+
+class JEVUnavailable(RuntimeError):
+    """No JEV server scored a chunk in RETRIES attempts."""
+
+
+def clean_text(text: str) -> str:
+    """`text` without lone surrogates (e.g. "\\ud83d" decoded from JSON), the only str UTF-8 cannot encode."""
+    return text.encode("utf-8", "ignore").decode("utf-8")
 
 
 class JEVClient:
@@ -33,8 +44,8 @@ class JEVClient:
         self.timeout = timeout
 
     def post(self, url: str, pairs: list) -> list[dict]:
-        body = json.dumps({"pairs": [{"profile": profile, "behavior": behavior} for profile, behavior in pairs]},
-                          ensure_ascii=False).encode()
+        body = clean_text(json.dumps({"pairs": [{"profile": profile, "behavior": behavior}
+                                                for profile, behavior in pairs]}, ensure_ascii=False)).encode()
         request = urllib.request.Request(url + "/score", data=body, headers={"Content-Type": "application/json"})
         with urllib.request.urlopen(request, timeout=self.timeout) as response:
             scores = [result["probability"] for result in json.load(response)["results"]]
@@ -48,11 +59,17 @@ class JEVClient:
             url = self.urls[(first + attempt) % len(self.urls)]
             try:
                 return self.post(url, pairs)
+            except urllib.error.HTTPError as error:
+                if 400 <= error.code < 500:
+                    raise ValueError(f"{url} rejected the pairs: HTTP {error.code} "
+                                     f"{error.read().decode(errors='replace')[:500]}") from error
+                failure = error
             except Exception as error:
-                if attempt == RETRIES - 1:
-                    raise RuntimeError(f"JEV scoring failed {RETRIES} times, last on {url}: {error!r}") from error
-                print(f"[jev_client] {url}: {error!r}; retrying", file=sys.stderr, flush=True)
-                time.sleep(min(2 ** attempt, 60))
+                failure = error
+            if attempt == RETRIES - 1:
+                raise JEVUnavailable(f"JEV scoring failed {RETRIES} times, last on {url}: {failure!r}") from failure
+            print(f"[jev_client] {url}: {failure!r}; retrying", file=sys.stderr, flush=True)
+            time.sleep(min(2 ** attempt, 60))
 
     def score(self, pairs) -> list[dict]:
         pairs = list(pairs)

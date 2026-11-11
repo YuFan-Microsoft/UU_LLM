@@ -1,6 +1,6 @@
 """Layer-3 Commercial rollout -> EVAL_Dataset mai_profile -> JEV probabilities of the user's future behaviors.
 
-One RL_User_Profile_Layer3_V1_Processed row (prompt, category, future_behaviors) and one rollout answer of its prompt:
+One RL_User_Profile_Layer3_V2_Processed row (prompt, category, future_behaviors) and one rollout answer of its prompt:
   1. the prompt's input interests in their order (the Layer-2 confidence order), each matched by exact interest_name
      to the answer's first entry of that name; of those the answer marks "commercial": true (or, with `reference`,
      those named there, whatever the answer marks: the GRPO reward), the first TOP_K (10)
@@ -29,7 +29,7 @@ for directory in (CODE / "inference", CODE / "evaluation" / "e2e_ads_eval", CODE
         sys.path.insert(0, str(directory))
 
 from classify import mai_profile  # noqa: E402
-from jev_client import JEVClient  # noqa: E402,F401  (re-exported for the reward)
+from jev_client import JEVClient, clean_text  # noqa: E402,F401  (JEVClient re-exported for the reward)
 from utils import l3_commercial_keys_valid, parse_json_object  # noqa: E402
 
 TOP_K = 10
@@ -40,15 +40,18 @@ RL_ONLY_KEYS = ("action_idx", "action_freq")
 
 def jev_behavior(text: str) -> str:
     """One future behavior as JEV was trained on it (an EVAL_Dataset future_behavior): the JSON string without
-    RL_ONLY_KEYS, the other fields in their order, json.dumps with ensure_ascii=False as stored on HF. A behavior
-    without those keys (or not a JSON object) is returned as is."""
+    RL_ONLY_KEYS and without null-valued keys (EVAL_Dataset has none), the other fields in their order, json.dumps with
+    ensure_ascii=False as stored on HF. A behavior with neither (or not a JSON object) is returned as is. Lone
+    surrogates (an escaped half emoji) are dropped: UTF-8 (Parquet, the JEV request) cannot hold them."""
     try:
         behavior = json.loads(text)
     except ValueError:
-        return text
-    if not isinstance(behavior, dict) or not any(key in behavior for key in RL_ONLY_KEYS):
-        return text
-    return json.dumps({key: value for key, value in behavior.items() if key not in RL_ONLY_KEYS}, ensure_ascii=False)
+        return clean_text(text)
+    if not isinstance(behavior, dict) or not any(key in RL_ONLY_KEYS or value is None
+                                                 for key, value in behavior.items()):
+        return clean_text(text)
+    return clean_text(json.dumps({key: value for key, value in behavior.items()
+                                  if key not in RL_ONLY_KEYS and value is not None}, ensure_ascii=False))
 
 
 def prompt_interests(prompt: str) -> list[dict]:

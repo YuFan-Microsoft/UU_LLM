@@ -35,17 +35,22 @@ if ! flock -n 9; then
 fi
 
 RUN_SCRIPT=${RUN_SCRIPT:-run_l1_grpo.sh}
-case $RUN_SCRIPT in  # the run's name prefix, and the JEV GPUs it serves (as RUN_SCRIPT starts them)
-  run_l1_grpo.sh) RUN_PREFIX=GRPO_L1_no_kl ;;
-  run_l3_grpo.sh) RUN_PREFIX=GRPO_L3_commercial_no_kl; export JEV_GPUS=${JEV_GPUS:-0,1,2,3,4,5,6,7} ;;
-  run_l1_l3_grpo.sh) RUN_PREFIX=GRPO_L1_L3_no_kl; export JEV_GPUS=${JEV_GPUS:-1,2,3,4,5,6,7} ;;
+F16A=/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT
+L1_STEP600=/yufan/MAI_Profile/checkpoints/RL_V1_Layer1_Only/checkpoints/global_step_600/actor/huggingface
+case $RUN_SCRIPT in  # the run's name prefix, default checkpoint and the JEV GPUs it serves (as RUN_SCRIPT has them)
+  run_l1_grpo.sh) RUN_PREFIX=GRPO_L1_no_kl; DEFAULT_CHECKPOINT=$F16A ;;
+  run_l3_grpo.sh) RUN_PREFIX=GRPO_L3_commercial_no_kl; DEFAULT_CHECKPOINT=$L1_STEP600
+    export JEV_GPUS=${JEV_GPUS:-0,1,2,3,4,5,6,7} ;;
+  run_l1_l3_grpo.sh) RUN_PREFIX=GRPO_L1_L3_no_kl; DEFAULT_CHECKPOINT=$L1_STEP600
+    export JEV_GPUS=${JEV_GPUS:-1,2,3,4,5,6,7} ;;
   *) echo "RUN_SCRIPT must be run_l1_grpo.sh, run_l3_grpo.sh or run_l1_l3_grpo.sh" >&2; exit 1 ;;
 esac
 # The run's output directory, as RUN_SCRIPT names it.
-CHECKPOINT=${CHECKPOINT:-/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT}
+CHECKPOINT=${CHECKPOINT:-$DEFAULT_CHECKPOINT}
+CHECKPOINT_NAME=$(basename "$(echo "${CHECKPOINT%/}" | sed -E 's#/checkpoints/(global_step_[0-9]+)/actor/huggingface$#_\1#')")
 REPLAY_SUFFIX=""
 [ "${SFT_REPLAY:-1}" = 0 ] || REPLAY_SUFFIX="_replay"
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-${RUN_PREFIX}_qwen3_5_4B_$(basename "$CHECKPOINT")$REPLAY_SUFFIX}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-${RUN_PREFIX}_qwen3_5_4B_$CHECKPOINT_NAME$REPLAY_SUFFIX}
 OUTPUT_DIR=${OUTPUT_DIR:-$HERE/outputs/$EXPERIMENT_NAME}
 mkdir -p "$OUTPUT_DIR"
 INTERVAL=${WATCHDOG_INTERVAL:-60}

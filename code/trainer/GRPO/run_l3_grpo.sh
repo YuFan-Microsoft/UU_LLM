@@ -22,8 +22,10 @@ export PYTHONPATH="$HERE${PYTHONPATH:+:$PYTHONPATH}"
 # Unbuffered, so $OUTPUT_DIR/train.log (live-synced to the W&B run's Files tab) follows the run.
 export PYTHONUNBUFFERED=1
 
-DEFAULT_CHECKPOINT=/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT
+DEFAULT_CHECKPOINT=/yufan/MAI_Profile/checkpoints/RL_V1_Layer1_Only/checkpoints/global_step_600/actor/huggingface
 CHECKPOINT=${CHECKPOINT:-$DEFAULT_CHECKPOINT}
+# A verl export <run>/checkpoints/global_step_N/actor/huggingface is named <run>_global_step_N (as watchdog.sh names it)
+CHECKPOINT_NAME=$(basename "$(echo "${CHECKPOINT%/}" | sed -E 's#/checkpoints/(global_step_[0-9]+)/actor/huggingface$#_\1#')")
 SFT_REPLAY=${SFT_REPLAY:-1}
 if [[ "$SFT_REPLAY" != 0 && "$SFT_REPLAY" != 1 ]]; then
   echo "SFT_REPLAY must be 0 or 1" >&2
@@ -31,7 +33,7 @@ if [[ "$SFT_REPLAY" != 0 && "$SFT_REPLAY" != 1 ]]; then
 fi
 REPLAY_SUFFIX=""
 [ "$SFT_REPLAY" = 0 ] || REPLAY_SUFFIX="_replay"
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO_L3_commercial_no_kl_qwen3_5_4B_$(basename "$CHECKPOINT")$REPLAY_SUFFIX}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO_L3_commercial_no_kl_qwen3_5_4B_$CHECKPOINT_NAME$REPLAY_SUFFIX}
 PROJECT_NAME=${PROJECT_NAME:-MAI_Profile_SLM_V3_RL}
 OUTPUT_DIR=${OUTPUT_DIR:-$HERE/outputs/$EXPERIMENT_NAME}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
@@ -58,7 +60,7 @@ TRAIN_SUFFIX=""
 [ "$NUM_TRAIN" = 0 ] || TRAIN_SUFFIX="_train$NUM_TRAIN"  # a partial set never takes the full set's directory
 # _ref: profiles of the reference commercial interests; _freq: targets as JEV takes them, with their action_freq
 # (data without them is never reused)
-DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v1_seed${SEED}_prompt${MAX_PROMPT_LENGTH}_ref_freq_first25$TRAIN_SUFFIX}
+DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l3v2_seed${SEED}_prompt${MAX_PROMPT_LENGTH}_ref_freq_first25$TRAIN_SUFFIX}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
 mkdir -p "$OUTPUT_DIR"
@@ -80,8 +82,8 @@ if [[ "$LOGGER" == *wandb* ]] && [ -z "${WANDB_API_KEY:-}" ]; then
   fi
 fi
 
-# The Layer-3 rows with the `commercial` column (the reference answers, code/inference/tag_commercial_interests.py): from
-# Hugging Face, or L3_SOURCE_DIR (that script's <output_dir>/User_Profile_Layer3_For_RL_V1_Processed) before an upload.
+# The Layer-3 rows with the `commercial` column (the reference answers): from Hugging Face
+# (RL_User_Profile_Layer3_V2_Processed), or L3_SOURCE_DIR (a local copy of its train-*.parquet / test-*.parquet).
 L3_SOURCE_ARGS=()
 [ -z "${L3_SOURCE_DIR:-}" ] || L3_SOURCE_ARGS=(--data_dir "$L3_SOURCE_DIR")
 if [ ! -f "$DATA_DIR/train.parquet" ]; then
@@ -116,7 +118,7 @@ if [ "$SFT_REPLAY" = 1 ]; then
     exit 1
   fi
   SFT_EVAL_SAMPLES=${SFT_EVAL_SAMPLES:-200}
-  SFT_REPLAY_DIR=${SFT_REPLAY_DIR:-$HERE/outputs/data/sft_v2_$(basename "$CHECKPOINT")_seq${SFT_MAX_SEQ_LENGTH}_prompt${SFT_EVAL_MAX_PROMPT_LENGTH}_test${SFT_EVAL_SAMPLES}}
+  SFT_REPLAY_DIR=${SFT_REPLAY_DIR:-$HERE/outputs/data/sft_v2_${CHECKPOINT_NAME}_seq${SFT_MAX_SEQ_LENGTH}_prompt${SFT_EVAL_MAX_PROMPT_LENGTH}_test${SFT_EVAL_SAMPLES}}
   if [ ! -f "$SFT_REPLAY_DIR/meta.json" ]; then
     python3 l1/sft_replay.py --output_dir "$SFT_REPLAY_DIR" --tokenizer "$CHECKPOINT" \
       --revision "${SFT_DATA_REVISION:-main}" --max_seq_length "$SFT_MAX_SEQ_LENGTH" \

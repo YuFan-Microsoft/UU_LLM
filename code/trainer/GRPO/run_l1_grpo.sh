@@ -23,6 +23,8 @@ export PYTHONUNBUFFERED=1
 
 DEFAULT_CHECKPOINT=/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT
 CHECKPOINT=${CHECKPOINT:-$DEFAULT_CHECKPOINT}
+# A verl export <run>/checkpoints/global_step_N/actor/huggingface is named <run>_global_step_N (as watchdog.sh names it)
+CHECKPOINT_NAME=$(basename "$(echo "${CHECKPOINT%/}" | sed -E 's#/checkpoints/(global_step_[0-9]+)/actor/huggingface$#_\1#')")
 SFT_REPLAY=${SFT_REPLAY:-1}
 if [[ "$SFT_REPLAY" != 0 && "$SFT_REPLAY" != 1 ]]; then
   echo "SFT_REPLAY must be 0 or 1" >&2
@@ -30,7 +32,7 @@ if [[ "$SFT_REPLAY" != 0 && "$SFT_REPLAY" != 1 ]]; then
 fi
 REPLAY_SUFFIX=""
 [ "$SFT_REPLAY" = 0 ] || REPLAY_SUFFIX="_replay"
-EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO_L1_no_kl_qwen3_5_4B_$(basename "$CHECKPOINT")$REPLAY_SUFFIX}
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO_L1_no_kl_qwen3_5_4B_$CHECKPOINT_NAME$REPLAY_SUFFIX}
 PROJECT_NAME=${PROJECT_NAME:-MAI_Profile_SLM_V3_RL}
 OUTPUT_DIR=${OUTPUT_DIR:-$HERE/outputs/$EXPERIMENT_NAME}
 TRAIN_BATCH_SIZE=${TRAIN_BATCH_SIZE:-64}
@@ -110,7 +112,7 @@ if [ "$SFT_REPLAY" = 1 ]; then
     exit 1
   fi
   SFT_EVAL_SAMPLES=${SFT_EVAL_SAMPLES:-500}
-  SFT_REPLAY_DIR=${SFT_REPLAY_DIR:-$HERE/outputs/data/sft_v2_$(basename "$CHECKPOINT")_seq${SFT_MAX_SEQ_LENGTH}_prompt${SFT_EVAL_MAX_PROMPT_LENGTH}_test${SFT_EVAL_SAMPLES}}
+  SFT_REPLAY_DIR=${SFT_REPLAY_DIR:-$HERE/outputs/data/sft_v2_${CHECKPOINT_NAME}_seq${SFT_MAX_SEQ_LENGTH}_prompt${SFT_EVAL_MAX_PROMPT_LENGTH}_test${SFT_EVAL_SAMPLES}}
   if [ ! -f "$SFT_REPLAY_DIR/meta.json" ]; then
     python3 l1/sft_replay.py --output_dir "$SFT_REPLAY_DIR" --tokenizer "$CHECKPOINT" \
       --revision "${SFT_DATA_REVISION:-main}" --max_seq_length "$SFT_MAX_SEQ_LENGTH" \

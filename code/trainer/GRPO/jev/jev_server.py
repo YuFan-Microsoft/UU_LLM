@@ -4,7 +4,8 @@ Scores (profile, behavior) pairs exactly as JEV/Qwen35_profile_classifier_infere
 chat template, the profile-end truncation at --max_length, the checkpoint's frozen class head, right padding per batch.
 One GPU per server (serve_jev.sh starts one per GPU). One request is scored at a time: its pairs are sorted by length
 and packed into batches of at most --max_batch_tokens padded tokens. A failed request (e.g. CUDA OOM) frees the cache
-and answers 500; the client retries it.
+and answers 500; the client retries it. Pairs that cannot be tokenized answer 400 (the client does not retry). Lone
+surrogates are dropped from every text first.
 
   GET  /health -> {"status": "ok", "service": "jev", "checkpoint": ...}   (the port opens once the model is loaded)
   POST /score  {"pairs": [{"profile": <str | list>, "behavior": <str | dict>}, ...]}
@@ -45,7 +46,9 @@ def drop_nulls(value):
 
 
 def to_text(value):
-    return value if isinstance(value, str) else json.dumps(drop_nulls(value), ensure_ascii=False)
+    """The pair's text; without lone surrogates (an escaped half emoji the tokenizer cannot take)."""
+    text = value if isinstance(value, str) else json.dumps(drop_nulls(value), ensure_ascii=False)
+    return text.encode("utf-8", "ignore").decode("utf-8")
 
 
 def pack(lengths, max_batch_tokens):
@@ -96,9 +99,14 @@ class Scorer:
         return probs
 
     def score_pairs(self, profiles, behaviors):
+        """ValueError when the pairs cannot be tokenized (the input's fault: the server answers 400, never retried)."""
         with self.lock:
             try:
-                return self.score(self.encode(profiles, behaviors))
+                input_ids = self.encode(profiles, behaviors)
+            except Exception as error:
+                raise ValueError(f"tokenizing failed: {type(error).__name__}: {error}") from error
+            try:
+                return self.score(input_ids)
             except Exception:
                 torch.cuda.empty_cache()  # e.g. after an OOM, so the retried request starts clean
                 raise
@@ -144,6 +152,10 @@ class Handler(BaseHTTPRequestHandler):
             return
         try:
             probs = self.scorer.score_pairs(profiles, behaviors) if pairs else []
+        except ValueError as error:
+            print(f"[jev] {len(pairs)} pairs rejected: {error}", flush=True)
+            self.reply(400, {"error": str(error)})
+            return
         except Exception as error:
             print(f"[jev] {len(pairs)} pairs failed: {type(error).__name__}: {error}", flush=True)
             self.reply(500, {"error": f"{type(error).__name__}: {error}"})
