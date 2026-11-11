@@ -50,14 +50,18 @@ Each input has its header skipped separately with `skipFirstNRows: 1`. Keep the
 default extractor/outputter text escaping behavior paired across both scripts.
 
 `UNION ALL` keeps every data row, including duplicate rows and repeated user IDs.
-The single `OUTPUT` applies global `ORDER BY UserId ASC`; it does not add a rank
-column. `UserId` is sorted as a string. Ordering among rows with equal user IDs is
-not specified.
 
-The output is one logical TSV stream with one header:
+The merged data does not fit in one TSV: all vertices writing an output file commit
+blocks into the same ADLS blob, which allows at most 50000 committed blocks in total.
+Rows are therefore split into 16 TSVs by a deterministic FNV-1a hash of `UserId`
+(`UserBucket.Of` in the script's `#CS` block). All rows of a user land in the same
+file. Each file has one header and is sorted by `ORDER BY UserId ASC, Date ASC`
+(`UserId` as a string), so each user's rows stay contiguous.
 
 ```text
-/shares/UDC/RnR/MaiProfileV3/AllUsers_V4_Backfill/Denoising/From-20260503-To-20261003/ForGptLabeling.tsv
+/shares/UDC/RnR/MaiProfileV3/AllUsers_V4_Backfill/Denoising/From-20260503-To-20261003/ForGptLabeling_00.tsv
+...
+/shares/UDC/RnR/MaiProfileV3/AllUsers_V4_Backfill/Denoising/From-20260503-To-20261003/ForGptLabeling_15.tsv
 ```
 
 The destination name starts at `20260503` as requested; the inputs remain the
