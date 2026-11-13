@@ -5,7 +5,7 @@ trained; the main model, `embed_tokens` and
 `lm_head` stay frozen, so **the main model's outputs do not change** and only the acceptance rate of vLLM MTP
 speculative decoding improves. The result is a complete checkpoint that is served directly with
 `--speculative-config '{"method": "mtp", "num_speculative_tokens": k}'` (`run_inference.py --num_speculative_tokens k`
-or `code/prod_deployment/origin_qwen35_prod_server.sh`).
+or `code/prod_deployment/best_qwen35_prod_server.sh`).
 
 Training uses vLLM's [Speculators](https://github.com/vllm-project/speculators) (the FastMTP recipe: the single MTP layer
 is unrolled recursively over several draft steps, the same way vLLM reuses it at inference).
