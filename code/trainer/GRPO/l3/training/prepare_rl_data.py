@@ -103,8 +103,8 @@ def action_freq(value) -> int | None:
     return freq if freq >= 0 else None
 
 
-def targets(behaviors: list[str]) -> tuple[list[str], list[int | None]]:
-    """(the first NUM_TARGETS distinct future behaviors in time order, as JEV takes them (jev_behavior); the action_freq
+def targets(behaviors: list[str], num_targets: int = NUM_TARGETS) -> tuple[list[str], list[int | None]]:
+    """(the first num_targets (NUM_TARGETS) distinct future behaviors in time order, as JEV takes them (jev_behavior); the action_freq
     of each). Two behaviors are the same when they differ only in TimeStamp; the earliest one is kept. TimeStamp is a
     date, so behaviors of one day keep their order in the data (a stable sort). Behaviors that are not a JSON object
     or have no content field (only TimeStamp / Market / action_idx / action_freq) are left out."""
@@ -118,7 +118,7 @@ def targets(behaviors: list[str]) -> tuple[list[str], list[int | None]]:
         key = json.dumps({name: value for name, value in fields_out.items() if name != "TimeStamp"},
                          ensure_ascii=False, sort_keys=True)
         distinct.setdefault(key, (target, action_freq(fields.get("action_freq"))))
-    items = list(distinct.values())[:NUM_TARGETS]
+    items = list(distinct.values())[:num_targets]
     return [target for target, _ in items], [freq for _, freq in items]
 
 

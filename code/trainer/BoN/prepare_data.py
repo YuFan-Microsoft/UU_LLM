@@ -7,10 +7,11 @@ taken in the seeded random order of rl_data.row_key over "<user_id>|<cutoff>" (t
 future TimeStamp), as the GRPO L3 data does, and the first --num_rows accepted ones are written, one line each:
 
   {"uid": "<user_id>|<cutoff>", "user_id", "language", "prompt": the Layer-3 Commercial user message as is,
-   "category": the row's {interest_name: "/A/B"} (Layer-3 Persona), "targets": the first 25 distinct future
-   behaviors in time order as JEV takes them, "target_freqs": their action_freq (the reward's weights)}
+   "category": the row's {interest_name: "/A/B"} (Layer-3 Persona), "targets": the first --num_targets (50) distinct
+   future behaviors in time order as JEV takes them, "target_freqs": their action_freq (the reward's weights)}
 
-Targets and weights are those of the GRPO L3 reward (prepare_rl_data.targets). The data's `commercial` column (a fixed
+Targets and weights are built as the GRPO L3 reward's (prepare_rl_data.targets), but up to --num_targets (50, GRPO: 25);
+a row with fewer distinct future behaviors keeps all of them. The data's `commercial` column (a fixed
 checkpoint's {interest_name: commercial_score}) only selects rows: a row needs at least --min_reference_commercial (5)
 input interests it scores medium or high, so its candidates have enough commercial interests to differ (the candidates
 are still profiled and scored with their own commercial labels). A row is also skipped when its prompt is over
@@ -56,7 +57,8 @@ def split_files(dataset: str, split: str, data_dir: Path | None):
                for name in names]
 
 
-def build_row(row: dict, tokenizer, max_prompt_length: int, min_reference_commercial: int = 0) -> dict | None:
+def build_row(row: dict, tokenizer, max_prompt_length: int, min_reference_commercial: int = 0,
+              num_targets: int = 50) -> dict | None:
     """The rows.jsonl line of one window, or None when it is skipped (raises on data it cannot read)."""
     from jev_profile import prompt_interests
     from prepare_rl_data import cutoff, targets
@@ -75,7 +77,7 @@ def build_row(row: dict, tokenizer, max_prompt_length: int, min_reference_commer
     if not isinstance(category, dict):
         raise ValueError("category is not a JSON object")
     behaviors = list(row["future_behaviors"] or [])
-    ground_truth, freqs = targets(behaviors)
+    ground_truth, freqs = targets(behaviors, num_targets)
     if not ground_truth:
         return None
     prompt_tokens = len(build_prompt_ids(tokenizer, [{"role": "user", "content": row["prompt"]}]))
@@ -97,7 +99,7 @@ def build_file(task: tuple[str, list[int]]) -> tuple[str, list[tuple[int, dict |
     for number, row in zip(numbers, pq.read_table(path, columns=COLUMNS).take(numbers).to_pylist()):
         try:
             built = build_row(row, _worker["tokenizer"], _worker["args"].max_prompt_length,
-                              _worker["args"].min_reference_commercial)
+                              _worker["args"].min_reference_commercial, _worker["args"].num_targets)
         except Exception as error:
             print(f"  skipped dirty row {number} of {Path(path).name} (user {row.get('user_id')}): {error!r}",
                   flush=True)
@@ -152,6 +154,8 @@ def main() -> None:
     parser.add_argument("--num_rows", type=int, default=10000, help="Rows to sample (0 = all)")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_prompt_length", type=int, default=MAX_PROMPT_LENGTH)
+    parser.add_argument("--num_targets", type=int, default=50,
+                        help="First distinct future behaviors in time order a candidate is scored on (GRPO L3: 25)")
     parser.add_argument("--min_reference_commercial", type=int, default=5,
                         help="Least input interests the `commercial` column scores medium / high (0 = no filter)")
     parser.add_argument("--num_workers", type=int, default=min(40, os.cpu_count() or 1))
@@ -174,7 +178,8 @@ def main() -> None:
     tmp.replace(out)
     meta = {"dataset": f"{HF_REPO}/{DATASETS[args.dataset][0]}", "split": args.split, "seed": args.seed,
             "tokenizer": args.tokenizer, "max_prompt_length": args.max_prompt_length,
-            "min_reference_commercial": args.min_reference_commercial, "rows": len(rows),
+            "min_reference_commercial": args.min_reference_commercial, "num_targets": args.num_targets,
+            "rows": len(rows),
             "skipped": skipped,
             "mean_targets": sum(len(row["targets"]) for row in rows) / max(len(rows), 1)}
     (args.output_dir / "rows_meta.json").write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
