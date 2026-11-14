@@ -10,7 +10,7 @@ future TimeStamp), as the GRPO L3 data does, and the first --num_rows accepted o
    "category": the row's {interest_name: "/A/B"} (Layer-3 Persona), "targets": the first --num_targets (50) distinct
    future behaviors in time order as JEV takes them, "target_freqs": their action_freq (the reward's weights)}
 
-Targets and weights are built as the GRPO L3 reward's (prepare_rl_data.targets), but up to --num_targets (50, GRPO: 25);
+Targets and weights are built as the GRPO L3 reward's (prepare_rl_data.targets), but up to --num_targets (50, as GRPO L3);
 a row with fewer distinct future behaviors keeps all of them. The data's `commercial` column (a fixed
 checkpoint's {interest_name: commercial_score}) only selects rows: a row needs at least --min_reference_commercial (5)
 input interests it scores medium or high, so its candidates have enough commercial interests to differ (the candidates
@@ -155,7 +155,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--max_prompt_length", type=int, default=MAX_PROMPT_LENGTH)
     parser.add_argument("--num_targets", type=int, default=50,
-                        help="First distinct future behaviors in time order a candidate is scored on (GRPO L3: 25)")
+                        help="First distinct future behaviors in time order a candidate is scored on (GRPO L3: 50)")
     parser.add_argument("--min_reference_commercial", type=int, default=5,
                         help="Least input interests the `commercial` column scores medium / high (0 = no filter)")
     parser.add_argument("--num_workers", type=int, default=min(40, os.cpu_count() or 1))

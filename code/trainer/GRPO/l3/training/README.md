@@ -14,7 +14,7 @@ GRPO (no KL) of the Layer-3 Commercial task with the [Layer-1 SFT replay](../../
   per shard; `--upload` writes it back to Hugging Face.
 - `prepare_rl_data.py`: `RL_User_Profile_Layer3_V2_Processed` -> verl `train.parquet` / `val.parquet`, rows in the
   seeded order of `<user_id>|<cutoff>` (the cutoff: a window's earliest future TimeStamp). The prompt is
-  the row's `prompt` as is; the reward's targets are the window's first 25 distinct future behaviors in time order
+  the row's `prompt` as is; the reward's targets are the window's first 50 distinct future behaviors in time order
   (TimeStamp ignored for distinctness), the ones right after the profiled history, so every answer of a GRPO group is
   scored on the same ones. Each target is
   stored as JEV was trained on it (`jev_profile.jev_behavior`: the data's `action_idx` / `action_freq` removed), its

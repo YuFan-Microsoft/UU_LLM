@@ -3,7 +3,7 @@
 
 Each row (one window of a user) becomes one prompt: its `prompt` column as is (the Layer-3 Commercial user message,
 built exactly as inference builds it), wrapped as one user message. The
-reward's targets (ground_truth) are the user's first NUM_TARGETS (25) distinct future behaviors in time order (the
+reward's targets (ground_truth) are the user's first NUM_TARGETS (50) distinct future behaviors in time order (the
 same behavior on another day counts once, at its first day: TimeStamp is ignored), the ones right after the history
 the profile is built from, so every answer of a GRPO group is scored on the same ones.
 Each target is the behavior as JEV was trained on it (jev_profile.jev_behavior: without the data's action_idx /
@@ -57,7 +57,7 @@ COLUMNS = ["user_id", "prompt", "category", "commercial", "future_behaviors", "l
 REFERENCE_SCORES = ("medium", "high")  # the reference commercial interests the reward profiles
 DATA_SOURCE = "user_profile_l3"  # the W&B prefix: val-core/user_profile_l3/<metric>
 MAX_PROMPT_LENGTH = 25600 - 8192
-NUM_TARGETS = 25  # the first distinct future behaviors in time order the reward scores
+NUM_TARGETS = 50  # the first distinct future behaviors in time order the reward scores
 NON_CONTENT_KEYS = ("TimeStamp", "Market", *RL_ONLY_KEYS)  # a behavior with nothing else is no target
 TARGET_FORMAT_VERSION = 3  # 2: targets without action_idx / action_freq, their frequencies in extra_info future_freq;
 #                            3: the first NUM_TARGETS distinct future behaviors in time order (no random sample)

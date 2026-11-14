@@ -3,7 +3,7 @@
 The reward of one answer: 0 if it breaks the Layer-3 Commercial rules (user_profile_rules.score_example, the SFT
 checks: not V3 JSON, interest names not exactly the input's, invalid score / stage / query values, duplicates, query
 format or language; a cut answer is not valid JSON), else the weighted mean over the user's target future behaviors
-(the user's first 25 distinct future behaviors in time order, right after the profiled history,
+(the user's first 50 distinct future behaviors in time order, right after the profiled history,
 prepare_rl_data.py, so every answer of a GRPO group is scored on the same ones) of the
 JEV expected match
     (0 * P(no match) + 1 * P(partial match) + 2 * P(perfect match)) / 2      in [0, 1]

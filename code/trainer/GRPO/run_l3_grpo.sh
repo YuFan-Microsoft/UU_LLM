@@ -8,7 +8,7 @@
 # Limits: context 25600 tokens, response 8192 tokens.
 # SFT_REPLAY=0 disables replay and extra SFT evaluation.
 # Reward (l3/training/l3_reward.py): 0 when the answer breaks the Layer-3 Commercial rules, else the weighted mean
-# over the user's first 25 distinct future behaviors in time order (each 1 / (1 + action_freq / 100), as Layer 1) of
+# over the user's first 50 distinct future behaviors in time order (each 1 / (1 + action_freq / 100), as Layer 1) of
 # the JEV expected match (0 no / 1 partial / 2 perfect, over 2) of the answer's mai_profile (its commercial interests,
 # the first 10 in input order, joined with their category).
 # Every visible GPU trains; the JEV servers run elsewhere (serve_jev.sh): with JEV_NODE, one on each of its 8 GPUs

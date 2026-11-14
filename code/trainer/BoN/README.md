@@ -37,7 +37,7 @@ labels; the data's `commercial` column is never read.
    (medium), the first 10 in input order, each with its Category (the row's Layer-3 Persona `category`), the answer's
    brands / products / retailers / predicted queries and the input topics, built by `jev_profile.build_mai_profile`
    into the EVAL_Dataset `mai_profile` string (the same function as the e2e ads eval).
-3. The `action_freq`-weighted mean over the row's first 50 (`prepare_data.py --num_targets`; GRPO L3 uses 25) distinct
+3. The `action_freq`-weighted mean over the row's first 50 (`prepare_data.py --num_targets`, as GRPO L3) distinct
    future behaviors of
    `(P(partial) + 2 * P(perfect)) / 2`.
 

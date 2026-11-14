@@ -4,7 +4,7 @@ name=compute_score, reward_kwargs.jev_urls=<serve_jev.sh's last line>.
 verl calls compute_score once per answer, in the reward loop workers (Ray actors, CPU only), several answers of a
 worker at once in threads. The reward itself is l3_reward.L3Reward; this file only feeds it what verl passes:
     solution_str              the decoded answer (a cut answer is not valid JSON: verl does not pass the finish reason)
-    ground_truth              the user's target future behaviors (prepare_rl_data.py: the first 25 distinct ones in time order)
+    ground_truth              the user's target future behaviors (prepare_rl_data.py: the first 50 distinct ones in time order)
     extra_info["content"]     the Layer-3 Commercial user message
     extra_info["category"]    the row's category column, {interest_name: "/A/B"}
     extra_info["commercial_interests"]  the reference commercial interest names (JSON list): the profiled interests

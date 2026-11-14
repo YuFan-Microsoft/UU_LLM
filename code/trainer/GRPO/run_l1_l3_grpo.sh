@@ -9,7 +9,7 @@
 #   Layer 1   l1/l1_reward.py: the mean of past_assignment and future_retrieval (Qwen3-Embedding-8B, every action
 #             weighted by 1 / (1 + action_freq / 100)), within the
 #             step's L1_BATCH (32) Layer-1 users (one single-language pool)
-#   Layer 3   l3/training/l3_reward.py: the JEV expected match of the answer's mai_profile over the user's first 25
+#   Layer 3   l3/training/l3_reward.py: the JEV expected match of the answer's mai_profile over the user's first 50
 #             distinct future behaviors in time order, weighted as Layer 1's actions (1 / (1 + action_freq / 100))
 # Both are 0 when the answer breaks its task's rules. Every visible GPU trains; the embedding server (serve_embedding.sh,
 # GPU 0) and the JEV servers (serve_jev.sh, GPUs 1-7) run on another node.
