@@ -5,7 +5,8 @@
 #   1. prepare_data.py        download the assessment parquet; users.jsonl (each user's past behaviors once) and
 #                             rows.jsonl (one line per test row)
 #   2. commercial_profiles.py Layer 1 -> Layer 3 of the profile model on users.jsonl (one vLLM engine per visible GPU)
-#                             -> commercial.jsonl: each user's commercial interests, sorted by confidence
+#                             -> commercial.jsonl: each user's commercial interests with a commercial_score of at least
+#                             MIN_COMMERCIAL_SCORE (default medium), sorted by confidence
 #   3. classify.py            each user's first 10 commercial interests as the EVAL_Dataset mai_profile, every row
 #                             scored by the classifier; the predicted label shares are printed every 1000 rows
 # Usage: sh run_e2e_ads_eval.sh <profile model ckpt> <classifier step_N ckpt> [classify.py args]
@@ -15,6 +16,7 @@
 # rows.jsonl, commercial.jsonl, pipeline.log and classifier_<last 2 parts of the classifier ckpt path>/ with
 # predictions.jsonl, profiles.jsonl and summary.json.
 # Env: NUM_GPUS (classifier GPUs, default 8), MAX_USERS (0 = all; e.g. 20 for a smoke test, with a fresh OUTPUT_DIR),
+#      MIN_COMMERCIAL_SCORE (any / low / medium / high, default medium; delete commercial.jsonl to redo it),
 #      ENGINE_PRESET (vLLM preset of ../../inference/run_inference.py, default original), HF_TOKEN (gated dataset).
 # =============================================================================
 set -eu
@@ -51,7 +53,8 @@ run_pipeline() {
         echo "$OUTPUT_DIR/commercial.jsonl exists: skipping"
     else
         python3 commercial_profiles.py --checkpoint "$PROFILE_CKPT" --input "$OUTPUT_DIR/users.jsonl" \
-            --output_file "$OUTPUT_DIR/commercial.jsonl.tmp" --engine_preset "${ENGINE_PRESET:-original}"
+            --output_file "$OUTPUT_DIR/commercial.jsonl.tmp" --engine_preset "${ENGINE_PRESET:-original}" \
+            --min_commercial_score "${MIN_COMMERCIAL_SCORE:-medium}"
         mv "$OUTPUT_DIR/commercial.jsonl.tmp" "$OUTPUT_DIR/commercial.jsonl"
     fi
 
