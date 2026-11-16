@@ -33,7 +33,7 @@ def dumps(value) -> str:
 # ---------------------------------------------------------------------------
 # Based on code/trainer/SFT/user_profile_rules.py so this directory runs on its own. keys_valid of every task: exactly
 # the expected keys at every level (any order) with the expected value types of the V3 SFT answers
-# (docs/V3_user_profile_dataset_schema.md), the "json_valid" of the rollout metrics.
+# (code/trainer/SFT/V3_user_profile_dataset_schema.md), the "json_valid" of the rollout metrics.
 # ---------------------------------------------------------------------------
 
 INPUT_MARKER = "\nInput:\n"  # between the prompt and the input

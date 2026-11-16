@@ -150,7 +150,7 @@ the two postprocessing records copy the snapshot, so they keep its `date` (the u
 | 4 | `layer4_hyper_commercial_interest` (discovery + enhancement in one call) | `personal_context` / `professional_context` `""`, `commercial_preferences` (JSON string of the short form, as production's `project_commercial_preferences`: each dimension, shopper type and dining restriction with a known value and `confidence_score` >= 0.3 as `{value, confidence_score}`, the product categories, no empty containers; `""` when nothing is left), the `### Interest N` blocks of the commercial interests (Category, Persona, Activity, Existing queries, Known entities; no Intent line); no `query_language` | no commercial interest |
 | — | `layer4_postprocessing` | rule: Layer-3 snapshot + biography, life stage, `user_attributes`, commercial preferences, `enriched_commercial_interests`, and the missions appended to `interests` as `hyper_commercial` | — |
 
-Payloads follow the V3 SFT data (`docs/V3_user_profile_dataset_schema.md`) with the user-context fields empty, as in
+Payloads follow the V3 SFT data (`code/trainer/SFT/V3_user_profile_dataset_schema.md`) with the user-context fields empty, as in
 the rows without user context: `{}` for declared attributes and facts, `""` for the personal / professional
 context. No input carries an inferred intent or a query language: V3 answers are written in the language of their
 evidence, and the records carry no `_query_language`. A hyper answer is accepted (else
