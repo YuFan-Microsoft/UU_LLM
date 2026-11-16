@@ -2,10 +2,10 @@
 
 The rules mirror the data-cleaning scripts, so an output "passes" when it would
 survive cleaning:
-    L1:            pyscript/data_cleaning/layer1_step1_rule_based_clean.py
-    L1 Negative:   pyscript/data_cleaning/layer1_negative_feedback_step1_merge_input_output.py / _step2_rule_based_clean.py
-    L2:            pyscript/data_cleaning/layer2_step1_rule_based_clean.py
-    L3 / L4:       pyscript/data_cleaning/layer3_*_rule_based_clean.py, layer4_biography / commercial_preference
+    L1:            pyscript/data_cleaning/layer1/layer1_step1_rule_based_clean.py
+    L1 Negative:   pyscript/data_cleaning/layer1_negative_feedback/layer1_negative_feedback_step1_merge_input_output.py / _step2_rule_based_clean.py
+    L2:            pyscript/data_cleaning/layer2/layer2_step1_rule_based_clean.py
+    L3 / L4:       pyscript/data_cleaning/layer3_*/layer3_*_rule_based_clean.py, layer4_biography / commercial_preference
                    (--version v3) and layer4_hyper_step3_rule_based_clean.py
 The schemas are the V3 ones (code/trainer/SFT/V3_user_profile_dataset_schema.md): multilingual, no inferred intent, no
 predicted_content_locale and no query_language.
@@ -392,7 +392,7 @@ def check_layer2(payload, output):
 
 
 # ---------------------------------------------------------------------------
-# L1 Negative, Layers 3 and 4, mirroring their pyscript/data_cleaning/*_rule_based_clean.py scripts.
+# L1 Negative, Layers 3 and 4, mirroring their pyscript/data_cleaning/*/*_rule_based_clean.py scripts.
 # keys_valid(output) is json_valid: exactly the expected keys at every level (any order) with the expected value
 # types (string, int, bool, null, list, object). Enums, empty text and counts are rules, checked by check().
 # check(payload, output) returns violations (or (violations, stats)); every violation is one of these categories:

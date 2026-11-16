@@ -28,7 +28,7 @@ import sys
 import orjson
 from tqdm import tqdm
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent / "layer1"))
 from layer1_step3_build_sft_data import length_stats  # noqa: E402
 
 _TOKENIZER = None

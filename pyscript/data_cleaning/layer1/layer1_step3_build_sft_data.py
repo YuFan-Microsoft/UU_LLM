@@ -1,0 +1,177 @@
+#!/usr/bin/env python3
+"""Build Qwen SFT data (train/test JSONL with a `messages` column) from the
+Layer-1 step2 output (GPT-5.6 Final: multilingual, no content locale, no intent).
+
+Each row becomes:
+    {"messages": [{"role": "user", "content": PROMPT + "\\nInput:\\n" + <activity lines>},
+                  {"role": "assistant", "content": <{"interests": [...]} JSON>}],
+     "user_hash": ..., "language": <step2 row language, metadata only>}
+
+PROMPT is prompts/prompt_l1.md verbatim. Signals are sorted by date (oldest first,
+original order within a day), re-numbered 0..n-1 in that reading order, and written
+one minified JSON object per line (the GPT-5.6 Final signals carry no DetailedSource):
+    {"idx":0,"date":"YYYY-MM-DD","source":"Bing","action":"..."}
+    {"idx":1,"date":"YYYY-MM-DD","source":"MSN","action":"..."}
+Answer `evidence` indices are remapped to the new idx and sorted; the answer keeps the teacher's key order, which
+prompt_l1.md states (F7: {"interests": [{"interest_name", "topics": [{"topic", "evidence"}], "actual_activity"}]}).
+
+The "\\nInput:\\n" marker and this input layout match what
+code/trainer/SFT/user_profile_rules.py parses. JSON is minified.
+Train/test is split by user_hash so a user never appears in both.
+"""
+
+from __future__ import annotations
+
+import argparse
+from collections import Counter
+import json
+import os
+from pathlib import Path
+import statistics
+
+import orjson
+from tqdm import tqdm
+
+
+PROMPT = (Path(__file__).resolve().parents[3] / "prompts" / "prompt_l1.md").read_text(encoding="utf-8")
+INPUT_MARKER = "\nInput:\n"
+
+
+def dumps(value) -> str:
+    return orjson.dumps(value).decode("utf-8")
+
+
+def build_input(signals: list[dict]) -> tuple[str, dict[int, int]]:
+    """Return the activity lines (one JSON object per line) and the old-idx -> new-idx mapping."""
+    ordered = sorted(signals, key=lambda signal: (signal["Date"], signal["idx"]))
+    lines: list[str] = []
+    remap: dict[int, int] = {}
+    for new_idx, signal in enumerate(ordered):
+        remap[signal["idx"]] = new_idx
+        lines.append(dumps({"idx": new_idx, "date": signal["Date"], "source": signal["Source"],
+                            "action": signal["Action"]}))
+    return "\n".join(lines), remap
+
+
+def remap_interests(interests: list[dict], remap: dict[int, int]) -> list[dict]:
+    remapped = []
+    for interest in interests:
+        topics = []
+        for topic in interest["topics"]:
+            unknown = [idx for idx in topic["evidence"] if idx not in remap]
+            if unknown:
+                raise ValueError(f"evidence idx {unknown} not found in signals")
+            topics.append({**topic, "evidence": sorted({remap[idx] for idx in topic["evidence"]})})
+        remapped.append({**interest, "topics": topics})
+    return remapped
+
+
+def build_example(record: dict) -> dict:
+    payload, remap = build_input(record["signals"])
+    answer = {"interests": remap_interests(record["interests"], remap)}
+    return {
+        "messages": [
+            {"role": "user", "content": PROMPT + INPUT_MARKER + payload},
+            {"role": "assistant", "content": dumps(answer)},
+        ],
+        "user_hash": record["user_hash"],
+        "language": record["language"],
+    }
+
+
+def is_test_user(user_hash: str, test_ratio: float) -> bool:
+    return int(user_hash, 16) % 10_000 < test_ratio * 10_000
+
+
+def load_token_counter(tokenizer_name: str | None):
+    if not tokenizer_name:
+        return None
+    from transformers import AutoTokenizer
+
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+    def count(messages: list[dict]) -> int:
+        # Same call as deepspeed_llm_trainer.encode_sft_example; transformers v5 may still return a dict.
+        input_ids = tokenizer.apply_chat_template(
+            messages, tokenize=True, return_dict=False, add_generation_prompt=False, enable_thinking=False)
+        if isinstance(input_ids, dict):
+            input_ids = input_ids["input_ids"]
+        return len(input_ids)
+
+    return count
+
+
+PERCENTILES = {"p50": 0.5, "p90": 0.9, "p95": 0.95, "p99": 0.99, "p999": 0.999}
+
+
+def length_stats(values: list[int]) -> dict:
+    if not values:
+        return {}
+    ordered = sorted(values)
+    stats = {"mean": round(statistics.mean(ordered))}
+    stats.update({name: ordered[int(q * (len(ordered) - 1))] for name, q in PERCENTILES.items()})
+    stats["max"] = ordered[-1]
+    return stats
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Build Layer-1 SFT train/test JSONL for Qwen.")
+    parser.add_argument("--input", required=True, type=Path, help="step2 output (l1.jsonl)")
+    parser.add_argument("--out-dir", required=True, type=Path, help="Directory for train.jsonl / test.jsonl")
+    parser.add_argument("--test-ratio", type=float, default=0.02, help="Fraction of users held out for test")
+    parser.add_argument("--tokenizer", help="HF tokenizer name or path (e.g. the Qwen3.5-4B model dir) to report "
+                                            "full-chat token length percentiles; rows are never filtered by length")
+    parser.add_argument("--limit", type=int, default=0, help="Only process the first N rows (0 = all)")
+    return parser.parse_args()
+
+
+def main() -> None:
+    args = parse_args()
+    args.out_dir.mkdir(parents=True, exist_ok=True)
+    count_tokens = load_token_counter(args.tokenizer)
+
+    rows = Counter()
+    languages = {"train": Counter(), "test": Counter()}
+    users = {"train": set(), "test": set()}
+    user_chars, answer_chars, token_lengths = [], [], []
+    paths = {split: args.out_dir / f"{split}.jsonl" for split in ("train", "test")}
+    temporaries = {split: path.with_suffix(".jsonl.tmp") for split, path in paths.items()}
+    handles = {split: path.open("wb") for split, path in temporaries.items()}
+    try:
+        with args.input.open("rb") as source:
+            for line_number, line in enumerate(tqdm(source, desc="Building SFT", unit="rows"), 1):
+                if args.limit and line_number > args.limit:
+                    break
+                example = build_example(orjson.loads(line))
+                if count_tokens:
+                    token_lengths.append(count_tokens(example["messages"]))
+                split = "test" if is_test_user(example["user_hash"], args.test_ratio) else "train"
+                handles[split].write(orjson.dumps(example) + b"\n")
+                rows[split] += 1
+                languages[split][example["language"]] += 1
+                users[split].add(example["user_hash"])
+                user_chars.append(len(example["messages"][0]["content"]))
+                answer_chars.append(len(example["messages"][1]["content"]))
+    finally:
+        for handle in handles.values():
+            handle.close()
+    for split, temporary in temporaries.items():
+        os.replace(temporary, paths[split])
+
+    summary = {
+        "input": str(args.input),
+        "rows": dict(rows),
+        "users": {split: len(values) for split, values in users.items()},
+        "test_ratio": args.test_ratio,
+        "languages": {split: dict(counter.most_common()) for split, counter in languages.items()},
+        "user_chars": length_stats(user_chars),
+        "assistant_chars": length_stats(answer_chars),
+    }
+    if token_lengths:
+        summary["tokens"] = {"tokenizer": args.tokenizer, **length_stats(token_lengths)}
+    (args.out_dir / "summary.json").write_text(json.dumps(summary, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
+
+
+if __name__ == "__main__":
+    main()
