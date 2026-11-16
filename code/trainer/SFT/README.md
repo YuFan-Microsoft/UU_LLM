@@ -361,7 +361,7 @@ deepspeed deepspeed_llm_trainer.py --dataset_name <hf_dataset> --model_name_or_p
   (`[{"role": "user", ...}, {"role": "assistant", ...}]`).
 - User-profile SFT loads `yufan/user_profile_dataset` with the eight `V35_` configs (L1, L1 Negative, L2, L3 Persona,
   L3 Commercial, L4 Biography, L4 Commercial Preference, L4 Hyper; GPT-5.6 F7 teacher data, multilingual, each with its
-  task prompt, rows ≤ 25,600 Qwen3.5-4B tokens; schema in `docs/V3_user_profile_dataset_schema.md`, except that V35 L1
+  task prompt, rows ≤ 25,600 Qwen3.5-4B tokens; schema in `code/trainer/SFT/V3_user_profile_dataset_schema.md`, except that V35 L1
   answers write interest_name before topics and topic before evidence, and V35 L3 Commercial leaves the entity and
   query lists empty for non-commercial interests; L1 Negative is the V3 copy). Rollout scoring rules exist for all eight configs (see the rollout metrics below).
 - The train split is mixed with `--dataset_mixing_weights` (`V35_MIXTURE` in `deepspeed_user_profile_trainer.py`):
