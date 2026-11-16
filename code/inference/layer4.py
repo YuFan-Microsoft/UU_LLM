@@ -4,7 +4,7 @@
     -> layer4_hyper_commercial_interest record -> layer4_postprocessing (the final profile)
 
 Payloads follow the V3 SFT data (layer4_biography_step3 / layer4_commercial_preference_step3 /
-layer4_hyper_step4_build_sft_data.py and docs/V3_user_profile_dataset_schema.md), built from the production
+layer4_hyper_step4_build_sft_data.py and code/trainer/SFT/V3_user_profile_dataset_schema.md), built from the production
 (MAIProfile_Official) requests. There is no user context here: declared attributes and facts are {}, and the personal
 / professional context sections of the hyper input are "". No input carries an inferred intent, and the hyper input
 has no query_language.

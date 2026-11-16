@@ -7,7 +7,7 @@ survive cleaning:
     L2:            pyscript/data_cleaning/layer2_step1_rule_based_clean.py
     L3 / L4:       pyscript/data_cleaning/layer3_*_rule_based_clean.py, layer4_biography / commercial_preference
                    (--version v3) and layer4_hyper_step3_rule_based_clean.py
-The schemas are the V3 ones (docs/V3_user_profile_dataset_schema.md): multilingual, no inferred intent, no
+The schemas are the V3 ones (code/trainer/SFT/V3_user_profile_dataset_schema.md): multilingual, no inferred intent, no
 predicted_content_locale and no query_language.
 
 Flow:
