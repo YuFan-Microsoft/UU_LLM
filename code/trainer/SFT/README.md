@@ -498,7 +498,7 @@ One section per V3 task: every section has the 4 shared charts plus 1-4 task cha
 | L4 Biography | `source_grounded_ratio` | Outputs whose `linkedin` / `location_data` sources have that fact in the input (and LinkedIn occupation / company / education_area the field they copy, unless a status such as Self-Employed) |
 | L4 Commercial Preference | `value_detail_consistent_ratio` | Outputs whose sensitivity / affinity values are Unknown exactly without details and otherwise within the range of their detail levels, whose shopper types and dining restrictions equal their details, and whose product categories do not repeat |
 
-L1 Negative / L3 / L4 rule categories (mirroring `pyscript/data_cleaning/*_rule_based_clean.py`):
+L1 Negative / L3 / L4 rule categories (mirroring `pyscript/data_cleaning/*/*_rule_based_clean.py`):
 
 | Category | Rules |
 | --- | --- |
@@ -522,7 +522,7 @@ and evidence <- all interests' `actual_activity`; L4 Hyper mission name and quer
 of its source interests. Both sides use the data cleaning's fastText lid.176 vote (every distinct non-URL text tagged
 with probability >= 0.5 votes, the top language needs >= 60%, otherwise "mix"; Chinese is split into `zh-Hans` /
 `zh-Hant` with OpenCC), and languages match by family (`LANGUAGE_FAMILIES` of
-`pyscript/data_cleaning/layer1_step2_language_detection.py`, plus Chinese). A unit is skipped when either side is
+`pyscript/data_cleaning/layer1/layer1_step2_language_detection.py`, plus Chinese). A unit is skipped when either side is
 "mix" or has no taggable text. `wrong_language` needs more than half of an output's checked units to mismatch, since
 single short names and queries are often brand-only. On the V3 test references every task passes the rules at
 >= 99.7%, and English rewrites of non-English L1 / L3 Persona outputs are flagged. It needs `fasttext-wheel` and `opencc-python-reimplemented` (in the Dockerfile and
