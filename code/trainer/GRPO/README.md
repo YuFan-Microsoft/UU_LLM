@@ -48,7 +48,9 @@ retrieves the user's next-week messenger action at rank 1, and citing such actio
 
 - `past_assignment` (within the user): each visible input action is owned by its most similar topic (a tie counts if
   a citing topic is among the tied); the weight of the actions owned by a topic citing them, divided by the larger
-  of the weight of the actions cited and 0.7 of the weight of the visible actions (`PAST_COVERAGE_TARGET`). It
+  of the weight of every citation (an action cited by k topics weighs k times, as at most one of them owns it) and
+  0.7 of the weight of the visible actions (`PAST_COVERAGE_TARGET`), so citing one action from several topics no
+  longer hedges ownership for free (`citations_per_evidence` follows it). It
   compares the user's own topics only,
   never other users' actions, so a word shared by every label (a place, a language) does not help; an action left
   uncited, cited by a topic that does not own it, or owned by a more similar sibling topic earns nothing. Ownership
@@ -251,15 +253,16 @@ NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_r
 
 ## Following the reward
 
-Every validation logs only the mean over all validation answers of thirteen signals (W&B / console, set by
+Every validation logs only the mean over all validation answers of fourteen signals (W&B / console, set by
 `trainer.val_core_metrics` in the launcher): `val-core/user_profile_l1/<signal>` for `reward`, `n_interests`,
 `coverage` (diagnostic only), `past_assignment`, `future_retrieval`, their diagnostic
 `past_assignment_unweighted` / `future_retrieval_unweighted`, `json_valid`,
 `rule_pass`, and the diagnostic answer shape: `topics_per_interest`, `evidence_per_topic` (distinct idx),
+`citations_per_evidence` (topics citing each cited idx: 1 when no two topics cite the same action),
 `interest_name_tokens` and `topic_tokens` (generation-tokenizer tokens, as the label token limit counts them),
 each first averaged within an answer, over every interest and topic written, and skipped for answers without any.
 Step 0 is the starting checkpoint, scored like `case_study/` scores it.
-Each training step logs the same thirteen means over its rollouts
+Each training step logs the same fourteen means over its rollouts
 (`trainer.train_core_metrics`): `train-core/user_profile_l1/<signal>`,
 `reward` being `critic/score/mean`;
 the `training/`, `num_turns/`, `timing_s/`, `timing_per_token_ms/` and `prompt_length/` metrics are not logged

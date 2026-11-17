@@ -26,7 +26,8 @@ exclude special tokens and apply to every name and topic;
 long-tail action counts about 1 and a ubiquitous one (a messenger, an AI assistant, a start page) about 0.
 
 - `past_assignment`: the weight of the user's visible input actions owned by a topic that cites them, divided by the
-  larger of the weight of the actions cited and 0.7 of the weight of the visible actions; each visible action is
+  larger of the weight of every citation (an action cited by k topics weighs k times) and 0.7 of the weight of the
+  visible actions; each visible action is
   owned by its most similar topic (a tie counts if a citing topic is among the tied). Only the user's own topics
   compete, never other users' actions.
 - `future_retrieval`: every next-week action in the pool is scored by its most similar topic of the answer; of the
@@ -156,7 +157,7 @@ summary and, for the first `--report_prompts` prompts, the input signals and eve
 | `rule_pass` | The shared GRPO judgement: JSON-valid and no violation (`user_profile_rules.score_example`, `truncated`, `interest_name_too_long` / `topic_too_long` for any name or topic over its limit: 6 generation-tokenizer tokens for an English interest, else 10) |
 | `n_interests` | Number of interests written |
 | `coverage` | Share of the input indices cited by the answer (diagnostic only, not in the reward) |
-| `past_assignment` | The weight of this user's visible input actions owned (most similar topic, `<interest name>: <topic>`, among the answer's topics) by a topic citing them, over the larger of the weight of the actions cited and 0.7 of the weight of the visible actions; weight 1 / (1 + action_freq / 100) (reward signal) |
+| `past_assignment` | The weight of this user's visible input actions owned (most similar topic, `<interest name>: <topic>`, among the answer's topics) by a topic citing them, over the larger of the weight of every citation (an action cited by k topics weighs k times) and 0.7 of the weight of the visible actions; weight 1 / (1 + action_freq / 100) (reward signal) |
 | `future_retrieval` | Of the pool's next-week actions ranked by their most similar topic, the weight of this user's actions in the top B (B = this user's distinct next-week actions) over the weight of all of them (reward signal) |
 | `past_assignment_unweighted` / `future_retrieval_unweighted` | The same with every action weighing 1 (diagnostic only) |
 

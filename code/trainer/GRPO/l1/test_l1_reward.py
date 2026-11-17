@@ -187,11 +187,13 @@ class DualPoolRewardTest(unittest.TestCase):
         for count in (1, 5, 9, 12, 18, 27):
             with self.subTest(count=count):
                 result = self.score(count)
-                # Every interest cites only P0, which I0 owns: 1 correct, below the coverage target of 25.
-                self.assertAlmostEqual(result["past_assignment"], 1 / self.target)
+                # Every interest cites only P0, which I0 owns: 1 correct of `count` citations, and below 18 citations
+                # the coverage target of 25 (17.5) is the denominator.
+                past = 1 / max(count, self.target)
+                self.assertAlmostEqual(result["past_assignment"], past)
                 # I<n> retrieves F<n>; the rest of the top 20 are other users' actions.
                 self.assertAlmostEqual(result["future_retrieval"], min(count, 20) / 20)
-                self.assertAlmostEqual(result["reward"], (1 / self.target + min(count, 20) / 20) / 2)
+                self.assertAlmostEqual(result["reward"], (past + min(count, 20) / 20) / 2)
                 self.assertTrue(0 <= result["reward"] <= 1)
 
     def test_future_retrieval_picks_the_users_actions_out_of_a_fixed_budget(self):
@@ -246,6 +248,22 @@ class DualPoolRewardTest(unittest.TestCase):
         shifted = [[("topic", [index])] for index in range(20)] + [[("topic", [20 + (index + 1) % 5])]
                                                                     for index in range(5)]
         self.assertAlmostEqual(past(shifted)["past_assignment"], 20 / 25)
+
+    def test_repeated_citations_cost_once_per_extra_citation(self):
+        def past(interests, past_freqs=None):
+            return self.scorer(content(self.past), topics_answer(interests), None, self.future, past_freqs, None)
+
+        # I<n> owns P<n>: 20 correct citations score 1.
+        self.assertEqual(past([[("topic", [index])] for index in range(20)])["past_assignment"], 1)
+        # Each interest also citing its neighbour's action hedges nothing: 20 owned of 40 citations.
+        hedged = past([[("topic", [index, (index + 1) % 20])] for index in range(20)])
+        self.assertEqual(hedged["past_assignment"], 0.5)
+        self.assertEqual(hedged["citations_per_evidence"], 2)
+        # Repeated citations weigh as their action does: a ubiquitous action cited by every topic costs (almost) nothing.
+        w = reward.action_weight(10000)
+        freqs = [10000] + [0] * 24
+        ubiquitous = past([[("topic", [index] + ([0] if index else []))] for index in range(20)], freqs)
+        self.assertAlmostEqual(ubiquitous["past_assignment"], (w + 19) / (20 * w + 19))
 
     def test_action_weight(self):
         self.assertEqual(reward.action_weight(None), 1)
@@ -397,11 +415,12 @@ class DualPoolRewardTest(unittest.TestCase):
             {"interest_name": "I0", "actual_activity": "Synthetic activity",
              "topics": [{"topic": "a", "evidence": [0, 1, 1]}, {"topic": "b", "evidence": [2]}]},
             {"interest_name": "I1", "actual_activity": "Synthetic activity",
-             "topics": [{"topic": "c", "evidence": [3, 4, 5]}]},
+             "topics": [{"topic": "c", "evidence": [1, 2, 3]}]},
         ]}
         result = self.scorer(content(self.past), json.dumps(output), None, self.future)
         self.assertEqual(result["topics_per_interest"], 1.5)
         self.assertEqual(result["evidence_per_topic"], 2)  # distinct idx: 2, 1, 3
+        self.assertEqual(result["citations_per_evidence"], 1.5)  # 6 citations of 4 distinct idx (1 and 2 twice)
         self.assertEqual(result["interest_name_tokens"], 3)
         self.assertEqual(result["topic_tokens"], 2)
         for text in ("not JSON", answer(0)):
@@ -473,7 +492,7 @@ class TokenLimitRewardTest(unittest.TestCase):
         self.assertFalse(result["rule_pass"])
         self.assertEqual(result["reward"], 0.0)
         self.assertEqual(result["violations"], ["interest_name_too_long"])
-        self.assertEqual(result["past_assignment"], 1.0)
+        self.assertEqual(result["past_assignment"], 0.5)  # signals still computed: I0 owns P0, cited by both
 
     def test_second_topic_rejects_whole_rollout(self):
         output = json.loads(answer(1))

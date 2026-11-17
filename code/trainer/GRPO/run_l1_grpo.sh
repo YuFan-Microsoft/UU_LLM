@@ -6,7 +6,8 @@
 # Limits: context 25600 tokens, response 8192 tokens.
 # SFT_REPLAY=0 disables replay and extra SFT evaluation.
 # Reward: mean of past_assignment (visible actions owned by the topic citing them, within the user, over the
-# larger of the actions cited and 0.7 of them) and future_retrieval (of the batch next-week actions, the top B by
+# larger of every citation, an action cited by k topics counting k times, and 0.7 of the actions) and
+# future_retrieval (of the batch next-week actions, the top B by
 # the most similar topic, B = the user's next-week actions: the share that are the user's), every action weighted by
 # 1 / (1 + action_freq / 100) so ubiquitous actions count ~0; coverage and the unweighted signals are diagnostic.
 # Embeddings: EMBEDDING_URL (one server or several, comma-separated) / EMBEDDING_NODE (+ EMBEDDING_GPUS for one server
@@ -256,8 +257,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.save_freq="${SAVE_FREQ:-100}" \
     trainer.test_freq="${TEST_FREQ:-100}" \
     trainer.validation_data_dir="$OUTPUT_DIR/validation" \
-    +trainer.val_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens']" \
-    +trainer.train_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','interest_name_tokens','topic_tokens']" \
+    +trainer.val_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens']" \
+    +trainer.train_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens']" \
     +trainer.drop_metric_prefixes="['training/','num_turns/','timing_s/','timing_per_token_ms/','prompt_length/']" \
     trainer.total_epochs=1 \
     "${SFT_ARGS[@]}" \

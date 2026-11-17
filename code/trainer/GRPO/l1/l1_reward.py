@@ -11,8 +11,8 @@ about 1 and a ubiquitous one (a messenger, an AI assistant, a browser start page
 counts half. Without frequencies every action weighs 1.
     past_assignment     within the user: each visible input action is owned by its most similar topic (a tie counts
                         if a citing topic is among the tied); the weight of the actions owned by a topic citing them,
-                        divided by the larger of the weight of the actions cited and PAST_COVERAGE_TARGET (0.7) of the
-                        weight of the visible actions
+                        divided by the larger of the weight of every citation (an action cited by k topics weighs k
+                        times) and PAST_COVERAGE_TARGET (0.7) of the weight of the visible actions
     future_retrieval    across the batch: every next-week action of every batch user is scored by its most similar
                         topic of this answer (other users' answers play no part); of the top B, B being the number of
                         this user's distinct next-week actions, the weight of this user's actions over the weight of
@@ -23,7 +23,9 @@ coverage target. They earn and cost (almost) nothing now; past_assignment_unweig
 (every weight 1) are logged as diagnostics.
 past_assignment compares the user's own topics only, never other users' actions: a word shared by every label (a
 place, a language) does not help, and only correct citations earn: an action left uncited, cited by a topic that
-does not own it, or owned by a more similar sibling topic earns nothing. Below the coverage target, citing fewer
+does not own it, or owned by a more similar sibling topic earns nothing. Every citation counts in the denominator, so
+an action cited by several topics (all but its owner wrongly) costs once per extra citation: citing the same action
+from several topics no longer hedges ownership for free. Below the coverage target, citing fewer
 actions costs; above it, only the citations' correctness counts (the V35 GPT-5.6 labels cite 0.78 of the input
 actions on average, 0.67 at P25), so skipping noise is free and a wrong citation always costs. One topic citing
 everything owns everything there; future_retrieval checks that the topics also pick this user's next week out of the
@@ -32,7 +34,8 @@ topic common to everyone (a messenger, a login page) also ranks other users' act
 same actions, and more interests or topics add no slots.
 Coverage, the share of input indices cited by the answer, is logged but does not affect the reward directly.
 So is the answer's shape (STRUCTURE_SIGNALS, every interest and topic written): topics per interest, distinct
-evidence per topic, and generation-tokenizer tokens per interest_name and per topic.
+evidence per topic, topics citing each cited idx (1 without overlap), and generation-tokenizer tokens per
+interest_name and per topic.
 This batch's visible past actions are embedded once per batch (set_pools), so past_assignment reuses them, and its
 next-week actions are the future pool. Query embeddings and repeated action embeddings are shared.
 The embeddings are Qwen3-Embedding-8B's, computed in process (Embedder) or by vLLM
@@ -81,7 +84,8 @@ ACTION_FREQ_HALF_WEIGHT = 100
 UNWEIGHTED_SIGNALS = ("past_assignment_unweighted", "future_retrieval_unweighted")
 SIGNALS = ("coverage", *REWARD_SIGNALS, *UNWEIGHTED_SIGNALS)  # All logged content metrics; only REWARD_SIGNALS count.
 # Diagnostic answer-shape metrics; None when the answer has no interest (or, for the topic ones, no topic).
-STRUCTURE_SIGNALS = ("topics_per_interest", "evidence_per_topic", "interest_name_tokens", "topic_tokens")
+STRUCTURE_SIGNALS = ("topics_per_interest", "evidence_per_topic", "citations_per_evidence", "interest_name_tokens",
+                     "topic_tokens")
 DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B"
 SERVED_EMBEDDING_MODEL = "l1-embedding"  # --served-model-name of the vLLM embedding server
 # Seconds an embedding server that failed a request is skipped (the others take its share).
@@ -135,9 +139,13 @@ def structure_signals(output: dict, tokenizer: "PreTrainedTokenizerBase") -> dic
     def tokens(text: str) -> int:
         return len(tokenizer.encode(text, add_special_tokens=False))
 
+    citations = [set(topic["evidence"]) for topic in topics]
+    cited = set().union(*citations)
     return {
         "topics_per_interest": len(topics) / len(interests) if interests else None,
-        "evidence_per_topic": statistics.mean(len(set(topic["evidence"])) for topic in topics) if topics else None,
+        "evidence_per_topic": statistics.mean(len(evidence) for evidence in citations) if topics else None,
+        # Topics citing each cited idx, on average: 1 when no two topics cite the same action.
+        "citations_per_evidence": sum(map(len, citations)) / len(cited) if cited else None,
         "interest_name_tokens": statistics.mean(tokens(interest["interest_name"]) for interest in interests)
         if interests else None,
         "topic_tokens": statistics.mean(tokens(topic["topic"]) for topic in topics) if topics else None,
@@ -177,12 +185,14 @@ def assign_owners(similarity: list[list[float]], citations: list[set[int]],
     return counted, owners
 
 
-def past_score(counted: list[bool], cited: set[int], indices: list[int], weights: list[float]) -> float:
-    """past_assignment: the weight of the counted actions over the larger of the weight of the cited ones and
-    PAST_COVERAGE_TARGET of the weight of all visible actions (columns of `indices`)."""
+def past_score(counted: list[bool], citations: list[set[int]], indices: list[int], weights: list[float]) -> float:
+    """past_assignment: the weight of the counted actions over the larger of the weight of every citation (an action
+    cited by k topics weighs k times: at most one of them owns it) and PAST_COVERAGE_TARGET of the weight of all
+    visible actions (columns of `indices`)."""
     weight_of = dict(zip(indices, weights))
     return (sum(weight for count, weight in zip(counted, weights) if count)
-            / max(sum(weight_of[idx] for idx in cited), PAST_COVERAGE_TARGET * sum(weights)))
+            / max(sum(weight_of[idx] for cited in citations for idx in cited if idx in weight_of),
+                  PAST_COVERAGE_TARGET * sum(weights)))
 
 
 class Embedder:
@@ -398,10 +408,9 @@ class L1Reward:
                           @ self.embedder.encode([signal["action"] for signal in signals], query=False).T).tolist()
             visible = [signal["idx"] for signal in signals]
             counted, owners = assign_owners(similarity, citations, visible)
-            cited = set().union(*citations) & set(visible)
             weights = [1.0] * len(visible) if past_freqs is None else [action_weight(freq) for freq in past_freqs]
-            past_assignment = past_score(counted, cited, visible, weights)
-            past_unweighted = past_score(counted, cited, visible, [1.0] * len(visible))
+            past_assignment = past_score(counted, citations, visible, weights)
+            past_unweighted = past_score(counted, citations, visible, [1.0] * len(visible))
             past_owners = [list(topics[owner][:2]) for owner in owners]
         # Future: the same topics pick this user's next-week actions out of every batch user's.
         freq_of: dict[str, int | None] = {}
