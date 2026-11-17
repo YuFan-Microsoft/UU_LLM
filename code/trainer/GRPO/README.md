@@ -231,9 +231,9 @@ L1-only validation. PPL evaluation sleeps colocated rollout replicas first and r
 | `SFT_REPLAY_COEF` | `0.1`; replay batch size is fixed at 2 rows per training GPU per step |
 | `SFT_MAX_SEQ_LENGTH` | `25600`, for replay and reference PPL; cannot exceed 25600 |
 | `SFT_EVAL_SAMPLES` | `500` per task; must be between 1 and 500 |
-| `SFT_EVAL_MAX_PROMPT_LENGTH` / `SFT_EVAL_MAX_RESPONSE_LENGTH` | `17408` / `8192`, for guardrail generation |
+| `SFT_EVAL_MAX_RESPONSE_LENGTH` | `8192`, for guardrail generation: each answer gets at most this, within the context its prompt leaves. Test prompts have no separate limit; preparation fails if a test row's prompt + reference answer exceeds 25600 tokens (no row is silently dropped) |
 | `SFT_DATA_REVISION` | `main`, resolved and pinned when preparing a new directory |
-| `SFT_REPLAY_DIR` | `outputs/data/sft_v2_<checkpoint>_seq25600_prompt17408_test500` |
+| `SFT_REPLAY_DIR` | `outputs/data/sft_v2_<checkpoint>_seq25600_test500` |
 
 RL, replay and evaluation share a fixed maximum sequence/context length of **25600** tokens.
 Generated responses are capped at **8192** tokens, leaving **17408** prompt tokens by default.

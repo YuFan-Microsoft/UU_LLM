@@ -103,30 +103,27 @@ SFT_ARGS=()
 if [ "$SFT_REPLAY" = 1 ]; then
   SFT_MAX_SEQ_LENGTH=${SFT_MAX_SEQ_LENGTH:-$MAX_MODEL_LEN}
   SFT_EVAL_MAX_RESPONSE_LENGTH=${SFT_EVAL_MAX_RESPONSE_LENGTH:-$MAX_RESPONSE_LENGTH}
-  SFT_EVAL_MAX_PROMPT_LENGTH=${SFT_EVAL_MAX_PROMPT_LENGTH:-$((MAX_MODEL_LEN - SFT_EVAL_MAX_RESPONSE_LENGTH))}
+  # Each V3 test row's prompt + reference answer fits the 25600-token context (l1/sft_replay.py checks it); each
+  # generation gets the response budget within the context its prompt leaves (l1/sft_runtime.py).
   if [ "$SFT_MAX_SEQ_LENGTH" -lt 2 ] || [ "$SFT_MAX_SEQ_LENGTH" -gt "$MAX_MODEL_LEN" ] \
-      || [ "$SFT_EVAL_MAX_RESPONSE_LENGTH" -lt 1 ] || [ "$SFT_EVAL_MAX_RESPONSE_LENGTH" -gt 8192 ] \
-      || [ "$SFT_EVAL_MAX_PROMPT_LENGTH" -lt 1 ] \
-      || [ $((SFT_EVAL_MAX_PROMPT_LENGTH + SFT_EVAL_MAX_RESPONSE_LENGTH)) -gt "$MAX_MODEL_LEN" ]; then
-    echo "SFT requires sequence/prompt + response <= 25600 tokens and response <= 8192 tokens" >&2
+      || [ "$SFT_EVAL_MAX_RESPONSE_LENGTH" -lt 1 ] || [ "$SFT_EVAL_MAX_RESPONSE_LENGTH" -gt 8192 ]; then
+    echo "SFT requires sequence <= 25600 tokens and response <= 8192 tokens" >&2
     exit 1
   fi
   SFT_EVAL_SAMPLES=${SFT_EVAL_SAMPLES:-500}
-  SFT_REPLAY_DIR=${SFT_REPLAY_DIR:-$HERE/outputs/data/sft_v2_$(basename "$CHECKPOINT")_seq${SFT_MAX_SEQ_LENGTH}_prompt${SFT_EVAL_MAX_PROMPT_LENGTH}_test${SFT_EVAL_SAMPLES}}
+  SFT_REPLAY_DIR=${SFT_REPLAY_DIR:-$HERE/outputs/data/sft_v2_$(basename "$CHECKPOINT")_seq${SFT_MAX_SEQ_LENGTH}_test${SFT_EVAL_SAMPLES}}
   if [ ! -f "$SFT_REPLAY_DIR/meta.json" ]; then
     python3 l1/sft_replay.py --output_dir "$SFT_REPLAY_DIR" --tokenizer "$CHECKPOINT" \
-      --revision "${SFT_DATA_REVISION:-main}" --max_seq_length "$SFT_MAX_SEQ_LENGTH" \
-      --max_prompt_length "$SFT_EVAL_MAX_PROMPT_LENGTH" --test_samples "$SFT_EVAL_SAMPLES"
+      --revision "${SFT_DATA_REVISION:-main}" --max_seq_length "$SFT_MAX_SEQ_LENGTH" --test_samples "$SFT_EVAL_SAMPLES"
   fi
-  python3 - "$SFT_REPLAY_DIR/meta.json" "$CHECKPOINT" "$SFT_MAX_SEQ_LENGTH" \
-    "$SFT_EVAL_MAX_PROMPT_LENGTH" "$SFT_EVAL_SAMPLES" <<'EOF'
+  python3 - "$SFT_REPLAY_DIR/meta.json" "$CHECKPOINT" "$SFT_MAX_SEQ_LENGTH" "$SFT_EVAL_SAMPLES" <<'EOF'
 import json, sys
 from l1.sft_replay import FORMAT_VERSION, REPLAY_CONFIGS
 
 meta = json.load(open(sys.argv[1]))
 if (meta.get("format_version") != FORMAT_VERSION or set(meta.get("train", {})) != set(REPLAY_CONFIGS)
         or meta["tokenizer"] != sys.argv[2] or meta["max_seq_length"] != int(sys.argv[3])
-        or meta["max_prompt_length"] != int(sys.argv[4]) or meta["test_samples"] != int(sys.argv[5])):
+        or meta["test_samples"] != int(sys.argv[4])):
     sys.exit(f"{sys.argv[1]}: replay task set or preparation settings changed; use another SFT_REPLAY_DIR")
 EOF
   python3 -c "from l1.sft_runtime import ActorReplay, evaluate_sft"

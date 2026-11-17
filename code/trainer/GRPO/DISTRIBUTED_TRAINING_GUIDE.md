@@ -21,8 +21,8 @@ reward worker 会分布到所有有 CPU 资源的存活 Ray 节点；各节点�
 
 **当前仓库与下文历史部署的区别**：当前 `run_l1_grpo.sh` 仍默认 `trainer.nnodes=1`，
 仅设置 `NNODES=2` 不会生效；两节点启动需追加 `trainer.nnodes=2`。
-历史示例中的 `SFT_EVAL_MAX_PROMPT_LENGTH=24576` 与 response 8192 之和超过当前 25600 上限，
-当前版本应使用 prompt 17408 / response 8192，或不覆盖脚本默认值。
+SFT 评估已不再有单独的 prompt 上限（`SFT_EVAL_MAX_PROMPT_LENGTH` / `--max_prompt_length` 已删除），
+只要求每条评估样本的 prompt + 参考答案不超过 25600 tokens；历史示例中的这两个设置可直接去掉。
 
 ## 1. 当前布局与正式任务
 
@@ -313,8 +313,7 @@ TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1 python3 l1/prepare_data.py \
 export SFT_REPLAY_DIR="$GRPO_DIR/outputs/data/sft_v2_Final_CKPT_seq25600_prompt24576_test500_sha84fd43abef6e"
 TOKENIZERS_PARALLELISM=false OMP_NUM_THREADS=1 python3 l1/sft_replay.py \
   --output_dir "$SFT_REPLAY_DIR" --tokenizer "$CHECKPOINT" \
-  --revision "$HF_DATA_REVISION" --max_seq_length 25600 \
-  --max_prompt_length 24576 --test_samples 500
+  --revision "$HF_DATA_REVISION" --max_seq_length 25600 --test_samples 500
 ```
 
 应得到 `meta.json`、`eval.parquet`、32 个 `.npy` 索引及可读的 `raw/` 文件树。当前八个 replay train 集共有 1922110 行，评估为 500 × 8 = 4000 行。
@@ -355,7 +354,7 @@ ssh node-1 "ln -s '$HF_HUB_CACHE/datasets--yufan--user_profile_dataset/snapshots
 当前策略：
 
 - RL 的 prompt/response 上限仍是 17408/8192。
-- SFT 评估显式设置 `SFT_EVAL_MAX_PROMPT_LENGTH=24576`。
+- SFT 评估不设单独的 prompt 上限：准备数据时只检查每条 prompt + 参考答案不超过 25600 tokens，超过即报错。
 - 总上下文保持 25600，不扩大模型上下文。
 - 每条 SFT 生成的输出上限为 `min(8192, 25600 - 实际prompt长度)`。
 - 普通短样本仍有最多 8192 输出预算，不是一刀切改成 1024。
@@ -565,7 +564,7 @@ export EMBEDDING_URL=http://node-2:8100   # 多个服务用逗号分隔，见 9.
 export SFT_REPLAY=1 SFT_REPLAY_COEF=0.1
 export TRAIN_BATCH_SIZE=64 N=16 VAL_N=16 NUM_VAL=64 NUM_TRAIN_BATCHES=0
 export SFT_EVAL_SAMPLES=500 SFT_MAX_SEQ_LENGTH=25600
-export SFT_EVAL_MAX_PROMPT_LENGTH=24576 SFT_EVAL_MAX_RESPONSE_LENGTH=8192
+export SFT_EVAL_MAX_RESPONSE_LENGTH=8192
 export SFT_DATA_REVISION="$HF_DATA_REVISION"
 export SAVE_FREQ=100 TEST_FREQ=100 LR=7e-7
 export LOGGER="['console','wandb']"
@@ -604,7 +603,7 @@ python3 -u "$MONITOR" "$OUTPUT_DIR" 2181 bash "$GRPO_DIR/run_l1_grpo.sh" \
 
 - RL 准备：`batch_size=16`、`num_train_batches=5`、`num_val=16`，应有 80 条 train、16 条 val。
 - Rollout：`TRAIN_BATCH_SIZE=16`、`N=2`、`VAL_N=1`。
-- SFT 评估可用 `SFT_EVAL_SAMPLES=2`，但 replay meta、`SFT_REPLAY_DIR` 和 `SFT_EVAL_MAX_PROMPT_LENGTH` 必须一致；本次 debug cache 的 prompt budget 为 17408。
+- SFT 评估可用 `SFT_EVAL_SAMPLES=2`，但 replay meta 和 `SFT_REPLAY_DIR` 必须一致。
 - `trainer.total_training_steps=5`、`SAVE_FREQ=5`、`TEST_FREQ=5`，先用 console logger。
 - 选择全新的实验名/输出目录，必要时设置 `trainer.resume_mode=disable`，避免直接恢复已完成的旧五步结果。
 - 一轮训练只有两个 batch 时不会凭空执行五次更新；不要只准备两批数据又把它当作五步验收。

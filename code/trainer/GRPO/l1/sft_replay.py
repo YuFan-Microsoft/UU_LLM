@@ -55,8 +55,8 @@ def index_shard(path: Path, destination: Path) -> int:
 def prepare(args: argparse.Namespace, tokenizer) -> dict:
     if not 1 <= args.test_samples <= 500:
         raise ValueError("--test_samples must be between 1 and 500 per task")
-    if not 2 <= args.max_seq_length <= MAX_MODEL_LEN or not 1 <= args.max_prompt_length < MAX_MODEL_LEN:
-        raise ValueError(f"SFT sequence length must be 2-{MAX_MODEL_LEN} and prompt length 1-{MAX_MODEL_LEN - 1}")
+    if not 2 <= args.max_seq_length <= MAX_MODEL_LEN:
+        raise ValueError(f"SFT sequence length must be 2-{MAX_MODEL_LEN}")
     import pyarrow as pa
     import pyarrow.parquet as pq
     from datasets import load_dataset
@@ -104,10 +104,11 @@ def prepare(args: argparse.Namespace, tokenizer) -> dict:
             for row in islice(dataset, args.test_samples):
                 messages = validate_messages(row)
                 prompt = chat_template_ids(messages[:-1], tokenizer, generation=True).tolist()
-                if len(prompt) > args.max_prompt_length:
-                    raise ValueError(f"{config} test prompt has {len(prompt)} tokens > {args.max_prompt_length}; "
-                                     "resolve the prompt budget within the fixed 25600-token context "
-                                     "(no test rows are silently filtered)")
+                # Only prompt + reference answer must fit the context; generation gets what the prompt leaves.
+                total = len(chat_template_ids(messages, tokenizer, generation=False))
+                if total > MAX_MODEL_LEN:
+                    raise ValueError(f"{config} test row has {len(prompt)} prompt + {total - len(prompt)} answer "
+                                     f"tokens > {MAX_MODEL_LEN} (no test rows are silently filtered)")
                 rows.append({"config": config, "messages": messages, "prompt_ids": prompt,
                              **encode_example(messages, tokenizer, args.max_seq_length)})
             if not rows:
@@ -117,7 +118,7 @@ def prepare(args: argparse.Namespace, tokenizer) -> dict:
             print(f"SFT test {config}: {len(rows)} rows", flush=True)
     meta = {
         "format_version": FORMAT_VERSION, "repo": HF_REPO, "revision": revision, "tokenizer": args.tokenizer,
-        "max_seq_length": args.max_seq_length, "max_prompt_length": args.max_prompt_length,
+        "max_seq_length": args.max_seq_length,
         "test_samples": args.test_samples, "test_counts": test_counts, "train": train,
     }
     temporary = args.output_dir / "meta.json.tmp"
@@ -132,8 +133,7 @@ class ReplayData:
         self.meta = json.loads((self.directory / "meta.json").read_text(encoding="utf-8"))
         if self.meta["format_version"] != FORMAT_VERSION or set(self.meta["train"]) != set(REPLAY_CONFIGS):
             raise ValueError(f"{directory}: incompatible replay manifest")
-        if (not 2 <= self.meta["max_seq_length"] <= MAX_MODEL_LEN
-                or not 1 <= self.meta["max_prompt_length"] < MAX_MODEL_LEN):
+        if not 2 <= self.meta["max_seq_length"] <= MAX_MODEL_LEN:
             raise ValueError(f"{directory}: replay lengths exceed the fixed {MAX_MODEL_LEN}-token context")
         if set(self.meta["test_counts"]) != set(V3_MIXTURE):
             raise ValueError(f"{directory}: expected test examples for all eight V3 tasks")
@@ -187,6 +187,14 @@ class ReplayData:
             raise ValueError(f"{config}: test row count differs from the replay manifest")
         return table
 
+    def longest_test_prompt(self) -> int:
+        import pyarrow.compute as pc
+        import pyarrow.parquet as pq
+
+        lengths = pc.list_value_length(pq.read_table(self.directory / "eval.parquet", columns=["prompt_ids"])
+                                       .column("prompt_ids"))
+        return int(pc.max(lengths).as_py())
+
     def close(self) -> None:
         for stream in self.handles.values():
             stream.close()
@@ -203,7 +211,6 @@ def main() -> None:
     parser.add_argument("--revision", default="main")
     parser.add_argument("--test_samples", type=int, default=500)
     parser.add_argument("--max_seq_length", type=int, default=MAX_MODEL_LEN)
-    parser.add_argument("--max_prompt_length", type=int, default=MAX_MODEL_LEN - MAX_RESPONSE_LENGTH)
     args = parser.parse_args()
     prepare(args, AutoProcessor.from_pretrained(args.tokenizer, trust_remote_code=True).tokenizer)
 

@@ -160,8 +160,9 @@ def evaluate_sft(trainer) -> dict[str, float]:
         if not 1 <= response_length <= MAX_RESPONSE_LENGTH:
             raise ValueError(f"SFT evaluation response length must be 1-{MAX_RESPONSE_LENGTH}")
         context = trainer.config.actor_rollout_ref.rollout.max_model_len
-        if context > MAX_MODEL_LEN or data.meta["max_prompt_length"] >= context:
-            raise ValueError(f"SFT evaluation requires its prompts ({data.meta['max_prompt_length']} tokens) < "
+        longest = data.longest_test_prompt()
+        if context > MAX_MODEL_LEN or longest >= context:
+            raise ValueError(f"SFT evaluation requires its prompts ({longest} tokens) < "
                              f"rollout.max_model_len <= {MAX_MODEL_LEN}")
         metrics = asyncio.run(guardrail_evaluation(trainer, data, settings))
         # Actor evaluation must not coexist with awake colocated vLLM engines.
