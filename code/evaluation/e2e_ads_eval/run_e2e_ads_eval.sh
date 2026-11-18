@@ -9,8 +9,9 @@
 #                             MIN_COMMERCIAL_SCORE (default medium), sorted by confidence
 #   3. classify.py            each user's first 10 commercial interests as the EVAL_Dataset mai_profile, every row
 #                             scored by the classifier; the predicted label shares are printed every 1000 rows
-# Usage: sh run_e2e_ads_eval.sh <profile model ckpt> <classifier step_N ckpt> [classify.py args]
-#        (POSIX sh: also runs with bash, dash or ./run_e2e_ads_eval.sh)
+# Usage: sh run_e2e_ads_eval.sh <profile model ckpt> [classifier ckpt] [classify.py args]
+#        (POSIX sh: also runs with bash, dash or ./run_e2e_ads_eval.sh; the classifier defaults to the reward model
+#        /yufan/MAI_Profile/checkpoints/reward_model)
 # A step whose output exists is skipped, so a rerun resumes and another classifier reuses the same profiles (delete a
 # file to redo its step). Under $OUTPUT_DIR (default output/<last 3 parts of the profile ckpt path>): users.jsonl,
 # rows.jsonl, commercial.jsonl, pipeline.log and classifier_<last 2 parts of the classifier ckpt path>/ with
@@ -20,13 +21,19 @@
 #      ENGINE_PRESET (vLLM preset of ../../inference/run_inference.py, default original), HF_TOKEN (gated dataset).
 # =============================================================================
 set -eu
-if [ $# -lt 2 ]; then
-    echo "usage: $0 <profile model ckpt> <classifier step_N ckpt> [classify.py args]" >&2
+if [ $# -lt 1 ]; then
+    echo "usage: $0 <profile model ckpt> [classifier ckpt] [classify.py args]" >&2
     exit 2
 fi
 PROFILE_CKPT=$(cd "$1" && pwd)
-CLASSIFIER_CKPT=$(cd "$2" && pwd)
-shift 2
+shift
+# The 2nd argument is the classifier unless it is omitted or a classify.py option
+CLASSIFIER_CKPT=/yufan/MAI_Profile/checkpoints/reward_model
+case ${1:-} in
+    ""|-*) ;;
+    *) CLASSIFIER_CKPT=$1; shift ;;
+esac
+CLASSIFIER_CKPT=$(cd "$CLASSIFIER_CKPT" && pwd)
 cd "$(dirname "$0")"
 
 # The last k parts of a path joined by "_": .../4B/Final_CKPT -> 4B_Final_CKPT (k = 2)
