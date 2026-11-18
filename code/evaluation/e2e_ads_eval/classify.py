@@ -8,7 +8,7 @@ a ../../trainer/JEV/Qwen35_profile_classifier.py checkpoint with its prompt, tru
   profiles.jsonl     {"userid", "n_commercial_interests", "mai_profile"} per user
   summary.json       predicted label counts / shares and the run settings
 
-  accelerate launch --multi_gpu --num_processes 8 classify.py --checkpoint <classifier step_N dir> \
+  accelerate launch --multi_gpu --num_processes 8 classify.py [--checkpoint <classifier dir>] \
       --commercial_file commercial.jsonl --rows_file rows.jsonl --output_dir <dir>
 """
 import argparse
@@ -127,8 +127,9 @@ def predict(model, loader, accelerator, n, report_rows, labels):
 # =========================================================
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument("--checkpoint", required=True,
-                        help="A step_<N> directory saved by ../../trainer/JEV/Qwen35_profile_classifier.py")
+    parser.add_argument("--checkpoint", default="/yufan/MAI_Profile/checkpoints/reward_model",
+                        help="A directory saved by ../../trainer/JEV/Qwen35_profile_classifier.py (default: the reward "
+                             "model)")
     parser.add_argument("--commercial_file", required=True, help="commercial_profiles.py output")
     parser.add_argument("--rows_file", required=True, help="prepare_data.py rows.jsonl")
     parser.add_argument("--output_dir", required=True)
