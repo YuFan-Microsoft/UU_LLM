@@ -38,7 +38,8 @@ if TYPE_CHECKING:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from l1_reward import DEFAULT_EMBEDDING_MODEL, SIGNALS, STRUCTURE_SIGNALS, L1Reward  # noqa: E402
+from l1_reward import (DEFAULT_EMBEDDING_MODEL, SIGNALS, STRUCTURE_SIGNALS, VOCAB_REWARD_COEF,  # noqa: E402
+                       VOCAB_SIGNAL, L1Reward, load_vocab)
 
 NUM_THREADS_ENV = "L1_REWARD_NUM_THREADS"
 _lock = threading.Lock()
@@ -57,24 +58,29 @@ def load_pools(pool_file: str, batch_id: str) -> dict[str, list[str]]:
 
 
 def reward_fn(embedding_model: str, embedding_url: str | None, embedding_batch_size: int,
-              tokenizer: "PreTrainedTokenizerBase") -> L1Reward:
+              tokenizer: "PreTrainedTokenizerBase", vocab_file: str | None = None,
+              vocab_coef: float = VOCAB_REWARD_COEF) -> L1Reward:
     if _state["reward_fn"] is None:
         import torch
 
         torch.set_num_threads(int(os.environ.get(NUM_THREADS_ENV, 8)))
         _state["reward_fn"] = L1Reward(embedding_model, embedding_batch_size, embedding_url=embedding_url,
-                                     tokenizer=deepcopy(tokenizer))
+                                     tokenizer=deepcopy(tokenizer),
+                                     vocab=load_vocab(vocab_file) if vocab_file else None, vocab_coef=vocab_coef)
     return _state["reward_fn"]
 
 
 def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict, pool_file: str,
                   tokenizer: "PreTrainedTokenizerBase",
                   embedding_url: str | None = None, embedding_model: str = DEFAULT_EMBEDDING_MODEL,
-                  embedding_batch_size: int = 256, **kwargs) -> dict:
+                  embedding_batch_size: int = 256, vocab_file: str | None = None,
+                  vocab_coef: float = VOCAB_REWARD_COEF, **kwargs) -> dict:
     """The reward ("score") of one answer and the signals it is computed from, all numbers (verl averages them),
-    plus the answer-shape STRUCTURE_SIGNALS, None when undefined (the core-metric means skip None)."""
+    plus the answer-shape STRUCTURE_SIGNALS and VOCAB_SIGNAL, None when undefined (the core-metric means skip None).
+    vocab_file (reward_kwargs) is the standardized interest-name vocabulary; without it vocab_rate is None."""
     with _lock:
-        scorer = reward_fn(embedding_model, embedding_url, embedding_batch_size, tokenizer)
+        scorer = reward_fn(embedding_model, embedding_url, embedding_batch_size, tokenizer, vocab_file,
+                           float(vocab_coef))
         batch_id = str(extra_info["batch_id"])
         if batch_id != _state["batch_id"]:
             scorer.set_pools(**load_pools(pool_file, batch_id))
@@ -84,4 +90,5 @@ def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict
     return {"score": float(result["reward"]), "json_valid": float(result["json_valid"]),
             "rule_pass": float(result["rule_pass"]), "n_interests": float(result["n_interests"]),
             **{name: float(result[name]) for name in SIGNALS},
-            **{name: None if result[name] is None else float(result[name]) for name in STRUCTURE_SIGNALS}}
+            **{name: None if result[name] is None else float(result[name])
+               for name in (*STRUCTURE_SIGNALS, VOCAB_SIGNAL)}}

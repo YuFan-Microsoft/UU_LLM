@@ -386,6 +386,25 @@ class DualPoolRewardTest(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "Layer-1 prompt"):
             reward.input_signals("not a Layer-1 prompt")
 
+    def test_vocab_rate_rewards_standardized_english_names_only(self):
+        base = self.score(2)
+        self.assertIsNone(base[reward.VOCAB_SIGNAL])
+        with TemporaryDirectory() as directory:
+            path = Path(directory) / "vocab.jsonl"
+            path.write_text("\n".join(json.dumps(line) for line in [
+                {"interest_name": "I0", "count": 20, "variants": [{"name": "I1", "count": 9}]},
+                {"interest_name": "Other", "count": 20, "variants": []}]) + "\n", encoding="utf-8")
+            self.scorer.vocab = reward.load_vocab(str(path))
+        self.assertEqual(self.scorer.vocab, {"I0", "Other"})  # variants are not standardized names
+        with patch.object(reward.user_profile_rules, "detect_language", return_value="en"):
+            english = self.score(2)
+        self.assertEqual(english[reward.VOCAB_SIGNAL], 0.5)  # I0 standardized, I1 only a variant
+        self.assertAlmostEqual(english["reward"], base["reward"] + reward.VOCAB_REWARD_COEF * 0.5)
+        with patch.object(reward.user_profile_rules, "detect_language", return_value="fr"):
+            french = self.score(2)
+        self.assertIsNone(french[reward.VOCAB_SIGNAL])
+        self.assertAlmostEqual(french["reward"], base["reward"])
+
     def test_adapter_returns_all_metrics_and_caches_both_pools(self):
         pools = {"past_actions": self.past + ["DP"], "future_actions": self.future + ["DF"]}
         with patch.object(verl_reward, "_state", {"reward_fn": self.scorer, "batch_id": None}), \
@@ -397,8 +416,10 @@ class DualPoolRewardTest(unittest.TestCase):
                                                   "pools.parquet", tokenizer=self.scorer.tokenizer)
             loader.assert_called_once_with("pools.parquet", "train-000000")
         self.assertEqual(set(result), {"score", "json_valid", "rule_pass", "n_interests", *reward.SIGNALS,
-                                       *reward.STRUCTURE_SIGNALS})
-        self.assertTrue(all(isinstance(value, float) for value in result.values()))
+                                       *reward.STRUCTURE_SIGNALS, reward.VOCAB_SIGNAL})
+        self.assertIsNone(result[reward.VOCAB_SIGNAL])  # no vocab: not measured
+        self.assertTrue(all(isinstance(value, float) for name, value in result.items()
+                            if name != reward.VOCAB_SIGNAL))
         # The frequencies reach the reward: I0 cites and owns only P0, which is ubiquitous.
         self.assertAlmostEqual(result["past_assignment_unweighted"], 1 / self.target)
         self.assertLess(result["past_assignment"], 0.001)
@@ -569,7 +590,8 @@ class TokenLimitRewardTest(unittest.TestCase):
                                                    tokenizer), self.scorer)
         private_tokenizer = constructor.call_args.kwargs["tokenizer"]
         constructor.assert_called_once_with("embedding-model", 256, embedding_url="http://embedding",
-                                            tokenizer=private_tokenizer)
+                                            tokenizer=private_tokenizer, vocab=None,
+                                            vocab_coef=reward.VOCAB_REWARD_COEF)
         self.assertIsNot(private_tokenizer, tokenizer)
         self.assertEqual(len(private_tokenizer.encode("label", add_special_tokens=False)), 7)
         tokenizer.encode.assert_not_called()
@@ -982,7 +1004,8 @@ class CaseStudyTest(unittest.TestCase):
             (root / "rollouts.jsonl").write_text(json.dumps(row) + "\n")
             args = argparse.Namespace(output_dir=root, checkpoint="generation-checkpoint",
                                       embedding_model="synthetic", embedding_batch_size=256,
-                                      pool_users=64, embedding_url=None, report_prompts=1)
+                                      pool_users=64, embedding_url=None, report_prompts=1, vocab_file="",
+                                      vocab_coef=reward.VOCAB_REWARD_COEF)
             tokenizer = fake_tokenizer()
             processor = Mock()
             processor.from_pretrained.return_value.tokenizer = tokenizer
@@ -993,7 +1016,8 @@ class CaseStudyTest(unittest.TestCase):
                 with patch.object(layer1_sampling, "L1Reward", return_value=scorer) as constructor, patch("builtins.print"):
                     layer1_sampling.score(args)
             processor.from_pretrained.assert_called_once_with("generation-checkpoint", trust_remote_code=True)
-            constructor.assert_called_once_with("synthetic", 256, embedding_url=None, tokenizer=tokenizer)
+            constructor.assert_called_once_with("synthetic", 256, embedding_url=None, tokenizer=tokenizer, vocab=None,
+                                                vocab_coef=reward.VOCAB_REWARD_COEF)
             summary = json.loads((root / "summary.json").read_text())
             self.assertEqual(summary["metrics"]["past_assignment"]["mean"], 0.5)
             self.assertNotIn("past_recall@1", summary["metrics"])

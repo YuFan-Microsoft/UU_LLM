@@ -10,6 +10,8 @@
 # future_retrieval (of the batch next-week actions, the top B by
 # the most similar topic, B = the user's next-week actions: the share that are the user's), every action weighted by
 # 1 / (1 + action_freq / 100) so ubiquitous actions count ~0; coverage and the unweighted signals are diagnostic.
+# Plus VOCAB_REWARD_COEF (0.2) * vocab_rate: the share of English interests named exactly by VOCAB_FILE's standardized
+# interest_name (non-English interests are not supervised).
 # Embeddings: EMBEDDING_URL (one server or several, comma-separated) / EMBEDDING_NODE (+ EMBEDDING_GPUS for one server
 # per GPU there); otherwise the last local GPU.
 # See README.md for configuration, metrics and resume behavior.
@@ -56,6 +58,9 @@ if [ "$PPO_MAX_TOKEN_LEN_PER_GPU" -lt $((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH
 fi
 DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${TRAIN_BATCH_SIZE}_prompt${MAX_PROMPT_LENGTH}_pools_v5}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
+# Standardized English interest names (l1_reward.load_vocab): reward += VOCAB_REWARD_COEF * vocab_rate.
+VOCAB_FILE=/yufan/MAI_Profile/data_factory/Online_Top1M_Layer1_Result/layer1_interest_freq_normalized_en_min20.jsonl
+VOCAB_REWARD_COEF=${VOCAB_REWARD_COEF:-0.2}
 LOGGER=${LOGGER:-"['console','wandb']"}
 
 mkdir -p "$OUTPUT_DIR"
@@ -154,7 +159,7 @@ N_TRAIN_GPUS=$(echo "$TRAIN_GPUS" | tr ',' '\n' | grep -c .)
 echo "Reward embeddings at $EMBEDDING_URL; training on GPUs $TRAIN_GPUS"
 
 # Check reward dependencies before starting Ray.
-python3 - "$DATA_DIR" "$EMBEDDING_URL" "$EMBEDDING_MODEL" "$CHECKPOINT" <<'EOF'
+python3 - "$DATA_DIR" "$EMBEDDING_URL" "$EMBEDDING_MODEL" "$CHECKPOINT" "$VOCAB_FILE" "$VOCAB_REWARD_COEF" <<'EOF'
 import json, sys
 sys.path.insert(0, "l1")
 try:
@@ -170,7 +175,7 @@ from verl.utils import hf_tokenizer
 from verl.utils.fs import copy_to_local
 
 user_profile_rules.language_tools()  # downloads lid.176.bin once, before the reward workers need it
-data_dir, url, model, checkpoint = sys.argv[1:]
+data_dir, url, model, checkpoint, vocab_file, vocab_coef = sys.argv[1:]
 tokenizer = hf_tokenizer(copy_to_local(checkpoint), trust_remote_code=True)
 row = pq.read_table(f"{data_dir}/val.parquet").to_pylist()[0]
 answer = json.dumps({"interests": [{"topics": [{"evidence": [0], "topic": "test"}], "interest_name": "Test",
@@ -178,7 +183,8 @@ answer = json.dumps({"interests": [{"topics": [{"evidence": [0], "topic": "test"
 for text in ("not json", answer):
     result = compute_score(row["data_source"], text, row["reward_model"]["ground_truth"], row["extra_info"],
                            f"{data_dir}/pools.parquet", tokenizer=tokenizer,
-                           embedding_url=url, embedding_model=model)
+                           embedding_url=url, embedding_model=model, vocab_file=vocab_file,
+                           vocab_coef=float(vocab_coef))
     print(f"Preflight reward of {text[:20]!r}: {result}", flush=True)
 EOF
 
@@ -241,6 +247,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     +reward.custom_reward_function.reward_kwargs.pool_file="$DATA_DIR/pools.parquet" \
     +reward.custom_reward_function.reward_kwargs.embedding_url="'$EMBEDDING_URL'" \
     +reward.custom_reward_function.reward_kwargs.embedding_model="$EMBEDDING_MODEL" \
+    +reward.custom_reward_function.reward_kwargs.vocab_file="$VOCAB_FILE" \
+    +reward.custom_reward_function.reward_kwargs.vocab_coef="$VOCAB_REWARD_COEF" \
     trainer.critic_warmup=0 \
     +trainer.skip_on_policy_old_log_prob=True \
     trainer.logger="$LOGGER" \
@@ -254,8 +262,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.save_freq="${SAVE_FREQ:-100}" \
     trainer.test_freq="${TEST_FREQ:-100}" \
     trainer.validation_data_dir="$OUTPUT_DIR/validation" \
-    +trainer.val_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens']" \
-    +trainer.train_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens']" \
+    +trainer.val_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens','vocab_rate']" \
+    +trainer.train_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens','vocab_rate']" \
     +trainer.drop_metric_prefixes="['training/','num_turns/','timing_s/','timing_per_token_ms/','prompt_length/']" \
     trainer.total_epochs=1 \
     "${SFT_ARGS[@]}" \

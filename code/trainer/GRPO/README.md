@@ -26,7 +26,8 @@ GRPO/
 ## Reward
 
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, any `interest_name` or
-`topic` over its label token limit, cut at the response length), else the mean of two signals, each in [0, 1].
+`topic` over its label token limit, cut at the response length), else the mean of two signals, each in [0, 1], plus
+the standardized-name bonus below.
 The limit is per interest, by the language of the actions its topics cite (`user_profile_rules.detect_language`, the
 language rule's anchor): **at most 6 tokens** when English, **at most 10 tokens** otherwise (including mixed or
 untagged). It uses the **generation checkpoint's tokenizer**, with `add_special_tokens=False`, not the
@@ -74,6 +75,16 @@ matching actions and pushes this user's out of the budget, and sibling topics re
 
 `coverage`, the share of input indices cited by the answer, is diagnostic only: it is logged to W&B and does not
 enter the reward directly (`past_assignment` does reward citing up to 0.7 of the actions correctly).
+
+**Standardized interest names.** `vocab_rate` is the share of an answer's English interests (English by the
+language of the actions they cite, as for the 6-token limit) whose `interest_name`, stripped, exactly equals a
+standardized name: the `interest_name` of a line of `VOCAB_FILE`
+(`/yufan/MAI_Profile/data_factory/Online_Top1M_Layer1_Result/layer1_interest_freq_normalized_en_min20.jsonl`,
+fixed in the launcher; its `variants` do not count). Non-English interests are not supervised; an answer without
+English interests has `vocab_rate` None (skipped by the W&B means). A rule-passing answer's reward is the mean of the
+two signals **plus `VOCAB_REWARD_COEF` (0.2, env override) × `vocab_rate`** (0 without English interests), so it is
+in [0, 1.2]; a rule violation is still 0. `case_study/layer1_sampling.py score` applies the same vocabulary
+(`--vocab_file`, `--vocab_coef`).
 
 The batch's visible prompt actions are embedded once per batch and read back for each answer's `past_assignment`;
 they are excluded when removed by the 200-signal cap or token-budget trimming. The next-week actions of the batch are
@@ -253,16 +264,18 @@ NUM_TRAIN_BATCHES=2 SFT_EVAL_SAMPLES=2 LOGGER="['console']" EXPERIMENT_NAME=l1_r
 
 ## Following the reward
 
-Every validation logs only the mean over all validation answers of fourteen signals (W&B / console, set by
+Every validation logs only the mean over all validation answers of fifteen signals (W&B / console, set by
 `trainer.val_core_metrics` in the launcher): `val-core/user_profile_l1/<signal>` for `reward`, `n_interests`,
 `coverage` (diagnostic only), `past_assignment`, `future_retrieval`, their diagnostic
 `past_assignment_unweighted` / `future_retrieval_unweighted`, `json_valid`,
 `rule_pass`, and the diagnostic answer shape: `topics_per_interest`, `evidence_per_topic` (distinct idx),
 `citations_per_evidence` (topics citing each cited idx: 1 when no two topics cite the same action),
 `interest_name_tokens` and `topic_tokens` (generation-tokenizer tokens, as the label token limit counts them),
-each first averaged within an answer, over every interest and topic written, and skipped for answers without any.
+each first averaged within an answer, over every interest and topic written, and skipped for answers without any;
+and `vocab_rate` (the standardized-name share of the English interests, skipped for answers without one), whose
+`train-core` / `val-core` curves should rise over training.
 Step 0 is the starting checkpoint, scored like `case_study/` scores it.
-Each training step logs the same fourteen means over its rollouts
+Each training step logs the same fifteen means over its rollouts
 (`trainer.train_core_metrics`): `train-core/user_profile_l1/<signal>`,
 `reward` being `critic/score/mean`;
 the `training/`, `num_turns/`, `timing_s/`, `timing_per_token_ms/` and `prompt_length/` metrics are not logged

@@ -33,6 +33,11 @@ batch: B is fixed, so a topic earns only if it ranks this user's actions above o
 topic common to everyone (a messenger, a login page) also ranks other users' actions, sibling topics retrieve the
 same actions, and more interests or topics add no slots.
 Coverage, the share of input indices cited by the answer, is logged but does not affect the reward directly.
+Standardized naming (with a vocab, DEFAULT_VOCAB_FILE in GRPO): vocab_rate is the share of the answer's English
+interests (by the language of their cited actions, as the label token limit decides) whose interest_name is exactly a
+standardized name of the vocabulary (its lines' "interest_name", not their "variants"); other languages are not
+supervised (None when an answer has no English interest). A rule-passing answer's reward is the signal mean plus
+VOCAB_REWARD_COEF (0.2) * vocab_rate (0 without English interests), so in [0, 1.2].
 So is the answer's shape (STRUCTURE_SIGNALS, every interest and topic written): topics per interest, distinct
 evidence per topic, topics citing each cited idx (1 without overlap), and generation-tokenizer tokens per
 interest_name and per topic.
@@ -86,6 +91,12 @@ SIGNALS = ("coverage", *REWARD_SIGNALS, *UNWEIGHTED_SIGNALS)  # All logged conte
 # Diagnostic answer-shape metrics; None when the answer has no interest (or, for the topic ones, no topic).
 STRUCTURE_SIGNALS = ("topics_per_interest", "evidence_per_topic", "citations_per_evidence", "interest_name_tokens",
                      "topic_tokens")
+# Standardized English interest names: each line's "interest_name" (its "variants" are not standard).
+DEFAULT_VOCAB_FILE = ("/yufan/MAI_Profile/data_factory/Online_Top1M_Layer1_Result/"
+                      "layer1_interest_freq_normalized_en_min20.jsonl")
+# Reward bonus per unit of vocab_rate (the share of English interests named exactly by the vocabulary).
+VOCAB_REWARD_COEF = 0.2
+VOCAB_SIGNAL = "vocab_rate"
 DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B"
 SERVED_EMBEDDING_MODEL = "l1-embedding"  # --served-model-name of the vLLM embedding server
 # Seconds an embedding server that failed a request is skipped (the others take its share).
@@ -100,10 +111,31 @@ def embedding_text(text: str, query: bool) -> str:
     return f"Instruct: {EMBEDDING_INSTRUCTION}\nQuery:{text}" if query else text
 
 
+def is_english(interest: dict, action_by_idx: dict[int, str]) -> bool:
+    """Whether the actions the interest's topics cite are English (the language rule's anchor)."""
+    actions = [action_by_idx[idx] for topic in interest["topics"] for idx in topic["evidence"] if idx in action_by_idx]
+    return user_profile_rules.detect_language(actions) == "en"
+
+
 def label_token_limit(interest: dict, action_by_idx: dict[int, str]) -> int:
     """MAX_LABEL_TOKENS_EN when the actions the interest's topics cite are English, else MAX_LABEL_TOKENS_OTHER."""
-    actions = [action_by_idx[idx] for topic in interest["topics"] for idx in topic["evidence"] if idx in action_by_idx]
-    return MAX_LABEL_TOKENS_EN if user_profile_rules.detect_language(actions) == "en" else MAX_LABEL_TOKENS_OTHER
+    return MAX_LABEL_TOKENS_EN if is_english(interest, action_by_idx) else MAX_LABEL_TOKENS_OTHER
+
+
+def load_vocab(path: str) -> frozenset[str]:
+    """The standardized interest names of a vocabulary JSONL: every line's "interest_name"."""
+    with open(path, encoding="utf-8") as lines:
+        vocab = frozenset(json.loads(line)["interest_name"].strip() for line in lines if line.strip())
+    if not vocab:
+        raise ValueError(f"{path}: no interest_name")
+    return vocab
+
+
+def vocab_rate(interests: list[dict], action_by_idx: dict[int, str], vocab: frozenset[str]) -> float | None:
+    """The share of the English interests whose interest_name (stripped) is a standardized name of `vocab`; None
+    without English interests (other languages are not supervised)."""
+    names = [interest["interest_name"].strip() for interest in interests if is_english(interest, action_by_idx)]
+    return sum(name in vocab for name in names) / len(names) if names else None
 
 
 def judge(content: str, text: str, finish_reason: str | None,
@@ -325,10 +357,14 @@ class L1Reward:
 
     def __init__(self, embedding_model: str = DEFAULT_EMBEDDING_MODEL, batch_size: int = 256,
                  embedder: Embedder | EmbeddingClient | None = None,
-                 embedding_url: str | None = None, *, tokenizer: "PreTrainedTokenizerBase"):
+                 embedding_url: str | None = None, *, tokenizer: "PreTrainedTokenizerBase",
+                 vocab: frozenset[str] | None = None, vocab_coef: float = VOCAB_REWARD_COEF):
         """Use the generation `tokenizer` for label limits. Embeddings come from `embedder`, the vLLM server at
-        `embedding_url`, or `embedding_model` in process."""
+        `embedding_url`, or `embedding_model` in process. With `vocab` (load_vocab), a rule-passing answer earns
+        vocab_coef * vocab_rate on top of the signal mean; without it vocab_rate is None and the reward unchanged."""
         self.tokenizer = tokenizer
+        self.vocab = vocab
+        self.vocab_coef = vocab_coef
         user_profile_rules.language_tools()  # the language rule needs fastText lid.176.bin: fail before scoring
         if embedder is None:
             embedder = EmbeddingClient(embedding_url, batch_size) if embedding_url else Embedder(embedding_model,
@@ -370,7 +406,8 @@ class L1Reward:
         future_freqs of each action of `future` (None: every action weighs 1):
             reward, json_valid, rule_pass, violations, output (the parsed answer, None unless JSON-valid), n_interests,
             coverage, the two REWARD_SIGNALS and their UNWEIGHTED_SIGNALS (0 unless JSON-valid), STRUCTURE_SIGNALS
-            (None unless JSON-valid with interests / topics), and, None unless JSON-valid: queries (per interest, its
+            (None unless JSON-valid with interests / topics), VOCAB_SIGNAL (None unless JSON-valid with English
+            interests and a vocab), and, None unless JSON-valid: queries (per interest, its
             topics' queries), past_owners (per visible input action, in prompt order, [interest, topic] of the topic
             owning it; None without topics) and hits (per interest, [position in the distinct next-week actions, rank
             from 1] of the user's next-week actions in the top B whose most similar topic is one of the interest's).
@@ -378,7 +415,7 @@ class L1Reward:
         rules, output = judge(content, text, finish_reason, self.tokenizer)
         result = {"reward": INVALID_REWARD, "json_valid": rules["json_valid"], "rule_pass": rules["rule_pass"],
                   "violations": rules["violations"], "output": output, "n_interests": 0,
-                  **{name: 0.0 for name in SIGNALS}, **{name: None for name in STRUCTURE_SIGNALS},
+                  **{name: 0.0 for name in SIGNALS}, **{name: None for name in STRUCTURE_SIGNALS}, VOCAB_SIGNAL: None,
                   "queries": None, "past_owners": None, "hits": None}
         if output is None:
             return result
@@ -438,6 +475,10 @@ class L1Reward:
             "future_retrieval_unweighted": future_unweighted,
             "queries": by_interest, "past_owners": past_owners, "hits": hits,
         })
+        if self.vocab is not None:
+            result[VOCAB_SIGNAL] = vocab_rate(interests, {signal["idx"]: signal["action"] for signal in signals},
+                                              self.vocab)
         if rules["rule_pass"]:
-            result["reward"] = statistics.mean(result[name] for name in REWARD_SIGNALS)
+            result["reward"] = (statistics.mean(result[name] for name in REWARD_SIGNALS)
+                                + self.vocab_coef * (result[VOCAB_SIGNAL] or 0.0))
         return result

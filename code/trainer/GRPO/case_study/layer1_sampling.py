@@ -33,8 +33,8 @@ sys.path.insert(0, str(UU_LLM / "code" / "inference"))
 sys.path.insert(0, str(HERE.parent / "l1"))
 
 import layer1  # noqa: E402
-from l1_reward import (DEFAULT_EMBEDDING_MODEL, REWARD_SIGNALS, SIGNALS, UNWEIGHTED_SIGNALS, L1Reward,  # noqa: E402
-                       input_signals)
+from l1_reward import (DEFAULT_EMBEDDING_MODEL, DEFAULT_VOCAB_FILE, REWARD_SIGNALS, SIGNALS,  # noqa: E402
+                       UNWEIGHTED_SIGNALS, VOCAB_REWARD_COEF, L1Reward, input_signals, load_vocab)
 from rl_data import (DEFAULT_CHECKPOINT, HF_CONFIG_NAME, HF_REPO, clean_behaviors, index_rows, read_rows,  # noqa: E402
                      rl_data_files)
 import user_profile_rules  # noqa: E402
@@ -318,7 +318,8 @@ def score(args: argparse.Namespace) -> None:
     rows = read_jsonl(args.output_dir / "rollouts.jsonl")
     tokenizer = AutoProcessor.from_pretrained(args.checkpoint, trust_remote_code=True).tokenizer
     reward_fn = L1Reward(args.embedding_model, args.embedding_batch_size,
-                         embedding_url=args.embedding_url, tokenizer=tokenizer)
+                         embedding_url=args.embedding_url, tokenizer=tokenizer,
+                         vocab=load_vocab(args.vocab_file) if args.vocab_file else None, vocab_coef=args.vocab_coef)
     scored = []
     with (args.output_dir / "scores.jsonl").open("w", encoding="utf-8") as sink:
         for start in range(0, len(rows), args.pool_users):
@@ -503,6 +504,9 @@ def parse_args() -> argparse.Namespace:
     s.add_argument("--embedding_url", help="A vLLM embedding server of the same model instead (as the GRPO run's: "
                                             "vllm serve <model> --runner pooling --served-model-name l1-embedding)")
     s.add_argument("--embedding_batch_size", type=int, default=256)
+    s.add_argument("--vocab_file", default=DEFAULT_VOCAB_FILE,
+                   help="Standardized interest-name vocabulary of the GRPO reward ('' for none)")
+    s.add_argument("--vocab_coef", type=float, default=VOCAB_REWARD_COEF, help="Reward per unit of vocab_rate")
     s.add_argument("--pool_users", type=int, default=64,
                    help="Consecutive prompts per pool, as the GRPO batch (future_retrieval depends on the pool size)")
     s.add_argument("--report_prompts", type=int, default=16, help="Prompts shown sample by sample in report.md")
