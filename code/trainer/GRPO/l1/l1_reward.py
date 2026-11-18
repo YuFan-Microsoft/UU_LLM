@@ -93,7 +93,7 @@ STRUCTURE_SIGNALS = ("topics_per_interest", "evidence_per_topic", "citations_per
                      "topic_tokens")
 # Standardized English interest names: each line's "interest_name" (its "variants" are not standard).
 DEFAULT_VOCAB_FILE = ("/yufan/MAI_Profile/data_factory/Online_Top1M_Layer1_Result/"
-                      "layer1_interest_freq_normalized_en_min20.jsonl")
+                      "layer1_interest_freq_normalized_en_min20_cluster10K.jsonl")
 # Reward bonus per unit of vocab_rate (the share of English interests named exactly by the vocabulary).
 VOCAB_REWARD_COEF = 0.2
 VOCAB_SIGNAL = "vocab_rate"

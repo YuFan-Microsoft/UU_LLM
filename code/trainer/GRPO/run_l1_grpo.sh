@@ -59,7 +59,7 @@ fi
 DATA_DIR=${DATA_DIR:-$HERE/outputs/data/l1v1_seed${SEED}_batch${TRAIN_BATCH_SIZE}_prompt${MAX_PROMPT_LENGTH}_pools_v5}
 EMBEDDING_MODEL=${EMBEDDING_MODEL:-/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B}
 # Standardized English interest names (l1_reward.load_vocab): reward += VOCAB_REWARD_COEF * vocab_rate.
-VOCAB_FILE=/yufan/MAI_Profile/data_factory/Online_Top1M_Layer1_Result/layer1_interest_freq_normalized_en_min20.jsonl
+VOCAB_FILE=/yufan/MAI_Profile/data_factory/Online_Top1M_Layer1_Result/layer1_interest_freq_normalized_en_min20_cluster10K.jsonl
 VOCAB_REWARD_COEF=${VOCAB_REWARD_COEF:-0.2}
 LOGGER=${LOGGER:-"['console','wandb']"}
 

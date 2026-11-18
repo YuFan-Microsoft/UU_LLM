@@ -79,7 +79,7 @@ enter the reward directly (`past_assignment` does reward citing up to 0.7 of the
 **Standardized interest names.** `vocab_rate` is the share of an answer's English interests (English by the
 language of the actions they cite, as for the 6-token limit) whose `interest_name`, stripped, exactly equals a
 standardized name: the `interest_name` of a line of `VOCAB_FILE`
-(`/yufan/MAI_Profile/data_factory/Online_Top1M_Layer1_Result/layer1_interest_freq_normalized_en_min20.jsonl`,
+(`/yufan/MAI_Profile/data_factory/Online_Top1M_Layer1_Result/layer1_interest_freq_normalized_en_min20_cluster10K.jsonl`,
 fixed in the launcher; its `variants` do not count). Non-English interests are not supervised; an answer without
 English interests has `vocab_rate` None (skipped by the W&B means). A rule-passing answer's reward is the mean of the
 two signals **plus `VOCAB_REWARD_COEF` (0.2, env override) × `vocab_rate`** (0 without English interests), so it is
