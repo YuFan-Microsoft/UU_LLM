@@ -26,7 +26,11 @@ GRPO/
 ## Reward
 
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, any `interest_name` or
-`topic` over its label token limit, cut at the response length), else the mean of two signals, each in [0, 1].
+`topic` over its label token limit, cut at the response length), else the mean of two signals, each in [0, 1],
+minus **0.01 per interest** written (`INTEREST_PENALTY`). The signals see topics only, so without it splitting
+interests is free and merging them earns nothing; 0.01 is about what 3 correctly owned actions of a ~200-action user
+earn, so an interest pays for itself when it owns a few actions or helps retrieve next week. `n_interests` is not
+capped.
 The limit is per interest, by the language of the actions its topics cite (`user_profile_rules.detect_language`, the
 language rule's anchor): **at most 6 tokens** when English, **at most 10 tokens** otherwise (including mixed or
 untagged). It uses the **generation checkpoint's tokenizer**, with `add_special_tokens=False`, not the

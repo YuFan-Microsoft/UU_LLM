@@ -3,7 +3,8 @@
 The reward of one answer: 0 if it breaks the Layer-1 rules (not V3 JSON, a user_profile_rules violation such as a
 duplicate interest / topic, bad evidence or the wrong language, any interest_name or topic over its label token limit
 in generation tokenizer tokens (no special tokens): 6 when the interest's cited actions are English, else 10; or cut
-at max_tokens), else the mean of two signals, each in [0, 1]. Both use
+at max_tokens), else the mean of two signals, each in [0, 1], minus INTEREST_PENALTY (0.01) per interest written:
+the signals see topics only, so without it splitting interests is free and merging them earns nothing. Both use
 the same queries, one per topic written: "<interest name>: <topic>" (topic_query), and both weigh every action by
 how informative it is, from its global frequency (action_freq of the RL data, the occurrences of its normalized text
 over the whole corpus): action_weight = 1 / (1 + action_freq / ACTION_FREQ_HALF_WEIGHT), so a long-tail action counts
@@ -75,6 +76,9 @@ MAX_LABEL_TOKENS_EN = 6
 MAX_LABEL_TOKENS_OTHER = 10
 INVALID_REWARD = 0.0
 REWARD_SIGNALS = ("past_assignment", "future_retrieval")
+# Subtracted from a rule-passing answer's reward per interest: about what 3 correctly owned actions of a ~200-action
+# user earn.
+INTEREST_PENALTY = 0.01
 # past_assignment's denominator is at least this share of the visible actions: skipping beyond it is not penalized.
 PAST_COVERAGE_TARGET = 0.7
 # The action_freq at which an action weighs half (action_weight): where the corpus turns from tools, portals and login
@@ -439,5 +443,6 @@ class L1Reward:
             "queries": by_interest, "past_owners": past_owners, "hits": hits,
         })
         if rules["rule_pass"]:
-            result["reward"] = statistics.mean(result[name] for name in REWARD_SIGNALS)
+            result["reward"] = (statistics.mean(result[name] for name in REWARD_SIGNALS)
+                                - INTEREST_PENALTY * len(interests))
         return result
