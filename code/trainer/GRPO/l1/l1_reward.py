@@ -3,8 +3,9 @@
 The reward of one answer: 0 if it breaks the Layer-1 rules (not V3 JSON, a user_profile_rules violation such as a
 duplicate interest / topic, bad evidence or the wrong language, any interest_name or topic over its label token limit
 in generation tokenizer tokens (no special tokens): 6 when the interest's cited actions are English, else 10; or cut
-at max_tokens), else the mean of two signals, each in [0, 1], minus INTEREST_PENALTY (0.01) per interest written:
-the signals see topics only, so without it splitting interests is free and merging them earns nothing. Both use
+at max_tokens), else the mean of two signals, each in [0, 1], minus INTEREST_PENALTY (0.01) per interest beyond
+interest_cap of its input signal count (ceil(1.56 * signals ** 0.4), the SFT labels' mean): the signals see topics only, so
+without it splitting interests is free, and a penalty on every interest collapsed answers to one interest. Both use
 the same queries, one per topic written: "<interest name>: <topic>" (topic_query), and both weigh every action by
 how informative it is, from its global frequency (action_freq of the RL data, the occurrences of its normalized text
 over the whole corpus): action_weight = 1 / (1 + action_freq / ACTION_FREQ_HALF_WEIGHT), so a long-tail action counts
@@ -52,6 +53,7 @@ requests spread over them) on the same texts.
 """
 
 import json
+import math
 import statistics
 import sys
 import time
@@ -76,9 +78,14 @@ MAX_LABEL_TOKENS_EN = 6
 MAX_LABEL_TOKENS_OTHER = 10
 INVALID_REWARD = 0.0
 REWARD_SIGNALS = ("past_assignment", "future_retrieval")
-# Subtracted from a rule-passing answer's reward per interest: about what 3 correctly owned actions of a ~200-action
-# user earn.
+# Subtracted from a rule-passing answer's reward per interest beyond interest_cap(input signals): about what 3
+# correctly owned actions of a ~200-action user earn.
 INTEREST_PENALTY = 0.01
+# interest_cap = ceil(INTEREST_CAP_SCALE * signals ** INTEREST_CAP_EXPONENT): the least-squares fit of the mean interest
+# count of the Layer-1 SFT labels (SFT_User_Profile_L1_gpt56_V3, 71,890 train rows) by input signal count, e.g. 4 at 10
+# signals, 6 at 20, 8 at 50, 10 at 100, 13 at 200.
+INTEREST_CAP_SCALE = 1.56
+INTEREST_CAP_EXPONENT = 0.4
 # past_assignment's denominator is at least this share of the visible actions: skipping beyond it is not penalized.
 PAST_COVERAGE_TARGET = 0.7
 # The action_freq at which an action weighs half (action_weight): where the corpus turns from tools, portals and login
@@ -173,6 +180,11 @@ def topic_query(interest: dict, topic: dict) -> str:
 def action_weight(freq: int | None) -> float:
     """How much one action counts in both reward signals, from its global frequency (1 when unknown)."""
     return 1.0 / (1.0 + max(freq or 0, 0) / ACTION_FREQ_HALF_WEIGHT)
+
+
+def interest_cap(n_signals: int) -> int:
+    """The number of interests an answer to `n_signals` input signals may write without INTEREST_PENALTY."""
+    return math.ceil(INTEREST_CAP_SCALE * n_signals ** INTEREST_CAP_EXPONENT)
 
 
 def assign_owners(similarity: list[list[float]], citations: list[set[int]],
@@ -444,5 +456,5 @@ class L1Reward:
         })
         if rules["rule_pass"]:
             result["reward"] = (statistics.mean(result[name] for name in REWARD_SIGNALS)
-                                - INTEREST_PENALTY * len(interests))
+                                - INTEREST_PENALTY * max(0, len(interests) - interest_cap(len(signals))))
         return result
