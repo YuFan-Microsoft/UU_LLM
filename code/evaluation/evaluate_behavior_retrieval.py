@@ -151,7 +151,7 @@ def build_topk_layers(
 def read_dataset_rows(
     dataset_paths: list[Path] | None, hf_split: str
 ) -> Iterator[dict[str, Any]]:
-    """Like inference/utils.read_rows: local JSONL files, or the User_Profile_TestSet split streamed from HF."""
+    """Like inference/utils.read_rows: local JSONL files, or the SFT_User_Profile_TestSet split streamed from HF."""
     if dataset_paths:
         for path in dataset_paths:
             yield from iter_jsonl(path)
@@ -160,7 +160,7 @@ def read_dataset_rows(
 
         yield from load_dataset(
             "yufan/user_profile_dataset",
-            "User_Profile_TestSet",
+            "SFT_User_Profile_TestSet",
             split=hf_split,
             streaming=True,
             token=os.getenv("HF_TOKEN"),
@@ -875,7 +875,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hf_split",
         default="user_1200",
-        help="User_Profile_TestSet split for --layer3: user_1200 or user_12000 (needs HF_TOKEN; default: user_1200)",
+        help="SFT_User_Profile_TestSet split for --layer3: user_1200 or user_12000 (needs HF_TOKEN; default: user_1200)",
     )
     parser.add_argument(
         "--dataset_jsonl",

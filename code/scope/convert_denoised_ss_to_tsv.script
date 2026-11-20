@@ -1,0 +1,244 @@
+// cosmos09 / MSN.DnI. Only the 22 single-date folders from the supplied listing.
+#DECLARE Root string = "/shares/UDC/RnR/MaiProfileV3/AllUsers_V4_Backfill/Denoising";
+
+#DECLARE Input20260509 string = @Root + "/2026-05-09/ForGptLabeling.ss";
+#DECLARE Output20260509 string = @Root + "/2026-05-09/ForGptLabeling.tsv";
+raw20260509 = SSTREAM @Input20260509;
+kept20260509 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260509
+    WHERE denoising_label == 1;
+OUTPUT kept20260509
+TO @Output20260509
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260516 string = @Root + "/2026-05-16/ForGptLabeling.ss";
+#DECLARE Output20260516 string = @Root + "/2026-05-16/ForGptLabeling.tsv";
+raw20260516 = SSTREAM @Input20260516;
+kept20260516 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260516
+    WHERE denoising_label == 1;
+OUTPUT kept20260516
+TO @Output20260516
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260523 string = @Root + "/2026-05-23/ForGptLabeling.ss";
+#DECLARE Output20260523 string = @Root + "/2026-05-23/ForGptLabeling.tsv";
+raw20260523 = SSTREAM @Input20260523;
+kept20260523 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260523
+    WHERE denoising_label == 1;
+OUTPUT kept20260523
+TO @Output20260523
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260530 string = @Root + "/2026-05-30/ForGptLabeling.ss";
+#DECLARE Output20260530 string = @Root + "/2026-05-30/ForGptLabeling.tsv";
+raw20260530 = SSTREAM @Input20260530;
+kept20260530 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260530
+    WHERE denoising_label == 1;
+OUTPUT kept20260530
+TO @Output20260530
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260606 string = @Root + "/2026-06-06/ForGptLabeling.ss";
+#DECLARE Output20260606 string = @Root + "/2026-06-06/ForGptLabeling.tsv";
+raw20260606 = SSTREAM @Input20260606;
+kept20260606 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260606
+    WHERE denoising_label == 1;
+OUTPUT kept20260606
+TO @Output20260606
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260613 string = @Root + "/2026-06-13/ForGptLabeling.ss";
+#DECLARE Output20260613 string = @Root + "/2026-06-13/ForGptLabeling.tsv";
+raw20260613 = SSTREAM @Input20260613;
+kept20260613 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260613
+    WHERE denoising_label == 1;
+OUTPUT kept20260613
+TO @Output20260613
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260620 string = @Root + "/2026-06-20/ForGptLabeling.ss";
+#DECLARE Output20260620 string = @Root + "/2026-06-20/ForGptLabeling.tsv";
+raw20260620 = SSTREAM @Input20260620;
+kept20260620 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260620
+    WHERE denoising_label == 1;
+OUTPUT kept20260620
+TO @Output20260620
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260627 string = @Root + "/2026-06-27/ForGptLabeling.ss";
+#DECLARE Output20260627 string = @Root + "/2026-06-27/ForGptLabeling.tsv";
+raw20260627 = SSTREAM @Input20260627;
+kept20260627 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260627
+    WHERE denoising_label == 1;
+OUTPUT kept20260627
+TO @Output20260627
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260704 string = @Root + "/2026-07-04/ForGptLabeling.ss";
+#DECLARE Output20260704 string = @Root + "/2026-07-04/ForGptLabeling.tsv";
+raw20260704 = SSTREAM @Input20260704;
+kept20260704 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260704
+    WHERE denoising_label == 1;
+OUTPUT kept20260704
+TO @Output20260704
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260711 string = @Root + "/2026-07-11/ForGptLabeling.ss";
+#DECLARE Output20260711 string = @Root + "/2026-07-11/ForGptLabeling.tsv";
+raw20260711 = SSTREAM @Input20260711;
+kept20260711 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260711
+    WHERE denoising_label == 1;
+OUTPUT kept20260711
+TO @Output20260711
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260718 string = @Root + "/2026-07-18/ForGptLabeling.ss";
+#DECLARE Output20260718 string = @Root + "/2026-07-18/ForGptLabeling.tsv";
+raw20260718 = SSTREAM @Input20260718;
+kept20260718 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260718
+    WHERE denoising_label == 1;
+OUTPUT kept20260718
+TO @Output20260718
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260725 string = @Root + "/2026-07-25/ForGptLabeling.ss";
+#DECLARE Output20260725 string = @Root + "/2026-07-25/ForGptLabeling.tsv";
+raw20260725 = SSTREAM @Input20260725;
+kept20260725 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260725
+    WHERE denoising_label == 1;
+OUTPUT kept20260725
+TO @Output20260725
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260801 string = @Root + "/2026-08-01/ForGptLabeling.ss";
+#DECLARE Output20260801 string = @Root + "/2026-08-01/ForGptLabeling.tsv";
+raw20260801 = SSTREAM @Input20260801;
+kept20260801 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260801
+    WHERE denoising_label == 1;
+OUTPUT kept20260801
+TO @Output20260801
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260808 string = @Root + "/2026-08-08/ForGptLabeling.ss";
+#DECLARE Output20260808 string = @Root + "/2026-08-08/ForGptLabeling.tsv";
+raw20260808 = SSTREAM @Input20260808;
+kept20260808 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260808
+    WHERE denoising_label == 1;
+OUTPUT kept20260808
+TO @Output20260808
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260815 string = @Root + "/2026-08-15/ForGptLabeling.ss";
+#DECLARE Output20260815 string = @Root + "/2026-08-15/ForGptLabeling.tsv";
+raw20260815 = SSTREAM @Input20260815;
+kept20260815 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260815
+    WHERE denoising_label == 1;
+OUTPUT kept20260815
+TO @Output20260815
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260822 string = @Root + "/2026-08-22/ForGptLabeling.ss";
+#DECLARE Output20260822 string = @Root + "/2026-08-22/ForGptLabeling.tsv";
+raw20260822 = SSTREAM @Input20260822;
+kept20260822 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260822
+    WHERE denoising_label == 1;
+OUTPUT kept20260822
+TO @Output20260822
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260829 string = @Root + "/2026-08-29/ForGptLabeling.ss";
+#DECLARE Output20260829 string = @Root + "/2026-08-29/ForGptLabeling.tsv";
+raw20260829 = SSTREAM @Input20260829;
+kept20260829 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260829
+    WHERE denoising_label == 1;
+OUTPUT kept20260829
+TO @Output20260829
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260905 string = @Root + "/2026-09-05/ForGptLabeling.ss";
+#DECLARE Output20260905 string = @Root + "/2026-09-05/ForGptLabeling.tsv";
+raw20260905 = SSTREAM @Input20260905;
+kept20260905 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260905
+    WHERE denoising_label == 1;
+OUTPUT kept20260905
+TO @Output20260905
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260912 string = @Root + "/2026-09-12/ForGptLabeling.ss";
+#DECLARE Output20260912 string = @Root + "/2026-09-12/ForGptLabeling.tsv";
+raw20260912 = SSTREAM @Input20260912;
+kept20260912 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260912
+    WHERE denoising_label == 1;
+OUTPUT kept20260912
+TO @Output20260912
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260919 string = @Root + "/2026-09-19/ForGptLabeling.ss";
+#DECLARE Output20260919 string = @Root + "/2026-09-19/ForGptLabeling.tsv";
+raw20260919 = SSTREAM @Input20260919;
+kept20260919 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260919
+    WHERE denoising_label == 1;
+OUTPUT kept20260919
+TO @Output20260919
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20260926 string = @Root + "/2026-09-26/ForGptLabeling.ss";
+#DECLARE Output20260926 string = @Root + "/2026-09-26/ForGptLabeling.tsv";
+raw20260926 = SSTREAM @Input20260926;
+kept20260926 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20260926
+    WHERE denoising_label == 1;
+OUTPUT kept20260926
+TO @Output20260926
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);
+
+#DECLARE Input20261003 string = @Root + "/2026-10-03/ForGptLabeling.ss";
+#DECLARE Output20261003 string = @Root + "/2026-10-03/ForGptLabeling.tsv";
+raw20261003 = SSTREAM @Input20261003;
+kept20261003 =
+    SELECT UserId, Date, Source, Action
+    FROM raw20261003
+    WHERE denoising_label == 1;
+OUTPUT kept20261003
+TO @Output20261003
+USING DefaultTextOutputter(delimiter: '\t', outputHeader: true);

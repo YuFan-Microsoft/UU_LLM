@@ -4,3 +4,6 @@ __pycache__/
 *.py[cod]
 /models/
 /data/
+/HF_Key
+/hf_token.txt
+/wandb_key.txt

@@ -328,14 +328,14 @@ from datasets import load_dataset
 
 repo = "yufan/user_profile_dataset"
 configs = (
-    "V1_User_Profile_L1_gpt54",
-    "V1_User_Profile_L2_gpt54",
-    "V1_User_Profile_L3_Persona_gpt54",
-    "V1_User_Profile_L3_Commercial_gpt54",
-    "V1_User_Profile_L4_Biography_gpt54",
-    "V1_User_Profile_L4_CommercialPreference_gpt54",
-    "V1_User_Profile_L4_MissionDiscovery_gpt54",
-    "V1_User_Profile_L4_MissionEnhancement_gpt54",
+    "SFT_User_Profile_L1_gpt56_V3",
+    "SFT_User_Profile_L1_Negative_gpt56_V3",
+    "SFT_User_Profile_L2_gpt56_V3",
+    "SFT_User_Profile_L3_Persona_gpt56_V3",
+    "SFT_User_Profile_L3_Commercial_gpt56_V3",
+    "SFT_User_Profile_L4_Biography_gpt56_V3",
+    "SFT_User_Profile_L4_CommercialPreference_gpt56_V3",
+    "SFT_User_Profile_L4_Hyper_gpt56_V3",
 )
 
 for config in configs:

@@ -1,0 +1,111 @@
+#!/bin/bash
+# ============================================================================
+# Watchdog of a Layer-1 GRPO run (run_l1_grpo.sh). Every WATCHDOG_INTERVAL (60) seconds:
+#   - EMBEDDING_NODE set: when an embedding server there (one per GPU of EMBEDDING_GPUS) does not answer /health,
+#     restart it (serve_embedding.sh, which reuses the ones that answer);
+#   - when neither run_l1_grpo.sh nor verl.trainer.main_ppo has been running for 2 checks in a row, or neither its
+#     train.log nor launch.log changed for WATCHDOG_STALE_MINUTES (40; a hung run, stopped first): `ray stop
+#     --force` (crashed Ray workers can still hold GPUs), then launch run_l1_grpo.sh again with the same environment and
+#     arguments; it resumes from the run's latest checkpoint (trainer.resume_mode=auto) into the same W&B run
+#     (WANDB_RUN_ID, picked once here unless given, with WANDB_RESUME=allow). A run that is not running when the
+#     watchdog starts is launched the same way;
+#   - when the run's train.log shows "Training Progress: 100%", exit.
+# It gives up after WATCHDOG_MAX_RESTARTS (20) launches. One watchdog per GRPO directory: a second one exits (a lock
+# on outputs/watchdog.lock, not a process-name match, which would also match the shell that runs the check).
+#
+# Usage: the environment and arguments of run_l1_grpo.sh, e.g.
+#   EMBEDDING_NODE=node-1 TEST_FREQ=50 SAVE_FREQ=50 setsid nohup bash watchdog.sh > /dev/null 2>&1 < /dev/null &
+#   EMBEDDING_NODE=node-4 EMBEDDING_GPUS=0,1,2,3,4,5,6,7 ... bash watchdog.sh ...   # 8 servers on node-4
+#   tail -f outputs/watchdog.log          # launches append to outputs/<EXPERIMENT_NAME>/launch.log
+# ============================================================================
+set -uo pipefail
+
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$HERE"
+mkdir -p outputs
+LOG="$HERE/outputs/watchdog.log"
+exec 9> "$HERE/outputs/watchdog.lock"
+if ! flock -n 9; then
+  echo "$(date '+%F %T') another watchdog is running in $HERE" >> "$LOG"
+  exit 1
+fi
+
+RUN_SCRIPT=run_l1_grpo.sh
+# The run's output directory, as run_l1_grpo.sh names it.
+CHECKPOINT=${CHECKPOINT:-/yufan/MAI_Profile/checkpoints/unified_slm_VFinal_F16A/4B/Final_CKPT}
+REPLAY_SUFFIX=""
+[ "${SFT_REPLAY:-1}" = 0 ] || REPLAY_SUFFIX="_replay"
+EXPERIMENT_NAME=${EXPERIMENT_NAME:-GRPO_L1_no_kl_qwen3_5_4B_$(basename "$CHECKPOINT")$REPLAY_SUFFIX}
+OUTPUT_DIR=${OUTPUT_DIR:-$HERE/outputs/$EXPERIMENT_NAME}
+mkdir -p "$OUTPUT_DIR"
+INTERVAL=${WATCHDOG_INTERVAL:-60}
+MAX_RESTARTS=${WATCHDOG_MAX_RESTARTS:-20}
+STALE_MINUTES=${WATCHDOG_STALE_MINUTES:-40}
+# Every launch continues one W&B run: the launcher keeps a given WANDB_RUN_ID (a letter first: Hydra keeps it a string).
+export WANDB_RUN_ID=${WANDB_RUN_ID:-r$(python3 -c "import secrets; print(secrets.token_hex(6))")}
+export WANDB_RESUME=${WANDB_RESUME:-allow}
+
+log() { echo "$(date '+%F %T') $*" >> "$LOG"; }
+
+running() {
+  pgrep -f "$RUN_SCRIPT" > /dev/null || pgrep -f "verl.trainer.main_ppo" > /dev/null
+}
+
+stale() {  # neither train.log nor launch.log (the data preparation before training) changed for STALE_MINUTES
+  local files=() file
+  for file in "$OUTPUT_DIR/train.log" "$OUTPUT_DIR/launch.log"; do [ -f "$file" ] && files+=("$file"); done
+  [ "${#files[@]}" -gt 0 ] && [ -z "$(find "${files[@]}" -mmin -"$STALE_MINUTES" 2>/dev/null)" ]
+}
+
+stop_run() {  # the launcher and the driver, by PID (TERM, then KILL after 30 s)
+  local pids
+  pids=$( (pgrep -f "$RUN_SCRIPT"; pgrep -f "verl.trainer.main_ppo") | sort -u | tr '\n' ' ')
+  [ -n "${pids// }" ] || return 0
+  kill -TERM $pids 2>/dev/null || true
+  for _ in $(seq 30); do running || return 0; sleep 1; done
+  kill -KILL $pids 2>/dev/null || true
+}
+
+log "watchdog started for $OUTPUT_DIR, W&B run $WANDB_RUN_ID (args: $*)"
+MISSED=0
+LAUNCHES=0
+while true; do
+  if grep -aqs "Training Progress: 100%" "$OUTPUT_DIR/train.log"; then
+    log "training finished; watchdog exits"
+    exit 0
+  fi
+  if [ -n "${EMBEDDING_NODE:-}" ]; then
+    # One server per GPU of EMBEDDING_GPUS (default one), on consecutive ports from EMBEDDING_PORT.
+    IFS=, read -r -a EMBEDDING_GPU_LIST <<< "${EMBEDDING_GPUS:-${EMBEDDING_GPU:-0}}"
+    DOWN=""
+    for i in "${!EMBEDDING_GPU_LIST[@]}"; do
+      port=$((${EMBEDDING_PORT:-8100} + i))
+      curl -sf "http://$EMBEDDING_NODE:$port/health" > /dev/null || DOWN="$DOWN $port"
+    done
+    if [ -n "$DOWN" ]; then
+      log "embedding server(s) on $EMBEDDING_NODE down (port(s)$DOWN); restarting them"
+      bash "$HERE/serve_embedding.sh" "$EMBEDDING_NODE" >> "$LOG" 2>&1 || log "embedding server restart failed"
+    fi
+  fi
+  if running && stale; then
+    log "train.log and launch.log unchanged for $STALE_MINUTES minutes: stopping the hung run"
+    stop_run
+  fi
+  if running; then
+    MISSED=0
+  else
+    MISSED=$((MISSED + 1))
+    if [ "$MISSED" -ge 2 ]; then
+      if [ "$LAUNCHES" -ge "$MAX_RESTARTS" ]; then
+        log "run not running and $LAUNCHES launches done; giving up"
+        exit 1
+      fi
+      LAUNCHES=$((LAUNCHES + 1))
+      log "run not running for 2 checks: ray stop --force, launch $LAUNCHES (log: $OUTPUT_DIR/launch.log)"
+      ray stop --force >> "$LOG" 2>&1 || true
+      setsid nohup bash "$HERE/$RUN_SCRIPT" "$@" >> "$OUTPUT_DIR/launch.log" 2>&1 < /dev/null &
+      MISSED=0
+    fi
+  fi
+  sleep "$INTERVAL"
+done

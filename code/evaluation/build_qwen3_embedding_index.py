@@ -17,7 +17,7 @@ DEFAULT_MODEL_PATH = Path(
     "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-0.6B"
 )
 HF_DATASET = "yufan/user_profile_dataset"
-HF_CONFIG = "User_Profile_TestSet"
+HF_CONFIG = "SFT_User_Profile_TestSet"
 # Streaming splits have no length; these let tqdm show a total and ETA.
 HF_SPLIT_USER_COUNTS = {"user_1200": 1191, "user_12000": 11947}
 DEFAULT_OUTPUT_DIR = Path(
@@ -308,7 +308,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
             "Build the four retrieval files of evaluate_behavior_retrieval.py from the "
-            "User_Profile_TestSet behaviors: history_index.jsonl, future_index.jsonl and "
+            "SFT_User_Profile_TestSet behaviors: history_index.jsonl, future_index.jsonl and "
             "their Qwen3-Embedding tensors, embedded on multiple GPUs."
         )
     )

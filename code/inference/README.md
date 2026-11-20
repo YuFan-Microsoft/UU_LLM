@@ -11,13 +11,13 @@
 | `utils.py` | Input loading and cleaning, weekly windows, signal dedupe / cap, query language, the answer key checks of every task, `generate()` with retries, MTP acceptance counters |
 | `user_profile_rules.py` | Copy of `code/trainer/SFT/user_profile_rules.py` (keep it identical): the V3 rollout checks that score every call's first sample for `rule_metrics`; it is reporting only (the answer key checks in `utils.py` decide retries) |
 | `merge_official_mtp.py` | Adds the official Qwen3.5 MTP head (`mtp.*`) to an SFT checkpoint saved without it (see [MTP speculative decoding](#mtp-speculative-decoding)) |
-| `prompts/` | The prompts (`prompt_l1.md` ... `prompt_l4_hyper.md`, plus `prompt_negative.md`, kept in sync but not used: the input has no negative feedback), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V35 SFT configs) |
+| `prompts/` | The prompts (`prompt_l1.md` ... `prompt_l4_hyper.md`, plus `prompt_negative.md`, kept in sync but not used: the input has no negative feedback), loaded verbatim; each must equal the file of the same name in `UU_LLM/prompts/` (the prompts of the V3 SFT configs) |
 
 The prompt files are read as-is (line endings normalized to `\n`); the script builds each user message as
-`prompt + "\nInput:\n" + input`, exactly like the V35 SFT data: rebuilt from their own inputs, every
-`V35_User_Profile_*_gpt56` L1, L2, L3 Persona and L3 Commercial test row gives the identical user message, the L4
+`prompt + "\nInput:\n" + input`, exactly like the V3 SFT data: rebuilt from their own inputs, every
+`SFT_User_Profile_*_gpt56_V3` L1, L2, L3 Persona and L3 Commercial test row gives the identical user message, the L4
 inputs have the same fields (without user context: no declared attributes, facts or personal / professional context,
-which this script never has), and every V35 test answer passes the answer checks. The model was trained on these exact strings, so edit them only together with the SFT data (and retrain).
+which this script never has), and every V3 test answer passes the answer checks. The model was trained on these exact strings, so edit them only together with the SFT data (and retrain).
 
 Run inside the same environment as the SFT evaluation (`../trainer/SFT/requirements_inference.txt`: vLLM,
 transformers, datasets). The directory is self-contained, so it can be uploaded on its own: the few helpers it shares
@@ -30,7 +30,7 @@ must stay identical to the originals. It uses one vLLM engine per visible GPU (l
 ```bash
 cd UU_LLM/code/inference
 export HF_TOKEN=...   # gated dataset
-# Default input: config User_Profile_TestSet, split user_1200 (1191 users) of yufan/user_profile_dataset;
+# Default input: config SFT_User_Profile_TestSet, split user_1200 (1191 users) of yufan/user_profile_dataset;
 # --hf_split user_12000 for the larger set. Only the chosen split is streamed.
 python run_inference.py --checkpoint <ckpt_dir> --output_dir <out_dir>
 # Quick check on the first 20 user ids
@@ -54,6 +54,16 @@ Input rows, one per user (only `past_behaviors` is used; `future_behaviors` is h
 
 ```json
 {"user_id": "...", "past_behaviors": [{"source": "Bing", "action": "...", "intent": "...", "date": "2026-02-06T00:00:00", "action_id": 0}], "future_behaviors": [...]}
+```
+
+For local JSONL, each behavior only needs `source`, `action` and an ISO-format `date`; `intent` and `action_id`
+are optional. `future_behaviors` may be omitted and is exported as `[]`. Extra top-level fields, such as
+`anid` and `muid` lists, are carried unchanged to `final_profiles.jsonl`, without entering model prompts or
+changing the per-layer intermediate files. Generated profile fields take precedence over input fields with
+the same name. For example:
+
+```json
+{"user_id":"...","anid":["..."],"muid":["...","..."],"past_behaviors":[{"date":"2026-10-03T12:34:56Z","source":"Bing","action":"..."}],"future_behaviors":[]}
 ```
 
 One checkpoint serves all seven tasks. The V3 SFT data were distilled from GPT-5.6 Final runs of the production
@@ -267,8 +277,10 @@ For the windows where some user's final snapshot was built: `layer3_persona`, `l
 `past_behaviors` and `future_behaviors` from the input, and the user's `layer4_postprocessing` profile:
 `interests` (the Layer-2 interests with confidence ≥ 0.2, enriched with persona,
 category and commercial fields, followed by the `hyper_commercial` missions), `biography`, `life_stage`,
-`user_attributes`, `commercial_preferences` and `enriched_commercial_interests`. Everything is empty if the user never
-had a Layer-1 interest. The ungated Layer-2 snapshot stays in `layer2_postmerge.jsonl`.
+`user_attributes`, `commercial_preferences` and `enriched_commercial_interests`. The generated profile contents are
+empty if the user never had a Layer-1 interest; raw behaviors and input metadata (including any `anid` / `muid` lists)
+are still retained.
+The ungated Layer-2 snapshot stays in `layer2_postmerge.jsonl`.
 
 Plus `<out_dir>/predictions.jsonl` (one record per model call: `stage`, user, window, `attempts`, `valid`, raw
 `text`; L2 also has `mode`, `snapshot_dropped` and merge/add `actions`; L3/L4 have `dropped`, the

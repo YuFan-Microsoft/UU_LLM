@@ -5,6 +5,7 @@ import json
 import math
 import re
 import socket
+import sys
 import time
 from pathlib import Path
 import torch
@@ -28,53 +29,12 @@ from deepspeed.runtime.zero.partition_parameters import ZeroParamStatus
 from datasets import concatenate_datasets, load_dataset
 from tqdm import tqdm
 
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+from user_profile_data import encode_sft_example
+
 QWEN3_5_MULTIMODAL_ARCH = "Qwen3_5ForConditionalGeneration"
 MISNESTED_VISUAL_PREFIX = "model.language_model.visual."
 HF_VISUAL_PREFIX = "model.visual."
-
-def encode_sft_example(messages, tokenizer, max_seq_length):
-    messages = [
-        {"role": message["role"], "content": message["content"]}
-        for message in messages
-    ]
-    input_ids = tokenizer.apply_chat_template(
-        conversation=messages,
-        tokenize=True,
-        return_dict=False,
-        add_generation_prompt=False,
-        enable_thinking=False,
-    )
-    if isinstance(input_ids, dict):
-        input_ids = input_ids["input_ids"]
-    input_ids = np.asarray(input_ids, dtype=np.int64)
-    labels = np.full_like(input_ids, -100)
-
-    generation_prompt_ids = tokenizer.apply_chat_template(
-        conversation=messages[:-1],
-        tokenize=True,
-        return_dict=False,
-        add_generation_prompt=True,
-        enable_thinking=False,
-    )
-    if isinstance(generation_prompt_ids, dict):
-        generation_prompt_ids = generation_prompt_ids["input_ids"]
-    generation_prompt_ids = np.asarray(generation_prompt_ids, dtype=np.int64)
-
-    response_start = len(generation_prompt_ids)
-    if not np.array_equal(input_ids[:response_start], generation_prompt_ids):
-        raise RuntimeError(
-            "The training sequence prefix does not match the non-thinking "
-            "generation prompt used for inference."
-        )
-    response_end = int(np.flatnonzero(input_ids == tokenizer.eos_token_id)[-1])
-    labels[response_start:response_end + 1] = input_ids[response_start:response_end + 1]
-
-    if max_seq_length and len(input_ids) > max_seq_length:
-        input_ids = input_ids[-max_seq_length:]
-        labels = labels[-max_seq_length:]
-
-    attention_mask = np.ones_like(input_ids)
-    return input_ids, labels, attention_mask
 
 class LLMDataset(Dataset):
     """With config_names, every item also carries "config_index" (its dataset config), used by the
@@ -441,6 +401,28 @@ def save_hf_checkpoint(model, processor, save_dir, zero_stage):
         validate_saved_checkpoint(model_to_save, save_dir, output_state_dict)
         processor.save_pretrained(save_dir)
     torch.distributed.barrier()
+
+def wandb_api_key():
+    """WANDB_API_KEY, else the first line of wandb_key.txt in UU_LLM or in the directory above it (git-ignored), else
+    None: wandb.login() then uses the login saved in ~/.netrc, and fails without one."""
+    if os.environ.get("WANDB_API_KEY"):
+        return os.environ["WANDB_API_KEY"]
+    uu_llm = Path(__file__).resolve().parents[3]
+    for path in (uu_llm / "wandb_key.txt", uu_llm.parent / "wandb_key.txt"):
+        if path.exists() and path.read_text(encoding="utf-8").split():
+            return path.read_text(encoding="utf-8").split()[0]
+    return None
+
+
+def upload_train_log(wandb_module, output_dir):
+    """Live-sync <output_dir>/train.log, the output of every rank tee'd by the launcher, to the run's Files tab
+    (the Logs tab only captures this process)."""
+    log_file = Path(output_dir).resolve() / "train.log"
+    if log_file.exists():
+        wandb_module.save(str(log_file), base_path=str(log_file.parent), policy="live")
+    else:
+        print(f"{log_file} not found (the launcher tees every rank into it): W&B keeps only rank 0's console")
+
 
 def get_all_reduce_mean(tensor):
     torch.distributed.all_reduce(tensor, op=torch.distributed.ReduceOp.SUM)
@@ -816,9 +798,9 @@ TASK_DISPLAY_NAMES = {"L1": "L1_Interest", "L2": "L2_Merge"}
 
 
 def task_name(config):
-    """Short task name of a dataset config: "V3_User_Profile_L1_gpt56" -> "L1_Interest",
-    "V3_User_Profile_L1_Negative_gpt56" -> "L1_Negative", "V3_User_Profile_L2_gpt56" -> "L2_Merge",
-    "V3_User_Profile_L3_Persona_gpt56" -> "L3_Persona" (V1 "_gpt54" and V2 configs map the same way)."""
+    """Short task name of a dataset config: "SFT_User_Profile_L1_gpt56_V3" -> "L1_Interest",
+    "SFT_User_Profile_L1_Negative_gpt56_V3" -> "L1_Negative", "SFT_User_Profile_L2_gpt56_V3" -> "L2_Merge",
+    "SFT_User_Profile_L3_Persona_gpt56_V3" -> "L3_Persona" (V1 "_gpt54" and V2 configs map the same way)."""
     match = re.search(r"(?:^|_)(L\d+(?:_[A-Za-z]+)?)_gpt5\d(?:_|$)", config or "") \
         or re.search(r"(?:^|_)(L\d+)(?:_|$)", config or "")
     if not match:
@@ -931,17 +913,21 @@ def main(argument_defaults=None, rollout_scorer=None, train_augmenters=None):
         import wandb
 
         os.environ["WANDB_PROJECT"] = args.wandb_project
-        wandb.login(key="3f14084582ffbf0986b305f813aea34ca59c77c5")
+        wandb.login(key=wandb_api_key())
         wandb_config = vars(args).copy()
         wandb_config.pop("hf_token", None)
         init_kwargs = {
             "project": args.wandb_project,
             "name": args.wandb_run_name,
             "config": wandb_config,
+            # fd-level capture (also C++ and child-process output). Explicit, so an inherited WANDB_CONSOLE=off cannot
+            # empty the Logs tab; the default "wrap" (wrap_raw under the wandb service) can leave output.log empty.
+            "settings": wandb.Settings(console="redirect"),
         }
         if args.wandb_run_id:
             init_kwargs.update({"id": args.wandb_run_id, "resume": "allow"})
         wandb.init(**init_kwargs)
+        upload_train_log(wandb, args.output_dir)
         wandb.define_metric("train_step")
         wandb.define_metric("Train/*", step_metric="train_step")
         wandb.define_metric("eval_step")
