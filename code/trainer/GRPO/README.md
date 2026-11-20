@@ -27,7 +27,14 @@ GRPO/
 
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, any `interest_name` or
 `topic` over its label token limit, cut at the response length), else the mean of two signals, each in [0, 1], plus
-the standardized-name bonus below.
+the standardized-name bonus below,
+minus **0.01 per interest beyond a cap that grows with the input signal count** (`INTEREST_PENALTY`,
+`interest_cap`): cap = ceil(1.56 × signals^0.4), the least-squares fit of the mean interest count of the Layer-1 SFT
+labels (`SFT_User_Profile_L1_gpt56_V3`, 71,890 train rows) by input signal count, so 3 at 5 signals, 4 at 10, 6 at
+20, 8 at 50, 10 at 100 and 13 at 200 (about 30% of the labels exceed it). The
+signals see topics only, so without a penalty splitting interests is free; a penalty on every interest collapsed
+answers to a single interest holding every topic (99% of answers at step 400), so interests within the cap are free.
+0.01 is about what 3 correctly owned actions of a ~200-action user earn.
 The limit is per interest, by the language of the actions its topics cite (`user_profile_rules.detect_language`, the
 language rule's anchor): **at most 6 tokens** when English, **at most 10 tokens** otherwise (including mixed or
 untagged). It uses the **generation checkpoint's tokenizer**, with `add_special_tokens=False`, not the
@@ -82,8 +89,8 @@ standardized name: the `interest_name` of a line of `VOCAB_FILE`
 (`/yufan/MAI_Profile/data_factory/Online_Top1M_Layer1_Result/layer1_interest_freq_normalized_en_min20_cluster10K.jsonl`,
 fixed in the launcher; its `variants` do not count). Non-English interests are not supervised; an answer without
 English interests has `vocab_rate` None (skipped by the W&B means). A rule-passing answer's reward is the mean of the
-two signals **plus `VOCAB_REWARD_COEF` (0.2, env override) × `vocab_rate`** (0 without English interests), so it is
-in [0, 1.2]; a rule violation is still 0. `case_study/layer1_sampling.py score` applies the same vocabulary
+two signals **plus `VOCAB_REWARD_COEF` (0.2, env override) × `vocab_rate`** (0 without English interests), minus
+the interest penalty above, so it is at most 1.2; a rule violation is still 0. `case_study/layer1_sampling.py score` applies the same vocabulary
 (`--vocab_file`, `--vocab_coef`).
 
 The batch's visible prompt actions are embedded once per batch and read back for each answer's `past_assignment`;

@@ -183,7 +183,7 @@ class DualPoolRewardTest(unittest.TestCase):
     def score(self, count=1, evidence=None):
         return self.scorer(content(self.past), answer(count, evidence), None, self.future)
 
-    def test_two_signal_mean_without_interest_cap(self):
+    def test_two_signal_mean_minus_penalty_for_interests_beyond_the_cap(self):
         for count in (1, 5, 9, 12, 18, 27):
             with self.subTest(count=count):
                 result = self.score(count)
@@ -193,8 +193,13 @@ class DualPoolRewardTest(unittest.TestCase):
                 self.assertAlmostEqual(result["past_assignment"], past)
                 # I<n> retrieves F<n>; the rest of the top 20 are other users' actions.
                 self.assertAlmostEqual(result["future_retrieval"], min(count, 20) / 20)
-                self.assertAlmostEqual(result["reward"], (past + min(count, 20) / 20) / 2)
+                # 25 input signals: up to ceil(1.56 * 25 ** 0.4) = 6 interests are free.
+                self.assertAlmostEqual(result["reward"],
+                                       (past + min(count, 20) / 20) / 2 - reward.INTEREST_PENALTY * max(0, count - 6))
                 self.assertTrue(0 <= result["reward"] <= 1)
+
+    def test_interest_cap_grows_with_the_input_signals(self):
+        self.assertEqual([reward.interest_cap(n) for n in (1, 5, 10, 20, 50, 100, 200)], [2, 3, 4, 6, 8, 10, 13])
 
     def test_future_retrieval_picks_the_users_actions_out_of_a_fixed_budget(self):
         self.scorer.set_pools(self.past + ["DP"], ["F0", "F1", "G0", "G1"])
@@ -499,7 +504,7 @@ class TokenLimitRewardTest(unittest.TestCase):
                     result = self.score()
                     self.assertTrue(result["json_valid"])
                     self.assertEqual(result["rule_pass"], count < 7)
-                    self.assertEqual(result["reward"], 1.0 if count < 7 else 0.0)
+                    self.assertAlmostEqual(result["reward"], 1.0 if count < 7 else 0.0)
                     self.assertEqual(result["violations"], [] if count < 7 else [violation])
                     self.assertEqual(result["past_assignment"], 1.0)
                     self.assertEqual(result["future_retrieval"], 1.0)
@@ -539,7 +544,7 @@ class TokenLimitRewardTest(unittest.TestCase):
         self.scorer.tokenizer = tokenizer
         result = self.score()
         self.assertTrue(result["rule_pass"])
-        self.assertEqual(result["reward"], 1.0)
+        self.assertAlmostEqual(result["reward"], 1.0)
         self.assertNotIn("Synthetic activity", [call.args[0] for call in tokenizer.encode.call_args_list])
 
     def test_new_violations_preserve_existing_evidence_and_truncation_failures(self):
@@ -614,7 +619,8 @@ class TokenLimitRewardTest(unittest.TestCase):
                 results = list(executor.map(score, range(16)))
         constructor.assert_called_once()
         loader.assert_called_once_with("pools.parquet", "test")
-        self.assertTrue(all(result["score"] == 1.0 and result["rule_pass"] == 1.0 for result in results))
+        self.assertTrue(all(result["score"] == 1.0 and result["rule_pass"] == 1.0
+                            for result in results))
 
 
 class RewardLoaderTokenizerTest(unittest.TestCase):
