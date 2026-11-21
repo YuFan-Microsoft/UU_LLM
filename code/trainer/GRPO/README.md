@@ -43,8 +43,10 @@ rollout's reward to 0 (`interest_name_too_long` / `topic_too_long`); retrieval d
 JSON-valid answers. `actual_activity` is not subject to this token limit.
 The `interest_name` of an English interest (English by the same language as the token limit) also follows two naming
 rules, each a violation that sets the reward to 0:
-- **E1, one concept per name** (`interest_name_joins_concepts`): no standalone `and`, `&` or `+` word (any case);
-  single words such as R&B, M&A and D&D pass. Joined names are why names do not unify (Movies and Television, TV and
+- **E1, one concept per name** (`interest_name_joins_concepts`): no standalone `and` or `+` word (any case), no slash
+  or comma (`/`, `,`, or full-width `／`, `，`, `、`), and an `&` only inside an acronym, between two capitals (R&B, M&A,
+  D&D, AT&T pass; `Pets & Animals` and `Movies&TV` do not), so the joint cannot move to another separator. C++ and
+  Disney+ pass. Joined names are why names do not unify (Movies and Television, TV and
   Movies, Film and Television); the rare true pairs rewrite to one concept (Arts and Crafts as Crafts, Track and Field
   as Athletics).
 - **E2, Title Case** (`interest_name_not_title_case`): every word starting with a letter contains an uppercase letter,

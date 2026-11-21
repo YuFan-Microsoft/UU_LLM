@@ -3,7 +3,8 @@
 The reward of one answer: 0 if it breaks the Layer-1 rules (not V3 JSON, a user_profile_rules violation such as a
 duplicate interest / topic, bad evidence or the wrong language, any interest_name or topic over its label token limit
 in generation tokenizer tokens (no special tokens): 6 when the interest's cited actions are English, else 10; an
-English interest_name joining concepts with a standalone and / & / + (E1) or not in Title Case (E2); or cut
+English interest_name joining concepts (a standalone and / +, a slash or comma, or an & not between two capitals: E1)
+or not in Title Case (E2); or cut
 at max_tokens), else the mean of two signals, each in [0, 1], minus INTEREST_PENALTY (0.01) per interest beyond
 interest_cap of its input signal count (ceil(1.56 * signals ** 0.4), the SFT labels' mean): the signals see topics only, so
 without it splitting interests is free, and a penalty on every interest collapsed answers to one interest. Both use
@@ -55,6 +56,7 @@ requests spread over them) on the same texts.
 
 import json
 import math
+import re
 import statistics
 import sys
 import time
@@ -77,8 +79,11 @@ from utils import parse_json_object  # noqa: E402
 # the language rule's anchor): English interests keep the tight limit, any other (or mixed / untagged) a looser one.
 MAX_LABEL_TOKENS_EN = 6
 MAX_LABEL_TOKENS_OTHER = 10
-# English interest names (E1): a standalone word joining two concepts ("Movies and Television", "Pets & Animals").
-CONCEPT_JOINERS = frozenset({"and", "&", "+"})
+# English interest names (E1): a standalone word joining two concepts ("Movies and Television", "Fitness + Diet"), and
+# a separator joining them: a slash or comma (also full-width), or an & that is not inside an acronym ("Pets & Animals",
+# "Movies&TV"; R&B, M&A, AT&T pass).
+CONCEPT_JOINERS = frozenset({"and", "+"})
+CONCEPT_SEPARATORS = re.compile(r"[/,／，、]|(?<![A-Z])&|&(?![A-Z])")
 # English interest names (E2, Title Case): words that may stay lowercase after the first.
 MINOR_WORDS = frozenset({"a", "an", "the", "and", "or", "nor", "but", "of", "in", "on", "at", "to", "for", "with", "by",
                          "from", "vs", "via", "as", "per", "into", "over"})
@@ -126,8 +131,10 @@ def is_english(interest: dict, action_by_idx: dict[int, str]) -> bool:
 
 
 def joins_concepts(name: str) -> bool:
-    """E1: the name joins concepts with a standalone "and", "&" or "+" (R&B, M&A, D&D are single words and pass)."""
-    return any(word.casefold() in CONCEPT_JOINERS for word in name.split())
+    """E1: the name joins concepts with a standalone "and" or "+" word, a slash or comma, or an & that is not between
+    two capitals (R&B, M&A, D&D, AT&T are acronyms and pass)."""
+    return (CONCEPT_SEPARATORS.search(name) is not None
+            or any(word.casefold() in CONCEPT_JOINERS for word in name.split()))
 
 
 def is_title_case(name: str) -> bool:

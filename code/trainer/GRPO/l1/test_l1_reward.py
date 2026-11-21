@@ -524,10 +524,16 @@ class TokenLimitRewardTest(unittest.TestCase):
             "Pets & Animals": ["interest_name_joins_concepts"],
             "Fitness + Nutrition": ["interest_name_joins_concepts"],
             "Food AND Drink": ["interest_name_joins_concepts"],
+            "Movies/TV": ["interest_name_joins_concepts"],
+            "Movies, TV": ["interest_name_joins_concepts"],
+            "Movies，TV": ["interest_name_joins_concepts"],
+            "Movies&TV": ["interest_name_joins_concepts"],
+            "Rock &Roll": ["interest_name_joins_concepts"],
             "Online games": ["interest_name_not_title_case"],
             "Inteligencia artificial": ["interest_name_not_title_case"],
             "学术出版": ["interest_name_not_title_case"],
-            "R&B": [], "M&A": [], "D&D": [], "iPhone": [], "K-pop": [], "3D Printing": [],
+            "R&B": [], "M&A": [], "D&D": [], "AT&T": [], "C++": [], "Disney+": [], "iPhone": [], "K-pop": [],
+            "3D Printing": [],
             "History of Art": [], "Cooking with Kids": [], "Crafts": [],
         }
         for name, violations in cases.items():
