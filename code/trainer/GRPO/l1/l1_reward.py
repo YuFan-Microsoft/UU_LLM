@@ -103,6 +103,8 @@ SIGNALS = ("coverage", *REWARD_SIGNALS, *UNWEIGHTED_SIGNALS)  # All logged conte
 # Diagnostic answer-shape metrics; None when the answer has no interest (or, for the topic ones, no topic).
 STRUCTURE_SIGNALS = ("topics_per_interest", "evidence_per_topic", "citations_per_evidence", "interest_name_tokens",
                      "topic_tokens")
+# Diagnostic: the share of an answer's English interests whose name passes E1 and E2; None without English interests.
+NAME_SIGNAL = "name_rule_pass"
 DEFAULT_EMBEDDING_MODEL = "/yufan/open_source_models/Embedding_Model/Qwen3-Embedding-8B"
 SERVED_EMBEDDING_MODEL = "l1-embedding"  # --served-model-name of the vLLM embedding server
 # Seconds an embedding server that failed a request is skipped (the others take its share).
@@ -149,20 +151,25 @@ def judge(content: str, text: str, finish_reason: str | None,
     output = parse_json_object(text) if rules["json_valid"] else None
     if output is not None:
         violations = set(rules["violations"])
+        name_passes = []
         action_by_idx = {signal["idx"]: signal["action"] for signal in input_signals(content)}
         for interest in output["interests"]:
             english = is_english(interest, action_by_idx)
             limit = MAX_LABEL_TOKENS_EN if english else MAX_LABEL_TOKENS_OTHER
             if len(tokenizer.encode(interest["interest_name"], add_special_tokens=False)) > limit:
                 violations.add("interest_name_too_long")
-            if english and joins_concepts(interest["interest_name"]):
-                violations.add("interest_name_joins_concepts")
-            if english and not is_title_case(interest["interest_name"]):
-                violations.add("interest_name_not_title_case")
+            if english:
+                joins, title = joins_concepts(interest["interest_name"]), is_title_case(interest["interest_name"])
+                if joins:
+                    violations.add("interest_name_joins_concepts")
+                if not title:
+                    violations.add("interest_name_not_title_case")
+                name_passes.append(not joins and title)
             if any(len(tokenizer.encode(topic["topic"], add_special_tokens=False)) > limit
                    for topic in interest["topics"]):
                 violations.add("topic_too_long")
-        rules = {**rules, "violations": sorted(violations), "rule_pass": rules["rule_pass"] and not violations}
+        rules = {**rules, "violations": sorted(violations), "rule_pass": rules["rule_pass"] and not violations,
+                 NAME_SIGNAL: statistics.mean(name_passes) if name_passes else None}
     return rules, output
 
 
@@ -411,7 +418,8 @@ class L1Reward:
         future_freqs of each action of `future` (None: every action weighs 1):
             reward, json_valid, rule_pass, violations, output (the parsed answer, None unless JSON-valid), n_interests,
             coverage, the two REWARD_SIGNALS and their UNWEIGHTED_SIGNALS (0 unless JSON-valid), STRUCTURE_SIGNALS
-            (None unless JSON-valid with interests / topics), and, None unless JSON-valid: queries (per interest, its
+            (None unless JSON-valid with interests / topics), NAME_SIGNAL (None unless JSON-valid with English
+            interests), and, None unless JSON-valid: queries (per interest, its
             topics' queries), past_owners (per visible input action, in prompt order, [interest, topic] of the topic
             owning it; None without topics) and hits (per interest, [position in the distinct next-week actions, rank
             from 1] of the user's next-week actions in the top B whose most similar topic is one of the interest's).
@@ -420,6 +428,7 @@ class L1Reward:
         result = {"reward": INVALID_REWARD, "json_valid": rules["json_valid"], "rule_pass": rules["rule_pass"],
                   "violations": rules["violations"], "output": output, "n_interests": 0,
                   **{name: 0.0 for name in SIGNALS}, **{name: None for name in STRUCTURE_SIGNALS},
+                  NAME_SIGNAL: rules.get(NAME_SIGNAL),
                   "queries": None, "past_owners": None, "hits": None}
         if output is None:
             return result

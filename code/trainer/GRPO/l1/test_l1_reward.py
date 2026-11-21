@@ -402,8 +402,8 @@ class DualPoolRewardTest(unittest.TestCase):
                                                   "pools.parquet", tokenizer=self.scorer.tokenizer)
             loader.assert_called_once_with("pools.parquet", "train-000000")
         self.assertEqual(set(result), {"score", "json_valid", "rule_pass", "n_interests", *reward.SIGNALS,
-                                       *reward.STRUCTURE_SIGNALS})
-        self.assertTrue(all(isinstance(value, float) for value in result.values()))
+                                       *reward.STRUCTURE_SIGNALS, reward.NAME_SIGNAL})
+        self.assertTrue(all(isinstance(value, float) for name, value in result.items() if name != reward.NAME_SIGNAL))
         # The frequencies reach the reward: I0 cites and owns only P0, which is ubiquitous.
         self.assertAlmostEqual(result["past_assignment_unweighted"], 1 / self.target)
         self.assertLess(result["past_assignment"], 0.001)
@@ -412,7 +412,7 @@ class DualPoolRewardTest(unittest.TestCase):
                                                 {"batch_id": "train-000000", "content": content(self.past),
                                                  "past_freq": [1] * 25, "future_freq": [1] * 20},
                                                 "pools.parquet", tokenizer=self.scorer.tokenizer)
-        self.assertTrue(all(invalid[name] is None for name in reward.STRUCTURE_SIGNALS))
+        self.assertTrue(all(invalid[name] is None for name in (*reward.STRUCTURE_SIGNALS, reward.NAME_SIGNAL)))
 
     def test_structure_signals_average_within_the_answer(self):
         self.scorer.tokenizer = fake_tokenizer({"I0": 2, "I1": 4, "a": 1, "b": 2, "c": 3})
@@ -537,6 +537,15 @@ class TokenLimitRewardTest(unittest.TestCase):
                 rules, _ = reward.judge(content(["P0"]), json.dumps(output), None, self.scorer.tokenizer)
                 self.assertEqual(rules["violations"], violations)
                 self.assertEqual(rules["rule_pass"], not violations)
+                self.assertEqual(rules[reward.NAME_SIGNAL], 0.0 if violations else 1.0)
+
+    def test_name_rule_pass_is_the_passing_share_of_english_interests(self):
+        self.detect.side_effect = lambda actions: "en" if actions == ["P0"] else "ja"
+        output = json.loads(topics_answer([[("a", [0])], [("b", [0])], [("c", [1])]]))
+        output["interests"][1]["interest_name"] = "Online games"
+        output["interests"][2]["interest_name"] = "ゲーム"
+        rules, _ = reward.judge(content(["P0", "DP"]), json.dumps(output), None, self.scorer.tokenizer)
+        self.assertEqual(rules[reward.NAME_SIGNAL], 0.5)  # the Japanese interest is not counted
 
     def test_naming_rules_skip_non_english_interests(self):
         self.detect.return_value = "es"
@@ -544,6 +553,7 @@ class TokenLimitRewardTest(unittest.TestCase):
         output["interests"][0]["interest_name"] = "Música y cine"
         rules, _ = reward.judge(content(["P0"]), json.dumps(output), None, self.scorer.tokenizer)
         self.assertTrue(rules["rule_pass"])
+        self.assertIsNone(rules[reward.NAME_SIGNAL])
 
     def test_actual_activity_is_not_token_limited(self):
         tokenizer = fake_tokenizer({"I0": 6, "topic": 6, "Synthetic activity": 100})

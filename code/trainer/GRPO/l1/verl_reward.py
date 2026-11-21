@@ -38,7 +38,7 @@ if TYPE_CHECKING:
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
-from l1_reward import DEFAULT_EMBEDDING_MODEL, SIGNALS, STRUCTURE_SIGNALS, L1Reward  # noqa: E402
+from l1_reward import DEFAULT_EMBEDDING_MODEL, NAME_SIGNAL, SIGNALS, STRUCTURE_SIGNALS, L1Reward  # noqa: E402
 
 NUM_THREADS_ENV = "L1_REWARD_NUM_THREADS"
 _lock = threading.Lock()
@@ -72,7 +72,7 @@ def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict
                   embedding_url: str | None = None, embedding_model: str = DEFAULT_EMBEDDING_MODEL,
                   embedding_batch_size: int = 256, **kwargs) -> dict:
     """The reward ("score") of one answer and the signals it is computed from, all numbers (verl averages them),
-    plus the answer-shape STRUCTURE_SIGNALS, None when undefined (the core-metric means skip None)."""
+    plus the answer-shape STRUCTURE_SIGNALS and NAME_SIGNAL, None when undefined (the core-metric means skip None)."""
     with _lock:
         scorer = reward_fn(embedding_model, embedding_url, embedding_batch_size, tokenizer)
         batch_id = str(extra_info["batch_id"])
@@ -84,4 +84,5 @@ def compute_score(data_source, solution_str: str, ground_truth, extra_info: dict
     return {"score": float(result["reward"]), "json_valid": float(result["json_valid"]),
             "rule_pass": float(result["rule_pass"]), "n_interests": float(result["n_interests"]),
             **{name: float(result[name]) for name in SIGNALS},
-            **{name: None if result[name] is None else float(result[name]) for name in STRUCTURE_SIGNALS}}
+            **{name: None if result[name] is None else float(result[name])
+               for name in (*STRUCTURE_SIGNALS, NAME_SIGNAL)}}

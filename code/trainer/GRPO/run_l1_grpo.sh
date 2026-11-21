@@ -254,8 +254,8 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" python3 -m verl.trainer.main_ppo \
     trainer.save_freq="${SAVE_FREQ:-100}" \
     trainer.test_freq="${TEST_FREQ:-100}" \
     trainer.validation_data_dir="$OUTPUT_DIR/validation" \
-    +trainer.val_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens']" \
-    +trainer.train_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens']" \
+    +trainer.val_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens','name_rule_pass']" \
+    +trainer.train_core_metrics="['reward','n_interests','coverage','past_assignment','future_retrieval','past_assignment_unweighted','future_retrieval_unweighted','json_valid','rule_pass','topics_per_interest','evidence_per_topic','citations_per_evidence','interest_name_tokens','topic_tokens','name_rule_pass']" \
     +trainer.drop_metric_prefixes="['training/','num_turns/','timing_s/','timing_per_token_ms/','prompt_length/']" \
     trainer.total_epochs=1 \
     "${SFT_ARGS[@]}" \
