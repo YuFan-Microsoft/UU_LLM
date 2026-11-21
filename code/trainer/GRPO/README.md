@@ -26,7 +26,8 @@ GRPO/
 ## Reward
 
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, any `interest_name` or
-`topic` over its label token limit, cut at the response length), else the mean of two signals, each in [0, 1],
+`topic` over its label token limit, an English `interest_name` breaking the naming rules below, cut at the response
+length), else the mean of two signals, each in [0, 1],
 minus **0.01 per interest beyond a cap that grows with the input signal count** (`INTEREST_PENALTY`,
 `interest_cap`): cap = ceil(1.56 × signals^0.4), the least-squares fit of the mean interest count of the Layer-1 SFT
 labels (`SFT_User_Profile_L1_gpt56_V3`, 71,890 train rows) by input signal count, so 3 at 5 signals, 4 at 10, 6 at
@@ -39,7 +40,19 @@ language rule's anchor): **at most 6 tokens** when English, **at most 10 tokens*
 untagged). It uses the **generation checkpoint's tokenizer**, with `add_special_tokens=False`, not the
 embedding tokenizer. Every name and every topic is checked. A violation sets `rule_pass=False` and the entire
 rollout's reward to 0 (`interest_name_too_long` / `topic_too_long`); retrieval diagnostics remain available for
-JSON-valid answers. `actual_activity` is not subject to this token limit. The vendored reward loader passes each
+JSON-valid answers. `actual_activity` is not subject to this token limit.
+The `interest_name` of an English interest (English by the same language as the token limit) also follows two naming
+rules, each a violation that sets the reward to 0:
+- **E1, one concept per name** (`interest_name_joins_concepts`): no standalone `and`, `&` or `+` word (any case);
+  single words such as R&B, M&A and D&D pass. Joined names are why names do not unify (Movies and Television, TV and
+  Movies, Film and Television); the rare true pairs rewrite to one concept (Arts and Crafts as Crafts, Track and Field
+  as Athletics).
+- **E2, Title Case** (`interest_name_not_title_case`): every word starting with a letter contains an uppercase letter,
+  except the minor words after the first (`MINOR_WORDS`: a, an, the, and, or, nor, but, of, in, on, at, to, for,
+  with, by, from, vs, via, as, per, into, over). iPhone, K-pop and 3D Printing pass; it also rejects foreign names
+  on English interests ("Inteligencia artificial", "学术出版").
+
+The vendored reward loader passes each
 worker's already-loaded generation tokenizer (including `model.tokenizer_path` overrides and node-local path
 resolution). The scorer keeps one private copy per process, isolated from concurrent response decoding; it does not
 reload the checkpoint or multimodal processor. Sync `verl/trainer/ppo/reward.py` together with the L1 reward code on

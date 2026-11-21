@@ -518,6 +518,33 @@ class TokenLimitRewardTest(unittest.TestCase):
         self.assertEqual(result["reward"], 0.0)
         self.assertEqual(result["violations"], ["topic_too_long"])
 
+    def test_english_interest_names_name_one_concept_in_title_case(self):
+        cases = {
+            "Movies and Television": ["interest_name_joins_concepts"],
+            "Pets & Animals": ["interest_name_joins_concepts"],
+            "Fitness + Nutrition": ["interest_name_joins_concepts"],
+            "Food AND Drink": ["interest_name_joins_concepts"],
+            "Online games": ["interest_name_not_title_case"],
+            "Inteligencia artificial": ["interest_name_not_title_case"],
+            "学术出版": ["interest_name_not_title_case"],
+            "R&B": [], "M&A": [], "D&D": [], "iPhone": [], "K-pop": [], "3D Printing": [],
+            "History of Art": [], "Cooking with Kids": [], "Crafts": [],
+        }
+        for name, violations in cases.items():
+            with self.subTest(name=name):
+                output = json.loads(answer(1))
+                output["interests"][0]["interest_name"] = name
+                rules, _ = reward.judge(content(["P0"]), json.dumps(output), None, self.scorer.tokenizer)
+                self.assertEqual(rules["violations"], violations)
+                self.assertEqual(rules["rule_pass"], not violations)
+
+    def test_naming_rules_skip_non_english_interests(self):
+        self.detect.return_value = "es"
+        output = json.loads(answer(1))
+        output["interests"][0]["interest_name"] = "Música y cine"
+        rules, _ = reward.judge(content(["P0"]), json.dumps(output), None, self.scorer.tokenizer)
+        self.assertTrue(rules["rule_pass"])
+
     def test_actual_activity_is_not_token_limited(self):
         tokenizer = fake_tokenizer({"I0": 6, "topic": 6, "Synthetic activity": 100})
         self.scorer.tokenizer = tokenizer

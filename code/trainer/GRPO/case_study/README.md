@@ -154,7 +154,7 @@ summary and, for the first `--report_prompts` prompts, the input signals and eve
 | --- | --- |
 | `reward` | The GRPO reward of `../l1/l1_reward.py` (above) |
 | `json_valid` | Exactly the V3 Layer-1 schema `{"interests":[{"topics":[{"evidence","topic"}],"interest_name","actual_activity"}]}` with the right value types (no topic source, intent or content locale) |
-| `rule_pass` | The shared GRPO judgement: JSON-valid and no violation (`user_profile_rules.score_example`, `truncated`, `interest_name_too_long` / `topic_too_long` for any name or topic over its limit: 6 generation-tokenizer tokens for an English interest, else 10) |
+| `rule_pass` | The shared GRPO judgement: JSON-valid and no violation (`user_profile_rules.score_example`, `truncated`, `interest_name_too_long` / `topic_too_long` for any name or topic over its limit: 6 generation-tokenizer tokens for an English interest, else 10; `interest_name_joins_concepts` / `interest_name_not_title_case` for an English interest_name with a standalone and / & / + or not in Title Case) |
 | `n_interests` | Number of interests written |
 | `coverage` | Share of the input indices cited by the answer (diagnostic only, not in the reward) |
 | `past_assignment` | The weight of this user's visible input actions owned (most similar topic, `<interest name>: <topic>`, among the answer's topics) by a topic citing them, over the larger of the weight of every citation (an action cited by k topics weighs k times) and 0.7 of the weight of the visible actions; weight 1 / (1 + action_freq / 100) (reward signal) |

@@ -2,7 +2,8 @@
 
 The reward of one answer: 0 if it breaks the Layer-1 rules (not V3 JSON, a user_profile_rules violation such as a
 duplicate interest / topic, bad evidence or the wrong language, any interest_name or topic over its label token limit
-in generation tokenizer tokens (no special tokens): 6 when the interest's cited actions are English, else 10; or cut
+in generation tokenizer tokens (no special tokens): 6 when the interest's cited actions are English, else 10; an
+English interest_name joining concepts with a standalone and / & / + (E1) or not in Title Case (E2); or cut
 at max_tokens), else the mean of two signals, each in [0, 1], minus INTEREST_PENALTY (0.01) per interest beyond
 interest_cap of its input signal count (ceil(1.56 * signals ** 0.4), the SFT labels' mean): the signals see topics only, so
 without it splitting interests is free, and a penalty on every interest collapsed answers to one interest. Both use
@@ -76,6 +77,11 @@ from utils import parse_json_object  # noqa: E402
 # the language rule's anchor): English interests keep the tight limit, any other (or mixed / untagged) a looser one.
 MAX_LABEL_TOKENS_EN = 6
 MAX_LABEL_TOKENS_OTHER = 10
+# English interest names (E1): a standalone word joining two concepts ("Movies and Television", "Pets & Animals").
+CONCEPT_JOINERS = frozenset({"and", "&", "+"})
+# English interest names (E2, Title Case): words that may stay lowercase after the first.
+MINOR_WORDS = frozenset({"a", "an", "the", "and", "or", "nor", "but", "of", "in", "on", "at", "to", "for", "with", "by",
+                         "from", "vs", "via", "as", "per", "into", "over"})
 INVALID_REWARD = 0.0
 REWARD_SIGNALS = ("past_assignment", "future_retrieval")
 # Subtracted from a rule-passing answer's reward per interest beyond interest_cap(input signals): about what 3
@@ -111,18 +117,32 @@ def embedding_text(text: str, query: bool) -> str:
     return f"Instruct: {EMBEDDING_INSTRUCTION}\nQuery:{text}" if query else text
 
 
-def label_token_limit(interest: dict, action_by_idx: dict[int, str]) -> int:
-    """MAX_LABEL_TOKENS_EN when the actions the interest's topics cite are English, else MAX_LABEL_TOKENS_OTHER."""
+def is_english(interest: dict, action_by_idx: dict[int, str]) -> bool:
+    """Whether the actions the interest's topics cite are English (the language rule's anchor)."""
     actions = [action_by_idx[idx] for topic in interest["topics"] for idx in topic["evidence"] if idx in action_by_idx]
-    return MAX_LABEL_TOKENS_EN if user_profile_rules.detect_language(actions) == "en" else MAX_LABEL_TOKENS_OTHER
+    return user_profile_rules.detect_language(actions) == "en"
+
+
+def joins_concepts(name: str) -> bool:
+    """E1: the name joins concepts with a standalone "and", "&" or "+" (R&B, M&A, D&D are single words and pass)."""
+    return any(word.casefold() in CONCEPT_JOINERS for word in name.split())
+
+
+def is_title_case(name: str) -> bool:
+    """E2: every word starting with a letter has an uppercase letter (iPhone, K-pop pass; words starting with a digit
+    such as 3D are not checked), except a MINOR_WORDS word after the first."""
+    return all(any(char.isupper() for char in word) for position, word in enumerate(name.split())
+               if word[0].isalpha() and not (position and word in MINOR_WORDS))
 
 
 def judge(content: str, text: str, finish_reason: str | None,
           tokenizer: "PreTrainedTokenizerBase") -> tuple[dict, dict | None]:
     """user_profile_rules.score_example of one Layer-1 answer to the user message `content` (json_valid, violations,
     rule_pass, ...) and the parsed answer when it is JSON-valid. A generation cut at max_tokens gets the violation
-    "truncated" and fails rule_pass. Every interest_name and topic must have at most label_token_limit generation
-    tokens, without special tokens, including interests and topics that earn no retrieval credit."""
+    "truncated" and fails rule_pass. Every interest_name and topic must have at most MAX_LABEL_TOKENS_EN generation
+    tokens (no special tokens) when its interest is English, else MAX_LABEL_TOKENS_OTHER, including interests and
+    topics that earn no retrieval credit; an English interest's name must also name one concept (joins_concepts, E1)
+    in Title Case (is_title_case, E2)."""
     rules = user_profile_rules.score_example([{"role": "user", "content": content}], text)
     if finish_reason == "length":
         rules = {**rules, "violations": rules["violations"] + ["truncated"], "rule_pass": False}
@@ -131,9 +151,14 @@ def judge(content: str, text: str, finish_reason: str | None,
         violations = set(rules["violations"])
         action_by_idx = {signal["idx"]: signal["action"] for signal in input_signals(content)}
         for interest in output["interests"]:
-            limit = label_token_limit(interest, action_by_idx)
+            english = is_english(interest, action_by_idx)
+            limit = MAX_LABEL_TOKENS_EN if english else MAX_LABEL_TOKENS_OTHER
             if len(tokenizer.encode(interest["interest_name"], add_special_tokens=False)) > limit:
                 violations.add("interest_name_too_long")
+            if english and joins_concepts(interest["interest_name"]):
+                violations.add("interest_name_joins_concepts")
+            if english and not is_title_case(interest["interest_name"]):
+                violations.add("interest_name_not_title_case")
             if any(len(tokenizer.encode(topic["topic"], add_special_tokens=False)) > limit
                    for topic in interest["topics"]):
                 violations.add("topic_too_long")
