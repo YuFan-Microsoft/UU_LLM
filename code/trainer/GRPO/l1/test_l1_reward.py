@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import io
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -183,7 +184,7 @@ class DualPoolRewardTest(unittest.TestCase):
     def score(self, count=1, evidence=None):
         return self.scorer(content(self.past), answer(count, evidence), None, self.future)
 
-    def test_two_signal_mean_minus_penalty_for_interests_beyond_the_cap(self):
+    def test_two_signal_mean_minus_the_interest_count_penalty(self):
         for count in (1, 5, 9, 12, 18, 27):
             with self.subTest(count=count):
                 result = self.score(count)
@@ -193,13 +194,27 @@ class DualPoolRewardTest(unittest.TestCase):
                 self.assertAlmostEqual(result["past_assignment"], past)
                 # I<n> retrieves F<n>; the rest of the top 20 are other users' actions.
                 self.assertAlmostEqual(result["future_retrieval"], min(count, 20) / 20)
-                # 25 input signals: up to ceil(1.56 * 25 ** 0.4) = 6 interests are free.
-                self.assertAlmostEqual(result["reward"],
-                                       (past + min(count, 20) / 20) / 2 - reward.INTEREST_PENALTY * max(0, count - 6))
+                # 25 input signals: an interest_target of 1.06 * 25 ** 0.477.
+                penalty = 0.02 * math.log(count / (1.06 * 25 ** 0.477)) ** 2
+                self.assertAlmostEqual(result["reward"], max(0.0, (past + min(count, 20) / 20) / 2 - penalty))
                 self.assertTrue(0 <= result["reward"] <= 1)
 
-    def test_interest_cap_grows_with_the_input_signals(self):
-        self.assertEqual([reward.interest_cap(n) for n in (1, 5, 10, 20, 50, 100, 200)], [2, 3, 4, 6, 8, 10, 13])
+    def test_interest_penalty_is_symmetric_in_log_and_grows_away_from_the_target(self):
+        target = reward.interest_target(100)
+        self.assertAlmostEqual(target, 1.06 * 100 ** 0.477)
+        with patch.object(reward, "interest_target", return_value=10.0):
+            self.assertEqual(reward.interest_penalty(10, 100), 0.0)
+            self.assertAlmostEqual(reward.interest_penalty(5, 100), reward.interest_penalty(20, 100))
+            penalties = [reward.interest_penalty(count, 100) for count in (10, 7, 5, 3, 1)]
+            self.assertEqual(penalties, sorted(penalties))
+            # Growing faster than linearly: the second step away costs more than the first.
+            self.assertGreater(penalties[2] - penalties[1], penalties[1] - penalties[0])
+            # No interest counts as one.
+            self.assertEqual(reward.interest_penalty(0, 100), reward.interest_penalty(1, 100))
+
+    def test_a_far_off_interest_count_never_scores_below_a_rule_breaking_answer(self):
+        with patch.object(reward, "interest_penalty", return_value=5.0):
+            self.assertEqual(self.score(1)["reward"], reward.INVALID_REWARD)
 
     def test_future_retrieval_picks_the_users_actions_out_of_a_fixed_budget(self):
         self.scorer.set_pools(self.past + ["DP"], ["F0", "F1", "G0", "G1"])
@@ -377,7 +392,8 @@ class DualPoolRewardTest(unittest.TestCase):
         self.assertEqual(empty["past_assignment"], 0)
         self.assertEqual(empty["future_retrieval"], 0)
         self.assertIsNone(empty["past_owners"])
-        no_future = self.scorer(content(self.past), answer(1), None, [])
+        with patch.object(reward, "interest_penalty", return_value=0.0):
+            no_future = self.scorer(content(self.past), answer(1), None, [])
         self.assertEqual(no_future["future_retrieval"], 0)
         self.assertAlmostEqual(no_future["reward"], (1 / self.target) / 2)
 
@@ -443,6 +459,8 @@ class TokenLimitRewardTest(unittest.TestCase):
         self.addCleanup(language.stop)
         self.addCleanup(language_check.stop)
         self.detect = patch.object(reward.user_profile_rules, "detect_language", return_value="en").start()
+        # These tests are about the rules; the interest-count penalty has its own tests in DualPoolRewardTest.
+        patch.object(reward, "interest_penalty", return_value=0.0).start()
         self.addCleanup(patch.stopall)
         self.scorer = reward.L1Reward(embedder=FakeEmbedder(), tokenizer=fake_tokenizer())
         self.scorer.set_pools(["P0", "DP"], ["F0", "DF"])

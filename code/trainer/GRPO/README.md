@@ -28,13 +28,18 @@ GRPO/
 0 when the answer breaks the Layer-1 rules (not V3 JSON, any `user_profile_rules` violation, any `interest_name` or
 `topic` over its label token limit, an English `interest_name` breaking the naming rules below, cut at the response
 length), else the mean of two signals, each in [0, 1],
-minus **0.01 per interest beyond a cap that grows with the input signal count** (`INTEREST_PENALTY`,
-`interest_cap`): cap = ceil(1.56 × signals^0.4), the least-squares fit of the mean interest count of the Layer-1 SFT
-labels (`SFT_User_Profile_L1_gpt56_V3`, 71,890 train rows) by input signal count, so 3 at 5 signals, 4 at 10, 6 at
-20, 8 at 50, 10 at 100 and 13 at 200 (about 30% of the labels exceed it). The
-signals see topics only, so without a penalty splitting interests is free; a penalty on every interest collapsed
-answers to a single interest holding every topic (99% of answers at step 400), so interests within the cap are free.
-0.01 is about what 3 correctly owned actions of a ~200-action user earn.
+minus **a symmetric interest-count penalty** (`interest_penalty`), never below 0:
+**0.02 × ln(interests / target)²** (`INTEREST_DEVIATION_WEIGHT`), where target = 1.06 × signals^0.477
+(`interest_target`), the least-squares fit of ln(interest count) on ln(input signal count) over the Layer-1 SFT
+labels (`SFT_User_Profile_L1_gpt56_V3`, 287,557 train rows; the 2,810 without interests left out), i.e. their
+geometric mean: 2.3 at 5 signals, 3.2 at 10, 4.4 at 20, 6.9 at 50, 9.6 at 100 and 13.3 at 200 (the labels' median is
+1.03 times it, P10 0.60, P90 1.60). Half or double the target costs 0.0096, about what 3 correctly owned actions of a
+~200-action user earn, a third or triple 0.024, a seventh or sevenfold 0.076: near the target the penalty is small,
+far from it large. An answer without interests counts as one. The
+signals see topics only, so the interest count is free to them: a penalty on every interest collapsed answers to a
+single interest holding every topic (99% of answers at step 400), and one only beyond a cap (0.01 per interest beyond
+ceil(1.56 × signals^0.4)) left nothing pulling the count up, so it kept falling (5.7 to 2.6 validation interests by
+step 1050); the penalty is therefore symmetric. It never takes a rule-passing answer below a rule-breaking one's 0.
 The limit is per interest, by the language of the actions its topics cite (`user_profile_rules.detect_language`, the
 language rule's anchor): **at most 6 tokens** when English, **at most 10 tokens** otherwise (including mixed or
 untagged). It uses the **generation checkpoint's tokenizer**, with `add_special_tokens=False`, not the

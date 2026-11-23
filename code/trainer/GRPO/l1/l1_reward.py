@@ -5,9 +5,11 @@ duplicate interest / topic, bad evidence or the wrong language, any interest_nam
 in generation tokenizer tokens (no special tokens): 6 when the interest's cited actions are English, else 10; an
 English interest_name joining concepts (a standalone and / +, a slash or comma, or an & not between two capitals: E1)
 or not in Title Case (E2); or cut
-at max_tokens), else the mean of two signals, each in [0, 1], minus INTEREST_PENALTY (0.01) per interest beyond
-interest_cap of its input signal count (ceil(1.56 * signals ** 0.4), the SFT labels' mean): the signals see topics only, so
-without it splitting interests is free, and a penalty on every interest collapsed answers to one interest. Both use
+at max_tokens), else the mean of two signals, each in [0, 1], minus interest_penalty, at least 0:
+INTEREST_DEVIATION_WEIGHT (0.02) times the squared log ratio of the interest count to interest_target of its input
+signal count (1.06 * signals ** 0.477, the SFT labels' geometric mean). The signals see topics only, so the interest
+count is free to them: a penalty on every interest collapsed answers to one interest, and one only beyond a cap let it
+drift down (nothing pulls it up), so the penalty is symmetric, small near the target and growing away from it. Both use
 the same queries, one per topic written: "<interest name>: <topic>" (topic_query), and both weigh every action by
 how informative it is, from its global frequency (action_freq of the RL data, the occurrences of its normalized text
 over the whole corpus): action_weight = 1 / (1 + action_freq / ACTION_FREQ_HALF_WEIGHT), so a long-tail action counts
@@ -89,14 +91,16 @@ MINOR_WORDS = frozenset({"a", "an", "the", "and", "or", "nor", "but", "of", "in"
                          "from", "vs", "via", "as", "per", "into", "over"})
 INVALID_REWARD = 0.0
 REWARD_SIGNALS = ("past_assignment", "future_retrieval")
-# Subtracted from a rule-passing answer's reward per interest beyond interest_cap(input signals): about what 3
-# correctly owned actions of a ~200-action user earn.
-INTEREST_PENALTY = 0.01
-# interest_cap = ceil(INTEREST_CAP_SCALE * signals ** INTEREST_CAP_EXPONENT): the least-squares fit of the mean interest
-# count of the Layer-1 SFT labels (SFT_User_Profile_L1_gpt56_V3, 71,890 train rows) by input signal count, e.g. 4 at 10
-# signals, 6 at 20, 8 at 50, 10 at 100, 13 at 200.
-INTEREST_CAP_SCALE = 1.56
-INTEREST_CAP_EXPONENT = 0.4
+# interest_target = INTEREST_TARGET_SCALE * signals ** INTEREST_TARGET_EXPONENT: the least-squares fit of
+# ln(interest count) on ln(input signal count) over the Layer-1 SFT labels (SFT_User_Profile_L1_gpt56_V3, 287,557 train
+# rows; the 2,810 without interests left out), i.e. their geometric mean, e.g. 3.2 at 10 signals, 4.4 at 20, 6.9 at 50,
+# 9.6 at 100, 13.3 at 200. The labels' median is 1.03 times it (P10 0.60, P90 1.60).
+INTEREST_TARGET_SCALE = 1.06
+INTEREST_TARGET_EXPONENT = 0.477
+# interest_penalty = INTEREST_DEVIATION_WEIGHT * ln(interests / interest_target) ** 2, subtracted from a rule-passing
+# answer's reward: half or double the target costs 0.0096, about what 3 correctly owned actions of a ~200-action user
+# earn; a third of it 0.024.
+INTEREST_DEVIATION_WEIGHT = 0.02
 # past_assignment's denominator is at least this share of the visible actions: skipping beyond it is not penalized.
 PAST_COVERAGE_TARGET = 0.7
 # The action_freq at which an action weighs half (action_weight): where the corpus turns from tools, portals and login
@@ -221,9 +225,15 @@ def action_weight(freq: int | None) -> float:
     return 1.0 / (1.0 + max(freq or 0, 0) / ACTION_FREQ_HALF_WEIGHT)
 
 
-def interest_cap(n_signals: int) -> int:
-    """The number of interests an answer to `n_signals` input signals may write without INTEREST_PENALTY."""
-    return math.ceil(INTEREST_CAP_SCALE * n_signals ** INTEREST_CAP_EXPONENT)
+def interest_target(n_signals: int) -> float:
+    """The expected number of interests of an answer to `n_signals` input signals (the SFT labels' geometric mean)."""
+    return INTEREST_TARGET_SCALE * max(n_signals, 1) ** INTEREST_TARGET_EXPONENT
+
+
+def interest_penalty(n_interests: int, n_signals: int) -> float:
+    """Squared log deviation from interest_target: as much for half as for double, small near the target and growing
+    fast away from it. An answer without interests counts as one."""
+    return INTEREST_DEVIATION_WEIGHT * math.log(max(n_interests, 1) / interest_target(n_signals)) ** 2
 
 
 def assign_owners(similarity: list[list[float]], citations: list[set[int]],
@@ -496,6 +506,7 @@ class L1Reward:
             "queries": by_interest, "past_owners": past_owners, "hits": hits,
         })
         if rules["rule_pass"]:
-            result["reward"] = (statistics.mean(result[name] for name in REWARD_SIGNALS)
-                                - INTEREST_PENALTY * max(0, len(interests) - interest_cap(len(signals))))
+            # Never below a rule-breaking answer's reward: a far-off interest count must not make breaking a rule pay.
+            result["reward"] = max(INVALID_REWARD, statistics.mean(result[name] for name in REWARD_SIGNALS)
+                                   - interest_penalty(len(interests), len(signals)))
         return result
