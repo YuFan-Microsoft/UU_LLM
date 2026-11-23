@@ -6,7 +6,6 @@ from concurrent.futures import ThreadPoolExecutor
 import importlib.util
 import io
 import json
-import math
 import os
 from pathlib import Path
 import subprocess
@@ -185,7 +184,7 @@ class DualPoolRewardTest(unittest.TestCase):
         return self.scorer(content(self.past), answer(count, evidence), None, self.future)
 
     def test_two_signal_mean_minus_the_interest_count_penalty(self):
-        for count in (1, 5, 9, 12, 18, 27):
+        for count in (1, 3, 5, 9, 12, 18, 27):
             with self.subTest(count=count):
                 result = self.score(count)
                 # Every interest cites only P0, which I0 owns: 1 correct of `count` citations, and below 18 citations
@@ -194,23 +193,22 @@ class DualPoolRewardTest(unittest.TestCase):
                 self.assertAlmostEqual(result["past_assignment"], past)
                 # I<n> retrieves F<n>; the rest of the top 20 are other users' actions.
                 self.assertAlmostEqual(result["future_retrieval"], min(count, 20) / 20)
-                # 25 input signals: an interest_target of 1.06 * 25 ** 0.477.
-                penalty = 0.02 * math.log(count / (1.06 * 25 ** 0.477)) ** 2
+                # 25 input signals: target ~4.92, free [P10, P50] band [3, 5], 0.01 per interest outside it.
+                penalty = reward.INTEREST_PENALTY * max(0, 3 - count, count - 5)
                 self.assertAlmostEqual(result["reward"], max(0.0, (past + min(count, 20) / 20) / 2 - penalty))
                 self.assertTrue(0 <= result["reward"] <= 1)
 
-    def test_interest_penalty_is_symmetric_in_log_and_grows_away_from_the_target(self):
-        target = reward.interest_target(100)
-        self.assertAlmostEqual(target, 1.06 * 100 ** 0.477)
-        with patch.object(reward, "interest_target", return_value=10.0):
-            self.assertEqual(reward.interest_penalty(10, 100), 0.0)
-            self.assertAlmostEqual(reward.interest_penalty(5, 100), reward.interest_penalty(20, 100))
-            penalties = [reward.interest_penalty(count, 100) for count in (10, 7, 5, 3, 1)]
-            self.assertEqual(penalties, sorted(penalties))
-            # Growing faster than linearly: the second step away costs more than the first.
-            self.assertGreater(penalties[2] - penalties[1], penalties[1] - penalties[0])
-            # No interest counts as one.
-            self.assertEqual(reward.interest_penalty(0, 100), reward.interest_penalty(1, 100))
+    def test_interest_band_and_linear_penalty_outside_p10_to_p50(self):
+        self.assertEqual([reward.interest_band(n) for n in (1, 5, 10, 20, 50, 100, 200)],
+                         [(1, 1), (1, 2), (2, 3), (3, 5), (4, 7), (6, 10), (8, 14)])
+        # 100 signals: free band [6, 10], 0.01 per interest outside it on either side.
+        for count in range(6, 11):
+            self.assertEqual(reward.interest_penalty(count, 100), 0.0)
+        self.assertAlmostEqual(reward.interest_penalty(5, 100), 0.01)
+        self.assertAlmostEqual(reward.interest_penalty(1, 100), 0.05)
+        self.assertAlmostEqual(reward.interest_penalty(0, 100), 0.06)
+        self.assertAlmostEqual(reward.interest_penalty(11, 100), 0.01)
+        self.assertAlmostEqual(reward.interest_penalty(14, 100), 0.04)
 
     def test_a_far_off_interest_count_never_scores_below_a_rule_breaking_answer(self):
         with patch.object(reward, "interest_penalty", return_value=5.0):

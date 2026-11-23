@@ -6,10 +6,11 @@ in generation tokenizer tokens (no special tokens): 6 when the interest's cited 
 English interest_name joining concepts (a standalone and / +, a slash or comma, or an & not between two capitals: E1)
 or not in Title Case (E2); or cut
 at max_tokens), else the mean of two signals, each in [0, 1], minus interest_penalty, at least 0:
-INTEREST_DEVIATION_WEIGHT (0.02) times the squared log ratio of the interest count to interest_target of its input
-signal count (1.06 * signals ** 0.477, the SFT labels' geometric mean). The signals see topics only, so the interest
-count is free to them: a penalty on every interest collapsed answers to one interest, and one only beyond a cap let it
-drift down (nothing pulls it up), so the penalty is symmetric, small near the target and growing away from it. Both use
+INTEREST_PENALTY (0.01) per interest outside interest_band of its input signal count, the rounded SFT [P10, P50] band
+[0.60, 1.03] around interest_target (1.06 * signals ** 0.477, the SFT labels' geometric mean; floor at least 1). The
+signals see topics only, so the interest count is free to them: a penalty on every interest collapsed answers to one
+interest, a cap only let it drift down (nothing pulls it up), and a gentle squared log penalty let it drift up near
+the target, so the penalty is a linear band on both sides. Both use
 the same queries, one per topic written: "<interest name>: <topic>" (topic_query), and both weigh every action by
 how informative it is, from its global frequency (action_freq of the RL data, the occurrences of its normalized text
 over the whole corpus): action_weight = 1 / (1 + action_freq / ACTION_FREQ_HALF_WEIGHT), so a long-tail action counts
@@ -57,7 +58,6 @@ requests spread over them) on the same texts.
 """
 
 import json
-import math
 import re
 import statistics
 import sys
@@ -94,13 +94,16 @@ REWARD_SIGNALS = ("past_assignment", "future_retrieval")
 # interest_target = INTEREST_TARGET_SCALE * signals ** INTEREST_TARGET_EXPONENT: the least-squares fit of
 # ln(interest count) on ln(input signal count) over the Layer-1 SFT labels (SFT_User_Profile_L1_gpt56_V3, 287,557 train
 # rows; the 2,810 without interests left out), i.e. their geometric mean, e.g. 3.2 at 10 signals, 4.4 at 20, 6.9 at 50,
-# 9.6 at 100, 13.3 at 200. The labels' median is 1.03 times it (P10 0.60, P90 1.60).
+# 9.6 at 100, 13.3 at 200. The labels' P10 is 0.60 times it, median (P50) 1.03, P90 1.60.
 INTEREST_TARGET_SCALE = 1.06
 INTEREST_TARGET_EXPONENT = 0.477
-# interest_penalty = INTEREST_DEVIATION_WEIGHT * ln(interests / interest_target) ** 2, subtracted from a rule-passing
-# answer's reward: half or double the target costs 0.0096, about what 3 correctly owned actions of a ~200-action user
-# earn; a third of it 0.024.
-INTEREST_DEVIATION_WEIGHT = 0.02
+# Free [floor, cap] interest-count band around interest_target (rounded SFT P10 to P50, floor at least 1):
+# [1, 2] at 5 signals, [2, 3] at 10, [3, 5] at 20, [4, 7] at 50, [6, 10] at 100, [8, 14] at 200.
+INTEREST_FLOOR_RATIO = 0.60
+INTEREST_CAP_RATIO = 1.03
+# Subtracted from a rule-passing answer's reward per interest outside interest_band: about what 3 correctly owned
+# actions of a ~200-action user earn.
+INTEREST_PENALTY = 0.01
 # past_assignment's denominator is at least this share of the visible actions: skipping beyond it is not penalized.
 PAST_COVERAGE_TARGET = 0.7
 # The action_freq at which an action weighs half (action_weight): where the corpus turns from tools, portals and login
@@ -230,10 +233,19 @@ def interest_target(n_signals: int) -> float:
     return INTEREST_TARGET_SCALE * max(n_signals, 1) ** INTEREST_TARGET_EXPONENT
 
 
+def interest_band(n_signals: int) -> tuple[int, int]:
+    """The free [floor, cap] interest-count band for `n_signals` input signals (rounded SFT P10 to P50, floor >= 1)."""
+    target = interest_target(n_signals)
+    floor = max(1, round(INTEREST_FLOOR_RATIO * target))
+    cap = max(floor, round(INTEREST_CAP_RATIO * target))
+    return floor, cap
+
+
 def interest_penalty(n_interests: int, n_signals: int) -> float:
-    """Squared log deviation from interest_target: as much for half as for double, small near the target and growing
-    fast away from it. An answer without interests counts as one."""
-    return INTEREST_DEVIATION_WEIGHT * math.log(max(n_interests, 1) / interest_target(n_signals)) ** 2
+    """Linear penalty outside interest_band: 0 inside [floor, cap], INTEREST_PENALTY per interest below floor or above
+    cap."""
+    floor, cap = interest_band(n_signals)
+    return INTEREST_PENALTY * max(0, floor - n_interests, n_interests - cap)
 
 
 def assign_owners(similarity: list[list[float]], citations: list[set[int]],
